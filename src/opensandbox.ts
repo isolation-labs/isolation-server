@@ -85,6 +85,16 @@ export async function listSandboxes(): Promise<Sandbox[]> {
   return page.items;
 }
 
+// Container logs via the runtime's diagnostics API (raw text tail).
+export async function sandboxLogs(id: string, tail = 500): Promise<string> {
+  const { url, apiKey } = getOsb();
+  const r = await fetch(`${url.replace(/\/+$/, "")}/v1/sandboxes/${id}/diagnostics/logs?tail=${tail}`, {
+    headers: apiKey ? { "OPEN-SANDBOX-API-KEY": apiKey } : {},
+  });
+  if (!r.ok) throw new OsbError(r.status, `diagnostics logs → HTTP ${r.status}`);
+  return r.text();
+}
+
 // Resolve where a sandbox port is reachable FROM THIS HOST. Docker runtime, direct
 // ingress: the runtime returns "<host>:<publishedPort>/proxy/<port>" — the published
 // port belongs to the in-sandbox execd, whose /proxy/<port> path forwards to the app

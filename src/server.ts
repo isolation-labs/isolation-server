@@ -5,7 +5,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { HOST, PORT, getName, getPairing, getToken, isLoopbackOrigin, originAllowed, savePairing, tokenMatches } from "./config.js";
 import { beatOffline, detach, pairingStatus, startHeartbeat } from "./heartbeat.js";
-import { deleteSandbox, getSandbox, listSandboxes, osbHealthy, pauseSandbox, resumeSandbox } from "./opensandbox.js";
+import { deleteSandbox, getSandbox, listSandboxes, osbHealthy, pauseSandbox, resumeSandbox, sandboxLogs } from "./opensandbox.js";
 import { handleViewRequest, handleViewUpgrade, invalidateEndpoints } from "./doorman.js";
 import { launch, type LaunchRequest } from "./launch.js";
 import { dropSink, saveWorkspace, syncWorkspace } from "./persistence.js";
@@ -85,6 +85,19 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   // Everything below is the control plane: master token required.
   if (!tokenMatches(bearer(req))) return json(res, 401, { error: "unauthorized" });
 
+  // The gate's own log tail (the web's server-card "Logs" contract).
+  if (method === "GET" && url === "/logs") {
+    try {
+      const { readFileSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      const { HOME } = await import("./config.js");
+      const lines = readFileSync(join(HOME, "isogate.log"), "utf8").split("\n");
+      return json(res, 200, { lines: lines.slice(-500) });
+    } catch {
+      return json(res, 200, { lines: [] });
+    }
+  }
+
   if (method === "GET" && url === "/status") {
     return json(res, 200, {
       version: VERSION,
@@ -160,7 +173,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     }
   }
 
-  const sb = /^\/sandboxes\/([a-zA-Z0-9-]+)(\/(pause|resume|save|sync))?$/.exec(url);
+  const sb = /^\/sandboxes\/([a-zA-Z0-9-]+)(\/(pause|resume|save|sync|logs))?$/.exec(url);
   if (sb) {
     const [, id, , action] = sb;
     try {
@@ -190,6 +203,9 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         invalidateEndpoints(id); // published ports may move across a resume
         forgetExecd(id);
         return json(res, 200, { ok: true });
+      }
+      if (method === "GET" && action === "logs") {
+        return json(res, 200, { lines: (await sandboxLogs(id)).split("\n").slice(-500) });
       }
       if (method === "GET" && !action) {
         const s = await getSandbox(id);
