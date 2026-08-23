@@ -7,7 +7,18 @@ import { randomBytes } from "node:crypto";
 import { createSandbox, type Sandbox } from "./opensandbox.js";
 import { run, waitReady, writeFile } from "./execd.js";
 import { sealedOrInline } from "./envelope.js";
+import { restoreWorkspace, type WorkspaceSink } from "./persistence.js";
 import { addView, mintViewToken, type View, type ViewType } from "./views.js";
+
+// The launch's persistence envelope (same shape the web sends the daemon today:
+// `workspaceId` + `persistence.workspace.{endpoint, creds}`).
+function parseWorkspaceSink(body: LaunchRequest): WorkspaceSink | undefined {
+  const p = (body.persistence ?? {}) as { workspace?: { endpoint?: unknown; creds?: unknown } };
+  const endpoint = typeof p.workspace?.endpoint === "string" ? p.workspace.endpoint.trim() : "";
+  const workspaceId = typeof body.workspaceId === "string" ? body.workspaceId.trim() : "";
+  if (!endpoint || !workspaceId) return undefined;
+  return { endpoint, workspaceId, creds: typeof p.workspace?.creds === "string" ? p.workspace.creds : undefined };
+}
 
 const log = (...a: unknown[]) => console.log("[launch]", ...a);
 
@@ -151,6 +162,8 @@ async function startViewProcess(sandboxId: string, view: View): Promise<void> {
 export interface LaunchRequest {
   name?: string;
   image?: string;
+  workspaceId?: string;
+  persistence?: unknown; // { workspace: { endpoint, creds } } — R2-agnostic blob sink
   repos?: unknown;
   views?: { type: ViewType; port?: number }[];
   envConfig?: unknown; // sealed string or inline {files, vars}
@@ -187,11 +200,6 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
   try {
     await waitReady(sandbox.id);
 
-    // Secret files land under /workspace before any repo/user process runs.
-    for (const f of envConfig.files) {
-      await writeFile(sandbox.id, `/workspace/${f.path}`, f.content, 0o600);
-    }
-
     // Git author identity (non-secret) before clones, so hooks/commits attribute right.
     const gname = body.git?.name?.trim();
     const gmail = body.git?.email?.trim();
@@ -202,6 +210,17 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
     for (const repo of repos) {
       log(`cloning ${repo.url} → /workspace/${repo.name}`);
       await cloneRepo(sandbox.id, repo, gitCreds);
+    }
+
+    // Workspace persistence: restore the shared tree (branch-per-session) when the
+    // launch carries a sink. Repos keep their own git and are excluded (v1).
+    const sink = parseWorkspaceSink(body);
+    if (sink) await restoreWorkspace(sandbox.id, sink, repos.map((r) => r.name));
+
+    // Secret files land AFTER the restore so the launch environment wins; written
+    // 0600 before any view/user process runs.
+    for (const f of envConfig.files) {
+      await writeFile(sandbox.id, `/workspace/${f.path}`, f.content, 0o600);
     }
 
     const views: LaunchResult["views"] = [];

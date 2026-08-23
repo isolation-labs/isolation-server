@@ -8,6 +8,7 @@ import { beatOffline, detach, pairingStatus, startHeartbeat } from "./heartbeat.
 import { deleteSandbox, getSandbox, listSandboxes, osbHealthy, pauseSandbox, resumeSandbox } from "./opensandbox.js";
 import { handleViewRequest, handleViewUpgrade, invalidateEndpoints } from "./doorman.js";
 import { launch, type LaunchRequest } from "./launch.js";
+import { dropSink, saveWorkspace } from "./persistence.js";
 import { dropViewsForSandbox, viewsForSandbox } from "./views.js";
 import { forgetExecd } from "./execd.js";
 import { tunnelManager } from "./tunnel.js";
@@ -159,15 +160,24 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     }
   }
 
-  const sb = /^\/sandboxes\/([a-zA-Z0-9-]+)(\/(pause|resume))?$/.exec(url);
+  const sb = /^\/sandboxes\/([a-zA-Z0-9-]+)(\/(pause|resume|save))?$/.exec(url);
   if (sb) {
     const [, id, , action] = sb;
     try {
+      if (method === "POST" && action === "save") {
+        try {
+          return json(res, 200, { ok: true, ...(await saveWorkspace(id)) });
+        } catch (e) {
+          const err = e as Error & { conflict?: boolean };
+          return json(res, err.conflict ? 409 : 502, { error: err.message });
+        }
+      }
       if (method === "DELETE" && !action) {
         await deleteSandbox(id);
         dropViewsForSandbox(id);
         invalidateEndpoints(id);
         forgetExecd(id);
+        dropSink(id);
         return json(res, 200, { ok: true });
       }
       if (method === "POST" && action === "pause") {
