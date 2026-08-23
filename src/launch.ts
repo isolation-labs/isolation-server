@@ -1,0 +1,224 @@
+// Launch orchestration — the isogate slice of what the old daemon's launch path
+// did, re-targeted at OpenSandbox: create the sandbox, materialize the launch
+// secrets, clone the repos, start the view processes. The devcontainer pipeline and
+// workspace persistence layer on top of this in later phases; nothing here persists
+// a secret beyond the sandbox's lifetime.
+import { randomBytes } from "node:crypto";
+import { createSandbox, type Sandbox } from "./opensandbox.js";
+import { run, waitReady, writeFile } from "./execd.js";
+import { sealedOrInline } from "./envelope.js";
+import { addView, mintViewToken, type View, type ViewType } from "./views.js";
+
+const log = (...a: unknown[]) => console.log("[launch]", ...a);
+
+export const TOOLING_IMAGE = "isogate/tooling:0.1";
+const TERMINAL_PORT = 7681;
+
+// --- validation (ported rules: the gate must never write outside /workspace or
+// let a launch body shadow system env) -----------------------------------------
+
+const VAR_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const RESERVED_PREFIXES = ["ISOGATE_", "ISO_", "OPEN_SANDBOX_"];
+const RESERVED_NAMES = new Set(["PATH", "HOME", "GIT_ASKPASS", "GIT_TOKEN", "GIT_SSH_COMMAND"]);
+
+interface EnvConfig {
+  files: { path: string; content: string }[];
+  vars: { name: string; value: string }[];
+}
+
+export function parseEnvConfig(body: unknown): EnvConfig {
+  const b = (body ?? {}) as { files?: unknown; vars?: unknown };
+  const files: EnvConfig["files"] = [];
+  for (const f of Array.isArray(b.files) ? b.files : []) {
+    if (typeof f?.path !== "string" || typeof f?.content !== "string") continue;
+    const path = f.path.trim().replace(/^\/+/, "");
+    if (!path || path.length > 512 || path.split("/").some((s: string) => s === "" || s === "..")) continue;
+    files.push({ path, content: f.content });
+  }
+  const vars: EnvConfig["vars"] = [];
+  const seen = new Set<string>();
+  for (const v of Array.isArray(b.vars) ? b.vars : []) {
+    if (typeof v?.name !== "string" || typeof v?.value !== "string") continue;
+    if (!VAR_NAME_RE.test(v.name) || v.name.length > 128 || seen.has(v.name)) continue;
+    if (RESERVED_NAMES.has(v.name) || RESERVED_PREFIXES.some((p) => v.name.startsWith(p))) continue;
+    if (Buffer.byteLength(v.value, "utf8") > 32 * 1024 || vars.length >= 100) continue;
+    seen.add(v.name);
+    vars.push({ name: v.name, value: v.value });
+  }
+  return { files, vars };
+}
+
+interface GitCreds {
+  githubOauth?: string;
+  repoTokens: { url: string; token: string }[];
+  repoSshKeys: { url: string; key: string }[];
+}
+
+export function parseGitCreds(body: unknown): GitCreds {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v : undefined);
+  const pairs = (v: unknown, field: "token" | "key") =>
+    (Array.isArray(v) ? v : []).flatMap((e: Record<string, unknown>) => {
+      const url = str(e?.url);
+      const val = str(e?.[field]);
+      return url && val ? [{ url, [field]: val } as never] : [];
+    });
+  return {
+    githubOauth: str(b.githubOauth),
+    repoTokens: pairs(b.repoTokens, "token"),
+    repoSshKeys: pairs(b.repoSshKeys, "key"),
+  };
+}
+
+// --- repos ---------------------------------------------------------------------
+
+interface RepoSpec {
+  url: string;
+  name: string;
+  branch?: string;
+}
+
+export function parseRepos(body: unknown): RepoSpec[] {
+  const out: RepoSpec[] = [];
+  for (const r of Array.isArray(body) ? body : []) {
+    const url = typeof r?.url === "string" ? r.url.trim() : "";
+    if (!url) continue;
+    const fallback = url.replace(/\/+$/, "").split("/").pop()?.replace(/\.git$/, "") ?? "repo";
+    const name = (typeof r?.name === "string" && r.name.trim() ? r.name.trim() : fallback).replace(/[^A-Za-z0-9._-]/g, "-");
+    out.push({ url, name, branch: typeof r?.branch === "string" && r.branch.trim() ? r.branch.trim() : undefined });
+  }
+  return out;
+}
+
+// Clone one repo inside the sandbox. Credentials never touch argv or a URL: HTTPS
+// tokens flow through a generic GIT_ASKPASS script reading $GIT_TOKEN from the
+// command's env; SSH keys are written 0600, referenced via GIT_SSH_COMMAND, and
+// deleted right after. Public repos clone tokenless.
+async function cloneRepo(sandboxId: string, repo: RepoSpec, creds: GitCreds): Promise<void> {
+  const override = creds.repoTokens.find((t) => t.url === repo.url)?.token;
+  const sshKey = creds.repoSshKeys.find((k) => k.url === repo.url)?.key;
+  const isSsh = /^(git@|ssh:\/\/)/.test(repo.url);
+  const dest = `/workspace/${repo.name}`;
+  const branchArg = repo.branch ? ` --branch ${JSON.stringify(repo.branch)}` : "";
+  const envs: Record<string, string> = {};
+  let cleanup = "";
+
+  if (isSsh && sshKey) {
+    const keyPath = `/tmp/.iso-key-${randomBytes(4).toString("hex")}`;
+    await writeFile(sandboxId, keyPath, sshKey.endsWith("\n") ? sshKey : `${sshKey}\n`, 0o600);
+    envs.GIT_SSH_COMMAND = `ssh -i ${keyPath} -o StrictHostKeyChecking=accept-new`;
+    cleanup = `; rm -f ${keyPath}`;
+  } else if (!isSsh) {
+    const token = override ?? creds.githubOauth;
+    if (token) {
+      const askpass = `/tmp/.iso-askpass-${randomBytes(4).toString("hex")}`;
+      await writeFile(sandboxId, askpass, `#!/bin/sh\ncase "$1" in\n  Username*) echo x-access-token ;;\n  *) echo "$GIT_TOKEN" ;;\nesac\n`, 0o700);
+      envs.GIT_ASKPASS = askpass;
+      envs.GIT_TOKEN = token;
+      cleanup = `; rm -f ${askpass}`;
+    }
+  }
+
+  const r = await run(sandboxId, `git clone${branchArg} ${JSON.stringify(repo.url)} ${JSON.stringify(dest)}${cleanup}`, {
+    envs,
+    timeoutMs: 300_000,
+  });
+  if (!r.ok || /^fatal:/m.test(r.stderr)) {
+    throw new Error(`clone of ${repo.url} failed: ${(r.stderr || r.stdout).trim().split("\n").slice(-3).join(" / ").slice(0, 400)}`);
+  }
+}
+
+// --- views ---------------------------------------------------------------------
+
+// Start the in-sandbox process a view type needs and return its inside port.
+// terminal: ttyd fronting a per-view tmux session — every browser tab attaches the
+// same tmux (shared state + live mirror), and a ttyd restart reattaches. web: the
+// app's own port, nothing to start. code/directory: land with the tooling image
+// growing code-server/a file server (later phase).
+async function startViewProcess(sandboxId: string, view: View): Promise<void> {
+  if (view.type === "terminal") {
+    // execd's background mode owns the process lifetime — no nohup/& wrapper (a
+    // shell that exits immediately takes its children with it).
+    await run(sandboxId, `ttyd --writable -p ${view.port} tmux new -A -s iso-view-${view.id}`, {
+      cwd: "/workspace",
+      background: true,
+    });
+  }
+}
+
+// --- the launch ----------------------------------------------------------------
+
+export interface LaunchRequest {
+  name?: string;
+  image?: string;
+  repos?: unknown;
+  views?: { type: ViewType; port?: number }[];
+  envConfig?: unknown; // sealed string or inline {files, vars}
+  repoTokens?: unknown; // sealed string or inline GitCreds
+  git?: { name?: string; email?: string };
+  env?: Record<string, string>;
+  metadata?: Record<string, string>;
+}
+
+export interface LaunchResult {
+  sandbox: Sandbox;
+  views: (View & { path: string; token: string })[];
+}
+
+export async function launch(body: LaunchRequest): Promise<LaunchResult> {
+  const repos = parseRepos(body.repos);
+  const envConfig = parseEnvConfig(sealedOrInline(body.envConfig));
+  const gitCreds = parseGitCreds(sealedOrInline(body.repoTokens));
+  const wanted = Array.isArray(body.views) ? body.views : [];
+
+  // Plain vars ride the container env from the start; caller-supplied `env` is
+  // reserved for trusted internals, so launch-body vars are validated above.
+  const env: Record<string, string> = { ...(body.env ?? {}) };
+  for (const v of envConfig.vars) env[v.name] = v.value;
+
+  const sandbox = await createSandbox({
+    image: body.image?.trim() || TOOLING_IMAGE,
+    entrypoint: ["sleep", "infinity"],
+    env: Object.keys(env).length ? env : undefined,
+    metadata: { managedBy: "isogate", ...(body.name ? { name: body.name } : {}), ...(body.metadata ?? {}) },
+  });
+  log(`sandbox ${sandbox.id} created (${body.image?.trim() || TOOLING_IMAGE})`);
+
+  try {
+    await waitReady(sandbox.id);
+
+    // Secret files land under /workspace before any repo/user process runs.
+    for (const f of envConfig.files) {
+      await writeFile(sandbox.id, `/workspace/${f.path}`, f.content, 0o600);
+    }
+
+    // Git author identity (non-secret) before clones, so hooks/commits attribute right.
+    const gname = body.git?.name?.trim();
+    const gmail = body.git?.email?.trim();
+    if (gname && gmail) {
+      await run(sandbox.id, `git config --global user.name ${JSON.stringify(gname)} && git config --global user.email ${JSON.stringify(gmail)}`);
+    }
+
+    for (const repo of repos) {
+      log(`cloning ${repo.url} → /workspace/${repo.name}`);
+      await cloneRepo(sandbox.id, repo, gitCreds);
+    }
+
+    const views: LaunchResult["views"] = [];
+    for (const w of wanted) {
+      const port = w.type === "terminal" ? (w.port ?? TERMINAL_PORT) : w.port;
+      if (!port) continue; // web needs an explicit port; code/directory not shipped yet
+      const v = addView(sandbox.id, w.type, port);
+      await startViewProcess(sandbox.id, v);
+      views.push({ ...v, path: `/v/${v.id}/`, token: mintViewToken(v.id) });
+    }
+
+    return { sandbox, views };
+  } catch (e) {
+    // A failed launch must not leak a half-provisioned sandbox — the caller sees
+    // the error; the sandbox is gone.
+    const { deleteSandbox } = await import("./opensandbox.js");
+    await deleteSandbox(sandbox.id).catch(() => undefined);
+    throw e;
+  }
+}

@@ -5,9 +5,11 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { HOST, PORT, getName, getPairing, getToken, isLoopbackOrigin, originAllowed, savePairing, tokenMatches } from "./config.js";
 import { beatOffline, detach, pairingStatus, startHeartbeat } from "./heartbeat.js";
-import { createSandbox, deleteSandbox, getSandbox, listSandboxes, osbHealthy, pauseSandbox, resumeSandbox } from "./opensandbox.js";
+import { deleteSandbox, getSandbox, listSandboxes, osbHealthy, pauseSandbox, resumeSandbox } from "./opensandbox.js";
 import { handleViewRequest, handleViewUpgrade, invalidateEndpoints } from "./doorman.js";
-import { addView, dropViewsForSandbox, mintViewToken, viewsForSandbox, type ViewType } from "./views.js";
+import { launch, type LaunchRequest } from "./launch.js";
+import { dropViewsForSandbox, viewsForSandbox } from "./views.js";
+import { forgetExecd } from "./execd.js";
 import { tunnelManager } from "./tunnel.js";
 
 const VERSION = "0.0.1";
@@ -139,22 +141,8 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
 
   if (method === "POST" && url === "/sandboxes") {
     const body = await readBody(req);
-    const image = String(body.image ?? "").trim();
-    if (!image) return json(res, 400, { error: "image required" });
-    const entrypoint = Array.isArray(body.entrypoint) ? (body.entrypoint as string[]) : ["sleep", "infinity"];
-    const wanted = Array.isArray(body.views) ? (body.views as { type: ViewType; port: number }[]) : [];
     try {
-      const sb = await createSandbox({
-        image,
-        entrypoint,
-        env: (body.env as Record<string, string>) ?? undefined,
-        metadata: { managedBy: "isogate", ...((body.metadata as Record<string, string>) ?? {}) },
-      });
-      const views = wanted.map((w) => {
-        const v = addView(sb.id, w.type, w.port);
-        return { ...v, path: `/v/${v.id}/`, token: mintViewToken(v.id) };
-      });
-      return json(res, 201, { sandbox: sb, views });
+      return json(res, 201, await launch(body as LaunchRequest));
     } catch (e) {
       return json(res, 502, { error: String((e as Error)?.message ?? e) });
     }
@@ -179,6 +167,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         await deleteSandbox(id);
         dropViewsForSandbox(id);
         invalidateEndpoints(id);
+        forgetExecd(id);
         return json(res, 200, { ok: true });
       }
       if (method === "POST" && action === "pause") {
@@ -188,6 +177,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       if (method === "POST" && action === "resume") {
         await resumeSandbox(id);
         invalidateEndpoints(id); // published ports may move across a resume
+        forgetExecd(id);
         return json(res, 200, { ok: true });
       }
       if (method === "GET" && !action) {
