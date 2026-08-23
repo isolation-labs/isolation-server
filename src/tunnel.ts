@@ -1,0 +1,122 @@
+// The relay tunnel — a free cloudflared quick tunnel fronting the doorman. Provider
+// stays behind this interface (the enrollment names it); the URL is never hardcoded
+// and changes on every restart, which the heartbeat self-heals.
+import { type ChildProcess, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { HOST, PORT } from "./config.js";
+
+const log = (...a: unknown[]) => console.log("[tunnel]", ...a);
+
+const URL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/;
+const RESTART_BACKOFF_MS = [2_000, 5_000, 15_000, 60_000];
+
+// PATH first; then the legacy isolation install location (a migrated machine already
+// has a pinned binary there) and isogate's own future install dir.
+function findCloudflared(): string {
+  for (const p of [
+    join(homedir(), ".isogate", "bin", "cloudflared"),
+    join(homedir(), ".isolation", "bin", "cloudflared"),
+    "/opt/homebrew/bin/cloudflared",
+    "/usr/local/bin/cloudflared",
+    "/usr/bin/cloudflared",
+  ]) {
+    if (existsSync(p)) return p;
+  }
+  return "cloudflared"; // hope for PATH; spawn error surfaces via lastError
+}
+
+export interface TunnelStatus {
+  connected: boolean;
+  url?: string;
+}
+
+class TunnelManager {
+  private child: ChildProcess | undefined;
+  private url: string | undefined;
+  private stopping = false;
+  private restarts = 0;
+  lastError: string | undefined;
+  // Fired when the public URL changes (a reconnect minted a fresh one) — the
+  // heartbeat hooks this to report the new address immediately.
+  onUrlChange: ((url: string) => void) | undefined;
+
+  publicUrl(): string | undefined {
+    return this.url;
+  }
+
+  status(): TunnelStatus {
+    return { connected: !!this.url && !!this.child, url: this.url };
+  }
+
+  // Bring the tunnel up and resolve once it has a public URL (or reject on timeout).
+  async start(): Promise<string> {
+    if (this.url && this.child) return this.url;
+    this.stopping = false;
+    return new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(this.lastError ?? "tunnel did not produce a URL in time")), 30_000);
+      this.spawnOnce((u) => {
+        clearTimeout(timer);
+        resolve(u);
+      });
+    });
+  }
+
+  private spawnOnce(onFirstUrl?: (u: string) => void): void {
+    const bin = findCloudflared();
+    const child = spawn(bin, ["tunnel", "--url", `http://${HOST}:${PORT}`], { stdio: ["ignore", "pipe", "pipe"] });
+    this.child = child;
+    let announced = false;
+    const scan = (chunk: Buffer) => {
+      const m = URL_RE.exec(chunk.toString());
+      if (m && !announced) {
+        announced = true;
+        const fresh = m[0];
+        const changed = this.url !== undefined && this.url !== fresh;
+        this.url = fresh;
+        this.restarts = 0;
+        log(`up: ${fresh}`);
+        onFirstUrl?.(fresh);
+        if (changed) this.onUrlChange?.(fresh);
+      }
+    };
+    child.stdout?.on("data", scan);
+    child.stderr?.on("data", scan);
+    child.on("error", (e) => {
+      this.lastError = e.message;
+      log(`spawn failed: ${e.message}`);
+    });
+    child.on("exit", (code) => {
+      this.child = undefined;
+      this.url = undefined;
+      if (this.stopping) return;
+      const delay = RESTART_BACKOFF_MS[Math.min(this.restarts++, RESTART_BACKOFF_MS.length - 1)];
+      log(`exited (code ${code}) — restarting in ${delay / 1000}s`);
+      setTimeout(() => {
+        if (!this.stopping) this.spawnOnce();
+      }, delay);
+    });
+  }
+
+  async stop(): Promise<void> {
+    this.stopping = true;
+    this.url = undefined;
+    const c = this.child;
+    this.child = undefined;
+    if (!c) return;
+    c.kill("SIGTERM");
+    await new Promise<void>((r) => {
+      const t = setTimeout(() => {
+        c.kill("SIGKILL");
+        r();
+      }, 3_000);
+      c.on("exit", () => {
+        clearTimeout(t);
+        r();
+      });
+    });
+  }
+}
+
+export const tunnelManager = new TunnelManager();
