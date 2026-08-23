@@ -22,8 +22,9 @@ function parseWorkspaceSink(body: LaunchRequest): WorkspaceSink | undefined {
 
 const log = (...a: unknown[]) => console.log("[launch]", ...a);
 
-export const TOOLING_IMAGE = "isogate/tooling:0.1";
+export const TOOLING_IMAGE = "isogate/tooling:0.2";
 const TERMINAL_PORT = 7681;
+const CODE_PORT = 13337;
 
 // --- validation (ported rules: the gate must never write outside /workspace or
 // let a launch body shadow system env) -----------------------------------------
@@ -147,10 +148,17 @@ async function cloneRepo(sandboxId: string, repo: RepoSpec, creds: GitCreds): Pr
 // app's own port, nothing to start. code/directory: land with the tooling image
 // growing code-server/a file server (later phase).
 async function startViewProcess(sandboxId: string, view: View): Promise<void> {
+  // execd's background mode owns each process's lifetime — no nohup/& wrappers (a
+  // shell that exits immediately takes its children with it).
   if (view.type === "terminal") {
-    // execd's background mode owns the process lifetime — no nohup/& wrapper (a
-    // shell that exits immediately takes its children with it).
     await run(sandboxId, `ttyd --writable -p ${view.port} tmux new -A -s iso-view-${view.id}`, {
+      cwd: "/workspace",
+      background: true,
+    });
+  } else if (view.type === "code") {
+    // Auth is the doorman's job (view tokens); code-server itself runs open on a
+    // loopback-only published port. Multi-client natively.
+    await run(sandboxId, `code-server --auth none --disable-telemetry --bind-addr 0.0.0.0:${view.port} /workspace`, {
       cwd: "/workspace",
       background: true,
     });
@@ -225,8 +233,8 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
 
     const views: LaunchResult["views"] = [];
     for (const w of wanted) {
-      const port = w.type === "terminal" ? (w.port ?? TERMINAL_PORT) : w.port;
-      if (!port) continue; // web needs an explicit port; code/directory not shipped yet
+      const port = w.port ?? (w.type === "terminal" ? TERMINAL_PORT : w.type === "code" ? CODE_PORT : undefined);
+      if (!port) continue; // web needs an explicit port; directory not shipped yet
       const v = addView(sandbox.id, w.type, port);
       await startViewProcess(sandbox.id, v);
       views.push({ ...v, path: `/v/${v.id}/`, token: mintViewToken(v.id) });

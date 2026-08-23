@@ -13,7 +13,12 @@ few things a cloud-driven, browser-facing server needs on top — and nothing el
 - **The doorman** — one public origin for every view of every sandbox
   (`/v/<viewId>/*`), WebSocket-capable, authorized by short-lived view tokens instead
   of the machine credential.
-- Coming next: sealed secrets materialization and workspace persistence.
+- **Launch orchestration** — sealed launch secrets (env vars + secret files),
+  repo clones whose credentials never touch argv or URLs, and per-view processes
+  (terminal = ttyd + tmux, code = code-server) from the `isogate/tooling` image.
+- **Workspace persistence** — `/workspace` is a git repo bundled to an HTTP blob
+  sink (`GET/PUT {endpoint}/{workspaceId}`, ETag compare-and-swap). Sessions work
+  on `session/<id>` branches; save merges back and pushes the bundle.
 
 Everything that *can* be an OpenSandbox call *is* one — isogate never reimplements
 the runtime.
