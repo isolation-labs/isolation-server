@@ -11,6 +11,7 @@
 // v1 scope: cloned repos keep their own git and are EXCLUDED from the workspace
 // tree (.gitignore'd at restore). The `.overlay/` capture mechanism (tracking a
 // repo's gitignored secrets) is the next slice.
+import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes } from "node:crypto";
 import { run, writeFile } from "./execd.js";
 
 const log = (...a: unknown[]) => console.log("[persist]", ...a);
@@ -20,7 +21,35 @@ const BUNDLE = "/tmp/.iso-workspace.bundle";
 export interface WorkspaceSink {
   endpoint: string; // {endpoint}/{workspaceId} is the blob URL
   creds?: string; // bearer
+  encKey?: string; // end-to-end bundle encryption key (the sink only stores ciphertext)
   workspaceId: string;
+}
+
+// End-to-end bundle encryption — byte-compatible with the isolation daemon's
+// format so bundles migrate across runtimes: `magic(8) || iv(12) || ct || tag(16)`.
+//   ISOAEAD2 (current): key = HKDF-SHA256(encKey, salt=workspaceId, v2 label)
+//   ISOAEAD1 (legacy, decrypt-only): key = SHA-256(encKey)
+// An unmarked blob is a pre-encryption plaintext bundle → passed through.
+const AEAD_MAGIC_V2 = Buffer.from("ISOAEAD2", "ascii");
+const AEAD_MAGIC_V1 = Buffer.from("ISOAEAD1", "ascii");
+const aesKeyV2 = (encKey: string, workspaceId: string) =>
+  Buffer.from(hkdfSync("sha256", Buffer.from(encKey), Buffer.from(workspaceId), Buffer.from("isolation:workspace-bundle:v2"), 32));
+const hasMagic = (buf: Buffer, magic: Buffer): boolean => buf.length >= magic.length && buf.subarray(0, magic.length).equals(magic);
+
+function encryptBundle(buf: Buffer, encKey: string, workspaceId: string): Buffer {
+  const iv = randomBytes(12);
+  const c = createCipheriv("aes-256-gcm", aesKeyV2(encKey, workspaceId), iv);
+  const ct = Buffer.concat([c.update(buf), c.final()]);
+  return Buffer.concat([AEAD_MAGIC_V2, iv, ct, c.getAuthTag()]);
+}
+
+function decryptBundle(buf: Buffer, encKey: string, workspaceId: string): Buffer {
+  if (!hasMagic(buf, AEAD_MAGIC_V2) && !hasMagic(buf, AEAD_MAGIC_V1)) return buf; // legacy plaintext
+  const key = hasMagic(buf, AEAD_MAGIC_V2) ? aesKeyV2(encKey, workspaceId) : createHash("sha256").update(encKey).digest();
+  const body = buf.subarray(AEAD_MAGIC_V2.length);
+  const d = createDecipheriv("aes-256-gcm", key, body.subarray(0, 12));
+  d.setAuthTag(body.subarray(body.length - 16));
+  return Buffer.concat([d.update(body.subarray(12, body.length - 16)), d.final()]);
 }
 
 interface SinkState {
@@ -53,7 +82,8 @@ export async function restoreWorkspace(sandboxId: string, sink: WorkspaceSink, r
   const sessionBranch = `session/${sandboxId.slice(0, 8)}`;
   const r = await fetch(blobUrl(sink), { headers: authHeaders(sink) });
   if (r.ok) {
-    const bytes = Buffer.from(await r.arrayBuffer());
+    let bytes: Buffer = Buffer.from(await r.arrayBuffer());
+    if (sink.encKey) bytes = decryptBundle(bytes, sink.encKey, sink.workspaceId);
     await writeFile(sandboxId, BUNDLE, bytes, 0o600);
     // Reconstitute the bundle's git INTO the existing /workspace (which may already
     // hold fresh clones). Init on a placeholder branch — git refuses to fetch into
@@ -103,7 +133,8 @@ export async function saveWorkspace(sandboxId: string): Promise<{ etag?: string 
   const ep = await endpointFor(sandboxId, 44772);
   const dl = await fetch(`http://${ep.host}/files/download?path=${encodeURIComponent(BUNDLE)}`);
   if (!dl.ok) throw new Error(`bundle download from sandbox → HTTP ${dl.status}`);
-  const bytes = Buffer.from(await dl.arrayBuffer());
+  let bytes: Buffer = Buffer.from(await dl.arrayBuffer());
+  if (st.sink.encKey) bytes = encryptBundle(bytes, st.sink.encKey, st.sink.workspaceId);
   const put = await fetch(blobUrl(st.sink), {
     method: "PUT",
     headers: {

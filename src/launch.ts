@@ -13,11 +13,16 @@ import { addView, mintViewToken, type View, type ViewType } from "./views.js";
 // The launch's persistence envelope (same shape the web sends the daemon today:
 // `workspaceId` + `persistence.workspace.{endpoint, creds}`).
 function parseWorkspaceSink(body: LaunchRequest): WorkspaceSink | undefined {
-  const p = (body.persistence ?? {}) as { workspace?: { endpoint?: unknown; creds?: unknown } };
+  const p = (body.persistence ?? {}) as { workspace?: { endpoint?: unknown; creds?: unknown; encKey?: unknown } };
   const endpoint = typeof p.workspace?.endpoint === "string" ? p.workspace.endpoint.trim() : "";
   const workspaceId = typeof body.workspaceId === "string" ? body.workspaceId.trim() : "";
   if (!endpoint || !workspaceId) return undefined;
-  return { endpoint, workspaceId, creds: typeof p.workspace?.creds === "string" ? p.workspace.creds : undefined };
+  return {
+    endpoint,
+    workspaceId,
+    creds: typeof p.workspace?.creds === "string" ? p.workspace.creds : undefined,
+    encKey: typeof p.workspace?.encKey === "string" ? p.workspace.encKey : undefined,
+  };
 }
 
 const log = (...a: unknown[]) => console.log("[launch]", ...a);
