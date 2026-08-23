@@ -49,8 +49,9 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
     const detail = await r.text().catch(() => "");
     throw new OsbError(r.status, `opensandbox ${method} ${path} → HTTP ${r.status}${detail ? `: ${detail.slice(0, 300)}` : ""}`);
   }
-  if (r.status === 204) return undefined as T;
-  return (await r.json()) as T;
+  // Some lifecycle endpoints answer 200 with an empty body — tolerate both.
+  const text = await r.text();
+  return (text ? JSON.parse(text) : undefined) as T;
 }
 
 export const osbHealthy = async (): Promise<boolean> => {
