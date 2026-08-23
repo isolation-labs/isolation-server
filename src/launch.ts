@@ -8,7 +8,7 @@ import { createSandbox, type Sandbox } from "./opensandbox.js";
 import { run, waitReady, writeFile } from "./execd.js";
 import { sealedOrInline } from "./envelope.js";
 import { restoreWorkspace, type WorkspaceSink } from "./persistence.js";
-import { addView, mintViewToken, type View, type ViewType } from "./views.js";
+import { addView, mintViewToken, viewsForSandbox, type View, type ViewType } from "./views.js";
 
 // The launch's persistence envelope (same shape the web sends the daemon today:
 // `workspaceId` + `persistence.workspace.{endpoint, creds}`).
@@ -31,6 +31,11 @@ export const TOOLING_IMAGE = "isogate/tooling:0.3";
 const TERMINAL_PORT = 7681;
 const CODE_PORT = 13337;
 const DIRECTORY_PORT = 8055;
+
+// Runtime metadata values are k8s-style labels: alphanumeric/-/_/. , ≤63 chars,
+// alphanumeric at both ends. Display names live on the session record instead.
+const labelSafe = (s: string): string =>
+  s.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, "").slice(0, 63) || "session";
 
 // --- validation (ported rules: the gate must never write outside /workspace or
 // let a launch body shadow system env) -----------------------------------------
@@ -148,6 +153,44 @@ async function cloneRepo(sandboxId: string, repo: RepoSpec, creds: GitCreds): Pr
 
 // --- views ---------------------------------------------------------------------
 
+export interface ViewSpec {
+  type: ViewType;
+  port?: number; // web: the in-container app port (or derived from `url`)
+  url?: string; // web: the app URL — port + optional subpage (daemon-compatible)
+  label?: string;
+  specKey?: string;
+}
+
+// Create one view (registry entry + in-sandbox process). Shared by launch scaffolding
+// and the live create-view endpoint. Returns undefined for an unsatisfiable spec.
+export async function scaffoldView(sandboxId: string, w: ViewSpec): Promise<View | undefined> {
+  let port = w.port;
+  let appPath: string | undefined;
+  if (w.type === "web" && w.url) {
+    try {
+      const u = new URL(w.url);
+      port = Number(u.port) || (u.protocol === "https:" ? 443 : 80);
+      appPath = u.pathname !== "/" || u.search ? `${u.pathname}${u.search}` : undefined;
+    } catch {
+      /* fall through to bare port */
+    }
+  }
+  // Per-view port allocation: the type's base port, bumped past any port already
+  // taken by this sandbox's views — a second terminal must not collide with the
+  // first (both processes would race the bind and the doorman would front the
+  // survivor for both views).
+  if (!port) {
+    const base = w.type === "terminal" ? TERMINAL_PORT : w.type === "code" ? CODE_PORT : w.type === "directory" ? DIRECTORY_PORT : undefined;
+    if (!base) return undefined; // only web needs an explicit port (the app's own)
+    const taken = new Set(viewsForSandbox(sandboxId).map((x) => x.port));
+    port = base;
+    while (taken.has(port)) port++;
+  }
+  const v = addView(sandboxId, w.type, port, { label: w.label, specKey: w.specKey, appPath });
+  await startViewProcess(sandboxId, v);
+  return v;
+}
+
 // Start the in-sandbox process a view type needs and return its inside port.
 // terminal: ttyd fronting a per-view tmux session — every browser tab attaches the
 // same tmux (shared state + live mirror), and a ttyd restart reattaches. web: the
@@ -187,12 +230,14 @@ export interface LaunchRequest {
   workspaceId?: string;
   persistence?: unknown; // { workspace: { endpoint, creds } } — R2-agnostic blob sink
   repos?: unknown;
-  views?: { type: ViewType; port?: number }[];
+  views?: ViewSpec[];
   envConfig?: unknown; // sealed string or inline {files, vars}
   repoTokens?: unknown; // sealed string or inline GitCreds
   git?: { name?: string; email?: string };
   env?: Record<string, string>;
   metadata?: Record<string, string>;
+  // Live progress callback — the session layer mirrors it into the record the web polls.
+  onPhase?: (phase: string) => void;
 }
 
 export interface LaunchResult {
@@ -215,7 +260,8 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
     image: body.image?.trim() || TOOLING_IMAGE,
     entrypoint: ["sleep", "infinity"],
     env: Object.keys(env).length ? env : undefined,
-    metadata: { managedBy: "isogate", ...(body.name ? { name: body.name } : {}), ...(body.metadata ?? {}) },
+    // Metadata values must be label-safe for the runtime (alphanum/-/_/. only, ≤63).
+    metadata: { managedBy: "isogate", ...(body.name ? { name: labelSafe(body.name) } : {}), ...(body.metadata ?? {}) },
   });
   log(`sandbox ${sandbox.id} created (${body.image?.trim() || TOOLING_IMAGE})`);
 
@@ -229,6 +275,7 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
       await run(sandbox.id, `git config --global user.name ${JSON.stringify(gname)} && git config --global user.email ${JSON.stringify(gmail)}`);
     }
 
+    body.onPhase?.("cloning repositories");
     for (const repo of repos) {
       log(`cloning ${repo.url} → /workspace/${repo.name}`);
       await cloneRepo(sandbox.id, repo, gitCreds);
@@ -237,21 +284,22 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
     // Workspace persistence: restore the shared tree (branch-per-session) when the
     // launch carries a sink. Repos keep their own git and are excluded (v1).
     const sink = parseWorkspaceSink(body);
-    if (sink) await restoreWorkspace(sandbox.id, sink, repos.map((r) => r.name));
+    if (sink) {
+      body.onPhase?.("restoring workspace");
+      await restoreWorkspace(sandbox.id, sink, repos.map((r) => r.name));
+    }
 
     // Secret files land AFTER the restore so the launch environment wins; written
     // 0600 before any view/user process runs.
     for (const f of envConfig.files) {
       await writeFile(sandbox.id, `/workspace/${f.path}`, f.content, 0o600);
     }
+    body.onPhase?.("starting views");
 
     const views: LaunchResult["views"] = [];
     for (const w of wanted) {
-      const port = w.port ?? (w.type === "terminal" ? TERMINAL_PORT : w.type === "code" ? CODE_PORT : w.type === "directory" ? DIRECTORY_PORT : undefined);
-      if (!port) continue; // only web needs an explicit port (the app's own)
-      const v = addView(sandbox.id, w.type, port);
-      await startViewProcess(sandbox.id, v);
-      views.push({ ...v, path: `/v/${v.id}/`, token: mintViewToken(v.id) });
+      const v = await scaffoldView(sandbox.id, w);
+      if (v) views.push({ ...v, path: `/v/${v.id}/`, token: mintViewToken(v.id) });
     }
 
     return { sandbox, views };

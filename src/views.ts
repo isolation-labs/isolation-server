@@ -16,6 +16,9 @@ export interface View {
   sandboxId: string;
   type: ViewType;
   port: number; // the port INSIDE the sandbox this view fronts
+  label?: string; // display name
+  specKey?: string; // the workspace-level view id (layout binding across launches)
+  appPath?: string; // web: subpage the view opens on
 }
 
 let views: Record<string, View> = {};
@@ -32,10 +35,19 @@ function persist(): void {
   renameSync(tmp, VIEWS_FILE);
 }
 
-export function addView(sandboxId: string, type: ViewType, port: number): View {
-  const v: View = { id: `v-${randomBytes(6).toString("hex")}`, sandboxId, type, port };
+export function addView(sandboxId: string, type: ViewType, port: number, extra: Pick<View, "label" | "specKey" | "appPath"> = {}): View {
+  const v: View = { id: `v-${randomBytes(6).toString("hex")}`, sandboxId, type, port, ...extra };
   views[v.id] = v;
   persist();
+  return v;
+}
+
+export function dropView(id: string): View | undefined {
+  const v = views[id];
+  if (v) {
+    delete views[id];
+    persist();
+  }
   return v;
 }
 

@@ -9,8 +9,21 @@ import { deleteSandbox, getSandbox, listSandboxes, osbHealthy, pauseSandbox, res
 import { handleViewRequest, handleViewUpgrade, invalidateEndpoints } from "./doorman.js";
 import { launch, type LaunchRequest } from "./launch.js";
 import { dropSink, saveWorkspace, syncWorkspace } from "./persistence.js";
-import { dropViewsForSandbox, viewsForSandbox } from "./views.js";
-import { forgetExecd } from "./execd.js";
+import { dropView, dropViewsForSandbox, getView, mintViewToken, viewsForSandbox } from "./views.js";
+import { forgetExecd, run } from "./execd.js";
+import {
+  createSessionView,
+  finishSession,
+  getSessionRecord,
+  listSessionRecords,
+  renameSession,
+  sessionChanges,
+  sessionJson,
+  sessionViews,
+  startSession,
+  viewJson,
+  type DaemonLaunchBody,
+} from "./sessions.js";
 import { tunnelManager } from "./tunnel.js";
 
 const VERSION = "0.0.1";
@@ -85,25 +98,38 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   // Everything below is the control plane: master token required.
   if (!tokenMatches(bearer(req))) return json(res, 401, { error: "unauthorized" });
 
-  // The gate's own log tail (the web's server-card "Logs" contract).
+  // The gate's own log tail — the DAEMON's wire shape ({entries, cursor, dropped}),
+  // so the web's server-card Logs modal renders it unchanged.
   if (method === "GET" && url === "/logs") {
     try {
       const { readFileSync } = await import("node:fs");
       const { join } = await import("node:path");
       const { HOME } = await import("./config.js");
-      const lines = readFileSync(join(HOME, "isogate.log"), "utf8").split("\n");
-      return json(res, 200, { lines: lines.slice(-500) });
+      const lines = readFileSync(join(HOME, "isogate.log"), "utf8").split("\n").filter(Boolean).slice(-500);
+      return json(res, 200, {
+        entries: lines.map((line, i) => ({ seq: i, ts: "", stream: "out" as const, line })),
+        cursor: lines.length,
+        dropped: false,
+      });
     } catch {
-      return json(res, 200, { lines: [] });
+      return json(res, 200, { entries: [], cursor: 0, dropped: false });
     }
   }
 
+  // Daemon-shaped status (superset: the web reads ok/version/name/relay/sessions/
+  // views; the isogate-native fields ride along).
   if (method === "GET" && url === "/status") {
+    const t = tunnelManager.status();
     return json(res, 200, {
+      ok: true,
       version: VERSION,
       name: getName(),
+      relay: { connected: t.connected, ...(t.url ? { provider: "cloudflared", publicUrl: t.url } : {}) },
+      sessions: listSessionRecords().length,
+      views: listSessionRecords().reduce((n, s) => n + sessionViews(s).length, 0),
+      maxViews: 28,
       runtime: { kind: "opensandbox", healthy: await osbHealthy() },
-      tunnel: tunnelManager.status(),
+      tunnel: t,
       pairing: pairingStatus(),
     });
   }
@@ -171,6 +197,117 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     } catch (e) {
       return json(res, 502, { error: String((e as Error)?.message ?? e) });
     }
+  }
+
+  // ── The daemon-compatible session surface (PLAN O3) — what the web app drives ──
+
+  if (method === "POST" && url === "/sessions") {
+    return json(res, 200, sessionJson(startSession((await readBody(req)) as DaemonLaunchBody)));
+  }
+  if (method === "GET" && url === "/sessions") {
+    const q = new URL(req.url ?? "/", "http://x").searchParams;
+    return json(res, 200, listSessionRecords(q.get("workspace") ?? undefined).map(sessionJson));
+  }
+
+  if (method === "GET" && url === "/credentials") {
+    // isogate discovers nothing on its host by design — credentials come sealed at launch.
+    return json(res, 200, { claude: [], github: { present: false } });
+  }
+
+  if (url.startsWith("/views/")) {
+    const vm = /^\/views\/([a-zA-Z0-9-]+)(\/view-token)?$/.exec(url);
+    if (vm) {
+      const [, vid, tokenAction] = vm;
+      if (method === "POST" && tokenAction) {
+        if (!getView(vid)) return json(res, 404, { error: "unknown view" });
+        return json(res, 200, { token: mintViewToken(vid) });
+      }
+      if (method === "DELETE" && !tokenAction) {
+        const v = dropView(vid);
+        // Best-effort: stop the view's in-sandbox server so the port frees up.
+        if (v && v.type !== "web") {
+          const pat = v.type === "terminal" ? `ttyd .*-p ${v.port}` : v.type === "code" ? `code-server .*:${v.port}` : `filebrowser .*-p ${v.port}`;
+          void run(v.sandboxId, `pkill -f ${JSON.stringify(pat)} || true`).catch(() => undefined);
+        }
+        return json(res, 200, { ok: true });
+      }
+    }
+  }
+
+  const sess = /^\/sessions\/(s-[a-z0-9]+)(\/([a-z-]+))?$/.exec(url);
+  if (sess) {
+    const [, id, , action] = sess;
+    const s = getSessionRecord(id);
+    if (!s) return json(res, 404, { error: "unknown session" });
+    try {
+      if (method === "GET" && !action) return json(res, 200, sessionJson(s));
+      if (method === "DELETE" && !action) {
+        await finishSession(id);
+        return json(res, 200, { ok: true });
+      }
+      if (method === "GET" && action === "views") {
+        return json(res, 200, sessionViews(s).map((v) => viewJson(v, id)));
+      }
+      if (method === "POST" && action === "views") {
+        const b = await readBody(req);
+        const v = await createSessionView(s, {
+          type: (typeof b.type === "string" ? b.type : "terminal") as never,
+          url: typeof b.url === "string" ? b.url : undefined,
+          label: typeof b.label === "string" ? b.label : undefined,
+          specKey: typeof b.specKey === "string" ? b.specKey : undefined,
+        });
+        if (!v) return json(res, 400, { error: "view spec not satisfiable" });
+        return json(res, 200, viewJson(v, id));
+      }
+      if (method === "POST" && action === "save") {
+        if (!s.sandboxId) return json(res, 409, { error: "session not ready" });
+        try {
+          await saveWorkspace(s.sandboxId);
+          return json(res, 200, { ok: true });
+        } catch (e) {
+          const err = e as Error & { conflict?: boolean };
+          return json(res, err.conflict ? 409 : 502, { error: err.message });
+        }
+      }
+      if (method === "POST" && action === "sync") {
+        if (!s.sandboxId) return json(res, 409, { error: "session not ready" });
+        try {
+          const out = await syncWorkspace(s.sandboxId);
+          return json(res, 200, { merged: out.updated });
+        } catch (e) {
+          const err = e as Error & { conflict?: boolean };
+          return json(res, err.conflict ? 409 : 502, { error: err.message });
+        }
+      }
+      if (method === "POST" && action === "rename") {
+        const b = await readBody(req);
+        return json(res, 200, sessionJson(renameSession(id, String(b.name ?? "")) ?? s));
+      }
+      if (method === "GET" && action === "changes") return json(res, 200, await sessionChanges(s));
+      if (method === "GET" && action === "logs") {
+        if (!s.sandboxId) return json(res, 200, { available: false, lines: [] });
+        const text = await sandboxLogs(s.sandboxId).catch(() => undefined);
+        if (text === undefined) return json(res, 200, { available: false, lines: [] });
+        return json(res, 200, {
+          available: true,
+          lines: text.split("\n").filter(Boolean).slice(-500).map((line) => ({ ts: "", stream: "out" as const, line })),
+        });
+      }
+      if (method === "GET" && action === "claude-usage") return json(res, 200, { usage: [] });
+      if (method === "GET" && action === "agents") return json(res, 200, { agents: [] });
+      // Not implemented on this runtime yet — explicit, not silent.
+      if (["restart", "files", "merge"].includes(action ?? "")) return json(res, 501, { error: "not supported by this server runtime yet" });
+    } catch (e) {
+      return json(res, 502, { error: String((e as Error)?.message ?? e) });
+    }
+  }
+  // Nested session paths (/sessions/:id/agents/approvals, /files/…, /views/:vid/…).
+  const nested = /^\/sessions\/(s-[a-z0-9]+)\/(.+)$/.exec(url);
+  if (nested) {
+    const sub = nested[2];
+    if (method === "GET" && sub === "agents/approvals") return json(res, 200, { approvals: [] });
+    if (method === "GET" && sub === "agents/harnesses") return json(res, 200, { harnesses: [] });
+    return json(res, 501, { error: "not supported by this server runtime yet" });
   }
 
   const sb = /^\/sandboxes\/([a-zA-Z0-9-]+)(\/(pause|resume|save|sync|logs))?$/.exec(url);
