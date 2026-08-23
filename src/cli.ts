@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 // isogate CLI — MVP surface: run the gate, link it to an account, inspect it.
-//   isogate run                 run the gate in the foreground (service mgmt comes later)
+//   isogate up                  install + start as the OS login service (refreshes on re-run)
+//   isogate down                stop + disable the service
+//   isogate run                 run the gate in the foreground (dev / supervisor-less)
 //   isogate connect <token>     link this server to the cloud account that minted the token
 //   isogate disconnect          unlink (detach pairing + drop the tunnel)
 //   isogate status              show gate / runtime / tunnel / pairing state
 // The pair token is self-describing — base64url({u: <backend origin>, c: <code>}) —
 // so the CLI never hardcodes a SaaS URL.
 import { HOST, PORT, getToken } from "./config.js";
+import { serviceDown, serviceUp } from "./service.js";
 
 const base = `http://${HOST}:${PORT}`;
 const authed = (init?: RequestInit): RequestInit => ({
@@ -19,6 +22,26 @@ async function main(): Promise<void> {
 
   if (cmd === "run") {
     await import("./index.js");
+    return;
+  }
+
+  if (cmd === "up") {
+    serviceUp();
+    // Wait for the service to come up, then show its status.
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      const r = await fetch(`${base}/status`, authed()).catch(() => undefined);
+      if (r?.ok) {
+        console.log(`isogate is up on ${base} (login service)`);
+        return;
+      }
+    }
+    return fail("service installed but the gate didn't come up — check ~/.isogate/isogate.log");
+  }
+
+  if (cmd === "down") {
+    serviceDown();
+    console.log("isogate service stopped");
     return;
   }
 
@@ -53,7 +76,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  console.log("usage: isogate <run|connect <token>|disconnect|status>");
+  console.log("usage: isogate <up|down|run|connect <token>|disconnect|status>");
 }
 
 function fail(msg: string): never {
