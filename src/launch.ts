@@ -27,9 +27,10 @@ function parseWorkspaceSink(body: LaunchRequest): WorkspaceSink | undefined {
 
 const log = (...a: unknown[]) => console.log("[launch]", ...a);
 
-export const TOOLING_IMAGE = "isogate/tooling:0.2";
+export const TOOLING_IMAGE = "isogate/tooling:0.3";
 const TERMINAL_PORT = 7681;
 const CODE_PORT = 13337;
+const DIRECTORY_PORT = 8055;
 
 // --- validation (ported rules: the gate must never write outside /workspace or
 // let a launch body shadow system env) -----------------------------------------
@@ -167,6 +168,14 @@ async function startViewProcess(sandboxId: string, view: View): Promise<void> {
       cwd: "/workspace",
       background: true,
     });
+  } else if (view.type === "directory") {
+    // filebrowser emits absolute asset paths, so it must own its public base URL —
+    // the doorman forwards the UNSTRIPPED path for directory views to match.
+    await run(
+      sandboxId,
+      `filebrowser --noauth -r /workspace -a 0.0.0.0 -p ${view.port} -b /v/${view.id} -d /tmp/.iso-fb-${view.id}.db`,
+      { cwd: "/workspace", background: true },
+    );
   }
 }
 
@@ -238,8 +247,8 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
 
     const views: LaunchResult["views"] = [];
     for (const w of wanted) {
-      const port = w.port ?? (w.type === "terminal" ? TERMINAL_PORT : w.type === "code" ? CODE_PORT : undefined);
-      if (!port) continue; // web needs an explicit port; directory not shipped yet
+      const port = w.port ?? (w.type === "terminal" ? TERMINAL_PORT : w.type === "code" ? CODE_PORT : w.type === "directory" ? DIRECTORY_PORT : undefined);
+      if (!port) continue; // only web needs an explicit port (the app's own)
       const v = addView(sandbox.id, w.type, port);
       await startViewProcess(sandbox.id, v);
       views.push({ ...v, path: `/v/${v.id}/`, token: mintViewToken(v.id) });

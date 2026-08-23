@@ -110,8 +110,7 @@ export async function handleViewRequest(req: IncomingMessage, res: ServerRespons
   }
   try {
     const t = await resolveTarget(view.sandboxId, view.port);
-    const rest = (req.url ?? "").slice(`/v/${viewId}`.length) || "/";
-    req.url = `${t.basePath}${rest}`;
+    req.url = `${t.basePath}${viewPath(view, req.url, viewId)}`;
     proxy.web(req, res, { target: `http://${t.host}` });
   } catch (e) {
     targets.delete(`${view.sandboxId}:${view.port}`);
@@ -119,6 +118,14 @@ export async function handleViewRequest(req: IncomingMessage, res: ServerRespons
     res.end(JSON.stringify({ error: String((e as Error)?.message ?? e) }));
   }
   return true;
+}
+
+// Most view servers see stripped, base-relative paths (they emit relative asset
+// URLs). A directory view's filebrowser is configured WITH its /v/<id> base URL,
+// so it receives the path unstripped.
+function viewPath(view: { type: string }, url: string | undefined, viewId: string): string {
+  if (view.type === "directory") return url ?? "/";
+  return (url ?? "").slice(`/v/${viewId}`.length) || "/";
 }
 
 export async function handleViewUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
@@ -131,8 +138,7 @@ export async function handleViewUpgrade(req: IncomingMessage, socket: Duplex, he
   }
   try {
     const t = await resolveTarget(view.sandboxId, view.port);
-    const rest = (req.url ?? "").slice(`/v/${viewId}`.length) || "/";
-    req.url = `${t.basePath}${rest}`;
+    req.url = `${t.basePath}${viewPath(view, req.url, viewId)}`;
     proxy.ws(req, socket, head, { target: `http://${t.host}` });
   } catch {
     targets.delete(`${view.sandboxId}:${view.port}`);

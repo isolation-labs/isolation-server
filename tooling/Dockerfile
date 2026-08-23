@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && arch="$([ "$TARGETARCH" = "arm64" ] && echo aarch64 || echo x86_64)" \
     && curl -fsSL -o /usr/local/bin/ttyd "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.${arch}" \
     && chmod +x /usr/local/bin/ttyd \
+    && curl -fsSL https://raw.githubusercontent.com/filebrowser/get/master/get.sh | bash \
     && curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone --prefix=/opt/code-server \
     && ln -s /opt/code-server/bin/code-server /usr/local/bin/code-server \
     && mkdir -p /workspace

@@ -97,16 +97,68 @@ export async function restoreWorkspace(sandboxId: string, sink: WorkspaceSink, r
     log(`${sandboxId.slice(0, 8)}: restored bundle (etag ${r.headers.get("etag") ?? "none"})`);
   } else if (r.status === 404) {
     await sh(sandboxId, `git init -q -b main .`);
+    // DETERMINISTIC root commit (fixed identity + epoch date + empty tree): two
+    // sessions that race the very first save of a workspace each init locally —
+    // identical roots keep their histories related, so the later sync/save merges
+    // instead of hitting git's unrelated-histories refusal.
+    await sh(
+      sandboxId,
+      `GIT_AUTHOR_DATE='2000-01-01T00:00:00Z' GIT_COMMITTER_DATE='2000-01-01T00:00:00Z' ` +
+        `git -c user.name=isolation -c user.email=iso@local commit -q --allow-empty -m "workspace root"`,
+    );
     state.set(sandboxId, { sink, etag: undefined, sessionBranch });
     log(`${sandboxId.slice(0, 8)}: new workspace (no bundle yet)`);
   } else {
     throw new Error(`workspace bundle fetch → HTTP ${r.status}`);
   }
-  // v1: repos own their history — exclude them from the workspace tree.
-  const ignores = [".iso-*", ...repoNames.map((n) => `/${n}/`)].join("\n");
+  // Repos own their history — never tracked here (matches the daemon's shipped
+  // overlay semantics; the old `.overlay/` secret capture is retired per §16
+  // SEC-2 — secrets come push-only from the environment config).
+  const ignores = [
+    "# isolation overlay — cloned repos have their own git, never track them here",
+    ...repoNames.map((n) => `/${n}/`),
+    "node_modules/",
+    "*.log",
+    ".iso-*",
+  ].join("\n");
   await writeFile(sandboxId, "/workspace/.gitignore", `${ignores}\n`, 0o644);
   await sh(sandboxId, `git add .gitignore && git -c user.name=isolation -c user.email=iso@local commit -q -m "session setup" --allow-empty`);
   await sh(sandboxId, `git checkout -q -B ${sessionBranch} main && rm -f ${BUNDLE}`);
+}
+
+// Sync: pull the hub's latest main into the RUNNING session — explicit/opt-in (it
+// touches a live working tree). 304 (ETag unchanged) → nothing to do. Otherwise
+// fetch the fresh bundle's main into a side ref, advance local main, and merge it
+// into the session branch; a conflict aborts cleanly (409-shaped) with the session
+// branch untouched.
+export async function syncWorkspace(sandboxId: string): Promise<{ updated: boolean; etag?: string }> {
+  const st = state.get(sandboxId);
+  if (!st) throw new Error("no persistence configured for this sandbox");
+  const r = await fetch(blobUrl(st.sink), {
+    headers: { ...authHeaders(st.sink), ...(st.etag ? { "If-None-Match": st.etag } : {}) },
+  });
+  if (r.status === 304) return { updated: false, etag: st.etag };
+  if (r.status === 404) return { updated: false }; // nothing saved yet anywhere
+  if (!r.ok) throw new Error(`workspace bundle fetch → HTTP ${r.status}`);
+  let bytes: Buffer = Buffer.from(await r.arrayBuffer());
+  if (st.sink.encKey) bytes = decryptBundle(bytes, st.sink.encKey, st.sink.workspaceId);
+  await writeFile(sandboxId, BUNDLE, bytes, 0o600);
+  await sh(sandboxId, `git fetch -q ${BUNDLE} main:refs/iso/hub-main`);
+  await sh(sandboxId, `git branch -q -f main refs/iso/hub-main`);
+  const merge = await run(sandboxId, `git -c user.name=isolation -c user.email=iso@local merge -q -m "sync from hub" main`, {
+    cwd: "/workspace",
+    timeoutMs: 120_000,
+  });
+  await run(sandboxId, `rm -f ${BUNDLE}`, { cwd: "/workspace" });
+  if (!merge.ok || /CONFLICT/.test(merge.stdout + merge.stderr)) {
+    await run(sandboxId, `git merge --abort`, { cwd: "/workspace" });
+    const err = new Error("sync conflict — hub changes collide with this session's work") as Error & { conflict?: boolean };
+    err.conflict = true;
+    throw err;
+  }
+  st.etag = r.headers.get("etag") ?? st.etag;
+  log(`${sandboxId.slice(0, 8)}: synced to hub main (etag ${st.etag ?? "none"})`);
+  return { updated: true, etag: st.etag };
 }
 
 // Save: commit the session branch, merge --no-ff into main, bundle everything, PUT
