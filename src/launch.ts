@@ -8,6 +8,9 @@ import { createSandbox, type Sandbox } from "./opensandbox.js";
 import { run, waitReady, writeFile } from "./execd.js";
 import { sealedOrInline } from "./envelope.js";
 import { restoreWorkspace, type WorkspaceSink } from "./persistence.js";
+import { analyzeLaunch, cleanScratch, fetchDetectionFiles, type AnalysisRepo, type LaunchSpec } from "./analysis.js";
+import { workspaceHash } from "./hashes.js";
+import { dockerAvailable, ensureSpecImage } from "./images.js";
 import { addView, mintViewToken, newWebSlug, viewsForSandbox, type View, type ViewType } from "./views.js";
 
 // The launch's persistence envelope (same shape the web sends the daemon today:
@@ -263,7 +266,7 @@ export async function startWebForwarder(view: View): Promise<void> {
   if (!view.appPort) return;
   await writeFile(view.sandboxId, PORTFWD_PATH, PORTFWD_SRC, 0o644);
   await run(view.sandboxId, `pkill -f "portfwd.mjs ${view.port} " || true`);
-  await run(view.sandboxId, `node ${PORTFWD_PATH} ${view.port} ${view.appPort} ${view.id}`, { cwd: "/workspace", background: true });
+  await run(view.sandboxId, `$(command -v iso-node || command -v node) ${PORTFWD_PATH} ${view.port} ${view.appPort} ${view.id}`, { cwd: "/workspace", background: true });
 }
 
 // True when this view's forwarder process is alive inside its sandbox.
@@ -306,14 +309,45 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
   const env: Record<string, string> = { ...(body.env ?? {}) };
   for (const v of envConfig.vars) env[v.name] = v.value;
 
+  // The image (PLAN O4): analyze the repos' detection files host-side, hash them, and
+  // build/reuse `isogate-spec:<wsHash>` — a repo's own .devcontainer (image / Dockerfile /
+  // features) or a generated language base, plus our tooling layer. An explicit `image`
+  // in the body wins; no docker CLI on the host (or a build failure) → the static
+  // tooling image, so a launch never dies on image prep.
+  let image = body.image?.trim() || "";
+  let spec: LaunchSpec | undefined;
+  const analysisRepos: AnalysisRepo[] = repos.map((r) => ({
+    url: r.url,
+    dir: r.name,
+    branch: r.branch,
+    token: gitCreds.repoTokens.find((t) => t.url === r.url)?.token ?? (/github\.com/.test(r.url) ? gitCreds.githubOauth : undefined),
+  }));
+  if (!image && dockerAvailable()) {
+    const scratchId = `a-${randomBytes(4).toString("hex")}`;
+    try {
+      body.onPhase?.("analyzing repositories");
+      const scratch = fetchDetectionFiles(analysisRepos, scratchId);
+      spec = analyzeLaunch(scratch);
+      const wsHash = workspaceHash(scratch);
+      body.onPhase?.("preparing image");
+      image = await ensureSpecImage(spec, analysisRepos, wsHash, (l) => body.onPhase?.(`preparing image · ${l}`));
+    } catch (e) {
+      log(`image pipeline failed, using the tooling image: ${String((e as Error)?.message ?? e)}`);
+      image = "";
+    } finally {
+      cleanScratch(scratchId);
+    }
+  }
+  if (!image) image = TOOLING_IMAGE;
+
   const sandbox = await createSandbox({
-    image: body.image?.trim() || TOOLING_IMAGE,
+    image,
     entrypoint: ["sleep", "infinity"],
     env: Object.keys(env).length ? env : undefined,
     // Metadata values must be label-safe for the runtime (alphanum/-/_/. only, ≤63).
     metadata: { managedBy: "isogate", ...(body.name ? { name: labelSafe(body.name) } : {}), ...(body.metadata ?? {}) },
   });
-  log(`sandbox ${sandbox.id} created (${body.image?.trim() || TOOLING_IMAGE})`);
+  log(`sandbox ${sandbox.id} created (${image})`);
 
   try {
     await waitReady(sandbox.id);
@@ -343,6 +377,20 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
     // 0600 before any view/user process runs.
     for (const f of envConfig.files) {
       await writeFile(sandbox.id, `/workspace/${f.path}`, f.content, 0o600);
+    }
+    // devcontainer lifecycle hooks (repository configs): postCreate runs once per fresh
+    // sandbox, postStart every boot — inside the sandbox, in the owning repo's dir.
+    const hooks = spec?.source === "repository" ? spec.devContainer.raw : undefined;
+    if (hooks && spec?.repoDir) {
+      const cwd = `/workspace/${spec.repoDir}`;
+      for (const [key, label] of [["postCreateCommand", "postCreate"], ["postStartCommand", "postStart"]] as const) {
+        const cmd = hooks[key];
+        const text = Array.isArray(cmd) ? cmd.map((c) => JSON.stringify(String(c))).join(" ") : typeof cmd === "string" ? cmd : typeof cmd === "object" && cmd ? Object.values(cmd as Record<string, unknown>).map(String).join(" && ") : "";
+        if (!text) continue;
+        body.onPhase?.(`running ${label}`);
+        const r = await run(sandbox.id, text, { cwd, timeoutMs: 900_000 });
+        if (!r.ok) log(`${label} hook failed (continuing): ${(r.stderr || r.stdout).trim().slice(-300)}`);
+      }
     }
     body.onPhase?.("starting views");
 

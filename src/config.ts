@@ -11,6 +11,7 @@ export const HOME = process.env.ISOGATE_HOME ?? join(homedir(), ".isogate");
 export const CONFIG_FILE = join(HOME, "config.json");
 export const DATA = join(HOME, "data");
 export const VIEWS_FILE = join(DATA, "views.json");
+export const LAUNCH_SCRATCH = join(HOME, "launch", "scratch");
 
 // 8090: side-by-side with a legacy isolation daemon (8088) during the migration window.
 export const PORT = Number(process.env.ISOGATE_PORT ?? 8090);

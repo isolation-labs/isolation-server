@@ -128,7 +128,9 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
     repoTokens: body.repoTokens,
     git: body.git ?? (body.workspace?.gitIdentity?.name && body.workspace?.gitIdentity?.email ? { name: body.workspace.gitIdentity.name, email: body.workspace.gitIdentity.email } : undefined),
     metadata: { sessionId: id },
-    onPhase: (phase) => update(id, { phase }),
+    // Build logs ride the phase string — strip control chars and cap it so the record
+    // stays clean JSON and the web's status line stays one line.
+    onPhase: (phase) => update(id, { phase: phase.replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 160) }),
   };
 
   void launch(req)
