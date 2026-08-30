@@ -9,7 +9,7 @@ import { cpSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
-import { imageExists } from "./images.js";
+import { imageExists, pullImage, pushImageInBackground, type ImageRegistry } from "./images.js";
 
 const log = (...a: unknown[]) => console.log("[cache]", ...a);
 const building = new Set<string>();
@@ -75,9 +75,15 @@ export function cacheDockerfile(scratchDir: string, specImage: string, dirs: str
   return `FROM ${specImage}\nUSER root\n\n${dirs.map((d) => installFragment(scratchDir, d)).join("\n\n")}\n`;
 }
 
+// Is a cache image available locally — or pullable from the registry?
+export async function cacheImageAvailable(key: string, registry?: ImageRegistry): Promise<boolean> {
+  const tag = cacheImageTag(key);
+  return imageExists(tag) || (!!registry && (await pullImage(registry, tag)));
+}
+
 // Fire-and-forget: build the cache image from the spec image + the scratch manifests.
 // `onDone` runs after (success or failure) so the caller can clean its scratch dir.
-export function buildDependencyCacheInBackground(key: string, specImage: string, scratchDir: string, dirs: string[], onDone: () => void): void {
+export function buildDependencyCacheInBackground(key: string, specImage: string, scratchDir: string, dirs: string[], onDone: () => void, registry?: ImageRegistry): void {
   const tag = cacheImageTag(key);
   if (building.has(key) || imageExists(tag) || dirs.length === 0) {
     onDone();
@@ -102,7 +108,10 @@ export function buildDependencyCacheInBackground(key: string, specImage: string,
   p.on("exit", (code) => {
     rmSync(ctx, { recursive: true, force: true });
     building.delete(key);
-    if (code === 0) log(`ready: ${tag}`);
+    if (code === 0) {
+      log(`ready: ${tag}`);
+      if (registry) pushImageInBackground(registry, tag);
+    }
     else log(`build failed (${code}): ${tail.trim().split("\n").slice(-3).join(" / ")}`);
     onDone();
   });

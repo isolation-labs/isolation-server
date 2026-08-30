@@ -7,9 +7,78 @@ import { spawnSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { hostClone, type AnalysisRepo, type LaunchSpec } from "./analysis.js";
+import { HOME } from "./config.js";
 
 const log = (...a: unknown[]) => console.log("[images]", ...a);
+
+// The launch's `persistence.cache` envelope: a registry the SaaS provisions so a FRESH
+// Cloud VM pulls spec/cache images built elsewhere instead of rebuilding. Images are
+// addressed `<registry>/<repository>:<kind>-<hash>`; creds (when given) are used for a
+// per-process `docker login` and never logged.
+export interface ImageRegistry {
+  registry: string;
+  repository: string;
+  username?: string;
+  password?: string;
+}
+
+const remoteRef = (r: ImageRegistry, localTag: string): string => `${r.registry.replace(/\/+$/, "")}/${r.repository}:${localTag.replace(":", "-")}`;
+
+// Registry ops run with their OWN docker config dir, not the user's ~/.docker: the user's
+// config may name a credential helper (Docker Desktop's `desktop`/`osxkeychain`) that
+// blocks waiting on a keychain/GUI session when invoked from a login service — a pull of
+// even a missing tag then hangs. Our dir has no credsStore; when the envelope carries
+// creds, `docker login` writes them into THIS dir only (0700, gate-owned, per registry).
+function dockerEnv(r: ImageRegistry): NodeJS.ProcessEnv {
+  const dir = join(DOCKER_CFG_ROOT, createHash("sha256").update(r.registry).digest("hex").slice(0, 16));
+  if (!existsSync(join(dir, "config.json"))) {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, "config.json"), "{}", { mode: 0o600 });
+  }
+  return { ...process.env, DOCKER_CONFIG: dir };
+}
+const loggedIn = new Set<string>();
+function dockerLogin(r: ImageRegistry, env: NodeJS.ProcessEnv): void {
+  if (!r.username || !r.password || loggedIn.has(r.registry)) return;
+  const p = spawnSync("docker", ["login", r.registry, "-u", r.username, "--password-stdin"], { input: r.password, env, stdio: ["pipe", "ignore", "ignore"] });
+  if (p.status === 0) loggedIn.add(r.registry);
+}
+
+// Pull `<localTag>` from the registry (tagging it locally) — true on success. Async:
+// a multi-GB pull must never block the gate's event loop (heartbeats, views).
+export async function pullImage(r: ImageRegistry, localTag: string): Promise<boolean> {
+  const env = dockerEnv(r);
+  dockerLogin(r, env);
+  const ref = remoteRef(r, localTag);
+  // Hard cap: a registry that neither answers nor fails (seen with Docker Desktop and a
+  // loopback registry) must never wedge a launch — give up and build locally instead.
+  const ok = await new Promise<boolean>((resolve) => {
+    const p = spawn("docker", ["pull", "-q", ref], { stdio: "ignore", env });
+    const t = setTimeout(() => {
+      log(`pull of ${localTag} timed out — building locally`);
+      p.kill("SIGKILL");
+    }, PULL_TIMEOUT_MS);
+    p.on("error", () => { clearTimeout(t); resolve(false); });
+    p.on("exit", (code) => { clearTimeout(t); resolve(code === 0); });
+  });
+  if (!ok) return false;
+  spawnSync("docker", ["tag", ref, localTag], { stdio: "ignore" });
+  log(`pulled ${localTag} from ${r.registry}`);
+  return true;
+}
+
+// Push in the background — a launch never waits on a push.
+export function pushImageInBackground(r: ImageRegistry, localTag: string): void {
+  const env = dockerEnv(r);
+  dockerLogin(r, env);
+  const ref = remoteRef(r, localTag);
+  spawnSync("docker", ["tag", localTag, ref], { stdio: "ignore" });
+  const p = spawn("docker", ["push", "-q", ref], { stdio: "ignore", env });
+  p.on("exit", (code) => log(code === 0 ? `pushed ${localTag} → ${r.registry}` : `push of ${localTag} failed (${code})`));
+  p.on("error", () => log(`push of ${localTag} failed to start`));
+}
 
 // Multi-arch, apt-based, git + a non-root user: what a workspace with no detectable
 // language gets. Batteries (Node/Python) come from analysis-picked images, not here.
@@ -18,6 +87,8 @@ const NODE_VERSION = "22.14.0";
 const TTYD_VERSION = "1.7.7";
 const FILEBROWSER_VERSION = "2.63.16";
 const DEVCONTAINER_CLI_VERSION = "0.80.0";
+const PULL_TIMEOUT_MS = 10 * 60_000;
+const DOCKER_CFG_ROOT = join(HOME, "docker-config");
 
 export const specImageTag = (wsHash: string) => `isogate-spec:${wsHash.slice(0, 32)}`;
 const devcImageTag = (wsHash: string) => `isogate-devc:${wsHash.slice(0, 32)}`;
@@ -100,9 +171,13 @@ function runLogged(cmd: string, args: string[], onLine?: (l: string) => void): P
 
 // Ensure the spec image for this workspace hash exists; returns its tag. `onLine`
 // streams build output so the launch can report progress instead of an opaque wait.
-export async function ensureSpecImage(spec: LaunchSpec, repos: AnalysisRepo[], wsHash: string, onLine?: (l: string) => void): Promise<string> {
+export async function ensureSpecImage(spec: LaunchSpec, repos: AnalysisRepo[], wsHash: string, onLine?: (l: string) => void, registry?: ImageRegistry): Promise<string> {
   const tag = specImageTag(wsHash);
   if (imageExists(tag)) return tag;
+  if (registry) {
+    onLine?.("looking for a prebuilt session image");
+    if (await pullImage(registry, tag)) return tag;
+  }
   const base = (await buildDevcontainerBase(spec, repos, wsHash, onLine)) ?? spec.devContainer.image ?? DEFAULT_BASE;
   const ctx = mkdtempSync(join(tmpdir(), "isogate-spec-"));
   try {
@@ -111,6 +186,7 @@ export async function ensureSpecImage(spec: LaunchSpec, repos: AnalysisRepo[], w
     const ok = await runLogged("docker", ["build", "-t", tag, ctx], onLine);
     if (!ok || !imageExists(tag)) throw new Error(`session image build failed (base ${base})`);
     log(`built ${tag} from ${base}`);
+    if (registry) pushImageInBackground(registry, tag);
     return tag;
   } finally {
     rmSync(ctx, { recursive: true, force: true });

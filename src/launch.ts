@@ -10,12 +10,22 @@ import { sealedOrInline } from "./envelope.js";
 import { restoreWorkspace, type WorkspaceSink } from "./persistence.js";
 import { analyzeLaunch, cleanScratch, fetchDetectionFiles, type AnalysisRepo, type LaunchSpec } from "./analysis.js";
 import { cacheKey, dependencyHash, workspaceHash } from "./hashes.js";
-import { buildDependencyCacheInBackground, cacheImageTag, reposWithDeps } from "./cache.js";
-import { dockerAvailable, ensureSpecImage, imageExists } from "./images.js";
+import { buildDependencyCacheInBackground, cacheImageAvailable, cacheImageTag, reposWithDeps } from "./cache.js";
+import { dockerAvailable, ensureSpecImage, type ImageRegistry } from "./images.js";
 import { addView, mintViewToken, newWebSlug, viewsForSandbox, type View, type ViewType } from "./views.js";
 
 // The launch's persistence envelope (same shape the web sends the daemon today:
 // `workspaceId` + `persistence.workspace.{endpoint, creds}`).
+// `persistence.cache` — the image registry a Cloud VM pulls/pushes spec + cache images
+// through (creds optional: managed VMs are already docker-logged-in by provisioning).
+function parseImageRegistry(body: LaunchRequest): ImageRegistry | undefined {
+  const c = ((body.persistence ?? {}) as { cache?: Record<string, unknown> }).cache;
+  const registry = typeof c?.registry === "string" ? c.registry.trim() : "";
+  const repository = typeof c?.repository === "string" ? c.repository.trim() : "";
+  if (!registry || !repository) return undefined;
+  return { registry, repository, username: typeof c?.username === "string" ? c.username : undefined, password: typeof c?.password === "string" ? c.password : undefined };
+}
+
 function parseWorkspaceSink(body: LaunchRequest): WorkspaceSink | undefined {
   const p = (body.persistence ?? {}) as { workspace?: { endpoint?: unknown; creds?: unknown; encKey?: unknown } };
   const endpoint = typeof p.workspace?.endpoint === "string" ? p.workspace.endpoint.trim() : "";
@@ -336,11 +346,13 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
       const scratch = fetchDetectionFiles(analysisRepos, scratchId);
       spec = analyzeLaunch(scratch);
       const wsHash = workspaceHash(scratch);
+      log(`analysis: ${spec.source} config${spec.repoDir ? ` (${spec.repoDir}/.devcontainer)` : ""} → base ${spec.devContainer.image ?? "(default)"}; wsHash ${wsHash.slice(0, 12)}`);
       body.onPhase?.("preparing image");
-      const specImage = await ensureSpecImage(spec, analysisRepos, wsHash, (l) => body.onPhase?.(`preparing image · ${l}`));
+      const registry = parseImageRegistry(body);
+      const specImage = await ensureSpecImage(spec, analysisRepos, wsHash, (l) => body.onPhase?.(`preparing image · ${l}`), registry);
       const key = cacheKey(wsHash, dependencyHash(scratch));
       const dirs = reposWithDeps(scratch, repos.map((r) => r.name));
-      if (dirs.length && imageExists(cacheImageTag(key))) {
+      if (dirs.length && (await cacheImageAvailable(key, registry))) {
         image = cacheImageTag(key);
         cacheDirs = dirs;
         log(`dependency cache hit: ${image}`);
@@ -348,7 +360,7 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
         image = specImage;
         if (dirs.length) {
           keepScratch = true; // the background build reads the scratch manifests
-          startCacheBuild = () => buildDependencyCacheInBackground(key, specImage, scratch, dirs, () => cleanScratch(scratchId));
+          startCacheBuild = () => buildDependencyCacheInBackground(key, specImage, scratch, dirs, () => cleanScratch(scratchId), registry);
         }
       }
     } catch (e) {
