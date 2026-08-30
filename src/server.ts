@@ -361,8 +361,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         const b = await readBody(req);
         const def = parseRoster([b])[0];
         if (!def) return json(res, 400, { error: "agent needs id + name" });
-        const r = spawnAgent(id, def);
-        return "error" in r ? json(res, 409, r) : json(res, 201, agentJson(r));
+        return json(res, 201, agentJson(spawnAgent(id, s.workspaceId ?? id, s.sandboxId, def)));
       }
       // Not implemented on this runtime yet — explicit, not silent.
       if (["restart", "files", "merge"].includes(action ?? "")) return json(res, 501, { error: "not supported by this server runtime yet" });

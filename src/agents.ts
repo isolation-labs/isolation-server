@@ -131,10 +131,10 @@ export function getAgent(agentId: string): (AgentRecord & { runtimeId: string })
 }
 
 // Spawn a new agent into a running session (control-plane op / an agent asking for help).
-export function spawnAgent(sessionId: string, def: AgentDef): (AgentRecord & { runtimeId: string }) | { error: string } {
-  const any = [...live.values()].find((r) => r.sessionId === sessionId);
-  if (!any) return { error: "unknown or not-ready session" };
-  const rec = newAgent(any.workspaceId, sessionId, any.sandboxId, def, "running") as AgentRecord & { runtimeId: string };
+// The session's workspace + sandbox ids are passed in (the caller has the session record) so the
+// FIRST agent of an empty session can be created — not bootstrapped off an existing one.
+export function spawnAgent(sessionId: string, workspaceId: string, sandboxId: string | undefined, def: AgentDef): (AgentRecord & { runtimeId: string }) {
+  const rec = newAgent(workspaceId, sessionId, sandboxId, def, "running") as AgentRecord & { runtimeId: string };
   log(`${sessionId}: spawned "${def.name}"`);
   return rec;
 }
