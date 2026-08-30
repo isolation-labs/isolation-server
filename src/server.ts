@@ -11,6 +11,8 @@ import { launch, type LaunchRequest } from "./launch.js";
 import { dropSink, saveWorkspace, syncWorkspace } from "./persistence.js";
 import { dropView, dropViewsForSandbox, getView, mintViewToken, viewsForSandbox } from "./views.js";
 import { forgetExecd, run } from "./execd.js";
+import { agentJson, getAgent, listAgents, parseRoster, sendMessage, spawnAgent, startAgent, stopAgent } from "./agents.js";
+import { listHarnesses } from "./harness.js";
 import {
   createSessionView,
   finishSession,
@@ -244,6 +246,24 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     return json(res, 200, { claude: [], github: { present: false } });
   }
 
+  const ag = /^\/agents\/([a-zA-Z0-9-]+)(\/(messages|start))?$/.exec(url);
+  if (ag) {
+    const [, agentId, , act] = ag;
+    const rec = getAgent(agentId);
+    if (!rec) return json(res, 404, { error: "unknown agent" });
+    if (method === "GET" && !act) return json(res, 200, { ...agentJson(rec), conversation: rec.conversation });
+    if (method === "GET" && act === "messages") return json(res, 200, { messages: rec.conversation });
+    if (method === "POST" && act === "messages") {
+      const b = await readBody(req);
+      const text = typeof b.text === "string" ? b.text : "";
+      if (!text.trim()) return json(res, 400, { error: "text required" });
+      const out = await sendMessage(agentId, text, typeof b.from === "string" ? b.from : "sidebar");
+      return "error" in out ? json(res, 502, out) : json(res, 200, out);
+    }
+    if (method === "POST" && act === "start") return json(res, 200, { ok: startAgent(agentId) });
+    if (method === "DELETE" && !act) return json(res, 200, { ok: stopAgent(agentId) });
+  }
+
   if (url.startsWith("/views/")) {
     const vm = /^\/views\/([a-zA-Z0-9-]+)(\/view-token)?$/.exec(url);
     if (vm) {
@@ -336,7 +356,14 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         });
       }
       if (method === "GET" && action === "claude-usage") return json(res, 200, { usage: [] });
-      if (method === "GET" && action === "agents") return json(res, 200, { agents: [] });
+      if (method === "GET" && action === "agents") return json(res, 200, { agents: listAgents(id).map(agentJson) });
+      if (method === "POST" && action === "agents") {
+        const b = await readBody(req);
+        const def = parseRoster([b])[0];
+        if (!def) return json(res, 400, { error: "agent needs id + name" });
+        const r = spawnAgent(id, def);
+        return "error" in r ? json(res, 409, r) : json(res, 201, agentJson(r));
+      }
       // Not implemented on this runtime yet — explicit, not silent.
       if (["restart", "files", "merge"].includes(action ?? "")) return json(res, 501, { error: "not supported by this server runtime yet" });
     } catch (e) {
@@ -348,7 +375,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (nested) {
     const sub = nested[2];
     if (method === "GET" && sub === "agents/approvals") return json(res, 200, { approvals: [] });
-    if (method === "GET" && sub === "agents/harnesses") return json(res, 200, { harnesses: [] });
+    if (method === "GET" && sub === "agents/harnesses") return json(res, 200, { harnesses: listHarnesses() });
     return json(res, 501, { error: "not supported by this server runtime yet" });
   }
 

@@ -15,6 +15,7 @@ import { deleteSandbox } from "./opensandbox.js";
 import { run } from "./execd.js";
 import { dropSink, sinkFor } from "./persistence.js";
 import { dropViewsForSandbox, viewsForSandbox, type View, type ViewType } from "./views.js";
+import { dropSessionAgents, parseRoster, registerRoster, type AgentDef } from "./agents.js";
 
 const log = (...a: unknown[]) => console.log("[sessions]", ...a);
 const FILE = join(DATA, "sessions.json");
@@ -33,6 +34,7 @@ export interface SessionRecord {
   phase?: string;
   origin?: "local";
   createdAt: number;
+  roster?: AgentDef[];
 }
 
 let sessions: Record<string, SessionRecord> = {};
@@ -84,6 +86,7 @@ export interface DaemonLaunchBody {
   git?: { name?: string; email?: string };
   name?: string;
   origin?: string;
+  agents?: unknown; // the workspace's agent roster (PLAN O5); parsed via parseRoster
 }
 
 const VIEW_TYPES = new Set(["terminal", "code", "directory", "web"]);
@@ -114,6 +117,7 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
     phase: "starting container",
     ...(body.origin === "local" ? { origin: "local" as const } : {}),
     createdAt: Date.now(),
+    roster: parseRoster(body.agents),
   };
   sessions[id] = rec;
   persist();
@@ -136,7 +140,8 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
   void launch(req)
     .then((out) => {
       update(id, { sandboxId: out.sandbox.id, state: "ready", phase: undefined });
-      log(`${id} ready (sandbox ${out.sandbox.id.slice(0, 8)})`);
+      if (rec.roster?.length) registerRoster(rec.workspaceId ?? id, id, out.sandbox.id, rec.roster);
+      log(`${id} ready (sandbox ${out.sandbox.id.slice(0, 8)})${rec.roster?.length ? `, ${rec.roster.length} agent(s)` : ""}`);
     })
     .catch((e: Error) => {
       update(id, { state: "error", error: e.message, phase: undefined });
@@ -153,6 +158,7 @@ export async function finishSession(id: string): Promise<void> {
     dropViewsForSandbox(s.sandboxId);
     dropSink(s.sandboxId);
   }
+  dropSessionAgents(id);
   delete sessions[id];
   persist();
 }
