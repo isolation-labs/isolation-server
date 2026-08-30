@@ -12,6 +12,9 @@
 // tree (.gitignore'd at restore). The `.overlay/` capture mechanism (tracking a
 // repo's gitignored secrets) is the next slice.
 import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { SECRETS } from "./config.js";
 import { run, writeFile } from "./execd.js";
 
 const log = (...a: unknown[]) => console.log("[persist]", ...a);
@@ -58,13 +61,32 @@ interface SinkState {
   sessionBranch: string;
 }
 
-// Per-sandbox persistence state, session-transient by design (a gate restart
-// re-reads nothing: save calls re-arrive from the web with the envelope — v1 keeps
-// it in memory and accepts that a gate restart needs a relaunch to save again).
+// Per-sandbox persistence state. It holds the sink's bearer + encKey, so it lives in
+// the gate's 0600 secret store (HOME/secrets/sinks.json) — sandbox-lifetime only,
+// dropped on finish — and survives a gate restart (a rebuild/`isogate up` mid-session
+// must not strand the session's ability to save or sync).
 const state = new Map<string, SinkState>();
+const SINKS_FILE = join(SECRETS, "sinks.json");
+try {
+  for (const [k, v] of Object.entries(JSON.parse(readFileSync(SINKS_FILE, "utf8")) as Record<string, SinkState>)) state.set(k, v);
+} catch {
+  /* first run / nothing persisted */
+}
+function persistSinks(): void {
+  mkdirSync(SECRETS, { recursive: true, mode: 0o700 });
+  const tmp = `${SINKS_FILE}.tmp`;
+  writeFileSync(tmp, JSON.stringify(Object.fromEntries(state)), { mode: 0o600 });
+  renameSync(tmp, SINKS_FILE);
+}
+function setSink(sandboxId: string, st: SinkState): void {
+  state.set(sandboxId, st);
+  persistSinks();
+}
 
 export const sinkFor = (sandboxId: string): SinkState | undefined => state.get(sandboxId);
-export const dropSink = (sandboxId: string): void => void state.delete(sandboxId);
+export const dropSink = (sandboxId: string): void => {
+  if (state.delete(sandboxId)) persistSinks();
+};
 
 const blobUrl = (s: WorkspaceSink): string => `${s.endpoint.replace(/\/+$/, "")}/${encodeURIComponent(s.workspaceId)}`;
 const authHeaders = (s: WorkspaceSink): Record<string, string> => (s.creds ? { Authorization: `Bearer ${s.creds}` } : {});
@@ -93,7 +115,7 @@ export async function restoreWorkspace(sandboxId: string, sink: WorkspaceSink, r
     await sh(sandboxId, `git init -q -b _iso_restore .`);
     await sh(sandboxId, `git fetch -q ${BUNDLE} 'refs/*:refs/*'`);
     await sh(sandboxId, `git checkout -q main`);
-    state.set(sandboxId, { sink, etag: r.headers.get("etag") ?? undefined, sessionBranch });
+    setSink(sandboxId, { sink, etag: r.headers.get("etag") ?? undefined, sessionBranch });
     log(`${sandboxId.slice(0, 8)}: restored bundle (etag ${r.headers.get("etag") ?? "none"})`);
   } else if (r.status === 404) {
     await sh(sandboxId, `git init -q -b main .`);
@@ -106,7 +128,7 @@ export async function restoreWorkspace(sandboxId: string, sink: WorkspaceSink, r
       `GIT_AUTHOR_DATE='2000-01-01T00:00:00Z' GIT_COMMITTER_DATE='2000-01-01T00:00:00Z' ` +
         `git -c user.name=isolation -c user.email=iso@local commit -q --allow-empty -m "workspace root"`,
     );
-    state.set(sandboxId, { sink, etag: undefined, sessionBranch });
+    setSink(sandboxId, { sink, etag: undefined, sessionBranch });
     log(`${sandboxId.slice(0, 8)}: new workspace (no bundle yet)`);
   } else {
     throw new Error(`workspace bundle fetch → HTTP ${r.status}`);
@@ -157,6 +179,7 @@ export async function syncWorkspace(sandboxId: string): Promise<{ updated: boole
     throw err;
   }
   st.etag = r.headers.get("etag") ?? st.etag;
+  persistSinks();
   log(`${sandboxId.slice(0, 8)}: synced to hub main (etag ${st.etag ?? "none"})`);
   return { updated: true, etag: st.etag };
 }
@@ -204,6 +227,7 @@ export async function saveWorkspace(sandboxId: string): Promise<{ etag?: string 
   if (!put.ok) throw new Error(`bundle PUT → HTTP ${put.status}`);
   const etag = put.headers.get("etag") ?? undefined;
   st.etag = etag;
+  persistSinks();
   await run(sandboxId, `rm -f ${BUNDLE}`, { cwd: "/workspace" });
   log(`${sandboxId.slice(0, 8)}: saved (etag ${etag ?? "none"})`);
   return { etag };

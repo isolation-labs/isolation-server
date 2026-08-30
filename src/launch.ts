@@ -9,8 +9,9 @@ import { run, waitReady, writeFile } from "./execd.js";
 import { sealedOrInline } from "./envelope.js";
 import { restoreWorkspace, type WorkspaceSink } from "./persistence.js";
 import { analyzeLaunch, cleanScratch, fetchDetectionFiles, type AnalysisRepo, type LaunchSpec } from "./analysis.js";
-import { workspaceHash } from "./hashes.js";
-import { dockerAvailable, ensureSpecImage } from "./images.js";
+import { cacheKey, dependencyHash, workspaceHash } from "./hashes.js";
+import { buildDependencyCacheInBackground, cacheImageTag, reposWithDeps } from "./cache.js";
+import { dockerAvailable, ensureSpecImage, imageExists } from "./images.js";
 import { addView, mintViewToken, newWebSlug, viewsForSandbox, type View, type ViewType } from "./views.js";
 
 // The launch's persistence envelope (same shape the web sends the daemon today:
@@ -322,20 +323,39 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
     branch: r.branch,
     token: gitCreds.repoTokens.find((t) => t.url === r.url)?.token ?? (/github\.com/.test(r.url) ? gitCreds.githubOauth : undefined),
   }));
+  // Dependency cache: when a cache image for this exact (workspace, dependencies) pair
+  // exists, launch FROM it and restore the baked deps post-clone; otherwise launch from
+  // the spec image and build the cache in the background for next time.
+  let cacheDirs: string[] = [];
+  let startCacheBuild: (() => void) | undefined;
   if (!image && dockerAvailable()) {
     const scratchId = `a-${randomBytes(4).toString("hex")}`;
+    let keepScratch = false;
     try {
       body.onPhase?.("analyzing repositories");
       const scratch = fetchDetectionFiles(analysisRepos, scratchId);
       spec = analyzeLaunch(scratch);
       const wsHash = workspaceHash(scratch);
       body.onPhase?.("preparing image");
-      image = await ensureSpecImage(spec, analysisRepos, wsHash, (l) => body.onPhase?.(`preparing image · ${l}`));
+      const specImage = await ensureSpecImage(spec, analysisRepos, wsHash, (l) => body.onPhase?.(`preparing image · ${l}`));
+      const key = cacheKey(wsHash, dependencyHash(scratch));
+      const dirs = reposWithDeps(scratch, repos.map((r) => r.name));
+      if (dirs.length && imageExists(cacheImageTag(key))) {
+        image = cacheImageTag(key);
+        cacheDirs = dirs;
+        log(`dependency cache hit: ${image}`);
+      } else {
+        image = specImage;
+        if (dirs.length) {
+          keepScratch = true; // the background build reads the scratch manifests
+          startCacheBuild = () => buildDependencyCacheInBackground(key, specImage, scratch, dirs, () => cleanScratch(scratchId));
+        }
+      }
     } catch (e) {
       log(`image pipeline failed, using the tooling image: ${String((e as Error)?.message ?? e)}`);
       image = "";
     } finally {
-      cleanScratch(scratchId);
+      if (!keepScratch) cleanScratch(scratchId);
     }
   }
   if (!image) image = TOOLING_IMAGE;
@@ -364,6 +384,14 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
       log(`cloning ${repo.url} → /workspace/${repo.name}`);
       await cloneRepo(sandbox.id, repo, gitCreds);
     }
+    // Cache hit: copy the baked deps (node_modules, .venv, vendor, …) into each fresh
+    // clone where missing — cp -a, since /iso and /workspace may be different mounts.
+    for (const dir of cacheDirs) {
+      body.onPhase?.("restoring cached dependencies");
+      await run(sandbox.id, `[ -d /iso/cache/${dir} ] && for e in /iso/cache/${dir}/* /iso/cache/${dir}/.[!.]*; do [ -e "$e" ] || continue; n=$(basename "$e"); [ -e /workspace/${dir}/$n ] || cp -a "$e" /workspace/${dir}/; done; true`, { timeoutMs: 300_000 });
+    }
+    // Launch has priority; the cache build starts only once the session is on its way.
+    startCacheBuild?.();
 
     // Workspace persistence: restore the shared tree (branch-per-session) when the
     // launch carries a sink. Repos keep their own git and are excluded (v1).
