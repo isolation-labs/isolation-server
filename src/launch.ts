@@ -27,7 +27,7 @@ function parseWorkspaceSink(body: LaunchRequest): WorkspaceSink | undefined {
 
 const log = (...a: unknown[]) => console.log("[launch]", ...a);
 
-export const TOOLING_IMAGE = "isogate/tooling:0.3";
+export const TOOLING_IMAGE = "isogate/tooling:0.4";
 const TERMINAL_PORT = 7681;
 const CODE_PORT = 13337;
 const DIRECTORY_PORT = 8055;
