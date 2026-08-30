@@ -2,7 +2,7 @@
 // stays behind this interface (the enrollment names it); the URL is never hardcoded
 // and changes on every restart, which the heartbeat self-heals.
 import { type ChildProcess, spawn } from "node:child_process";
-import { HOST, PORT } from "./config.js";
+import { HOST, PORT, getSandbox } from "./config.js";
 
 const log = (...a: unknown[]) => console.log("[tunnel]", ...a);
 
@@ -112,3 +112,64 @@ class TunnelManager {
 }
 
 export const tunnelManager = new TunnelManager();
+
+// The sandbox (public web) tunnel: a NAMED cloudflared tunnel whose ingress the cloud
+// configured as `*.<domain>` → http://localhost:<PORT>. We only run it with its token.
+class SandboxTunnelManager {
+  private child: ChildProcess | undefined;
+  private stopping = false;
+  private up = false;
+
+  status(): { connected: boolean; domain?: string } {
+    return { connected: this.up, domain: getSandbox()?.domain };
+  }
+
+  async start(): Promise<void> {
+    await this.stop();
+    const sb = getSandbox();
+    if (!sb) return;
+    if (sb.provider !== "cloudflared") throw new Error(`unsupported sandbox provider '${sb.provider}'`);
+    const bin = await ensureCloudflared(log);
+    this.stopping = false;
+    const child = spawn(bin, ["tunnel", "run", "--token", sb.creds], { stdio: ["ignore", "pipe", "pipe"] });
+    this.child = child;
+    const scan = (chunk: Buffer) => {
+      if (!this.up && /Registered tunnel connection/i.test(chunk.toString())) {
+        this.up = true;
+        log(`sandbox relay connected → *.${sb.domain}`);
+      }
+    };
+    child.stdout?.on("data", scan);
+    child.stderr?.on("data", scan);
+    child.on("exit", (code) => {
+      this.child = undefined;
+      this.up = false;
+      if (this.stopping) return;
+      log(`sandbox tunnel exited (code ${code}) — restarting in 5s`);
+      setTimeout(() => {
+        if (!this.stopping) void this.start().catch((e: Error) => log(e.message));
+      }, 5_000);
+    });
+  }
+
+  async stop(): Promise<void> {
+    this.stopping = true;
+    this.up = false;
+    const c = this.child;
+    this.child = undefined;
+    if (!c) return;
+    c.kill("SIGTERM");
+    await new Promise<void>((r) => {
+      const t = setTimeout(() => {
+        c.kill("SIGKILL");
+        r();
+      }, 3_000);
+      c.on("exit", () => {
+        clearTimeout(t);
+        r();
+      });
+    });
+  }
+}
+
+export const sandboxTunnelManager = new SandboxTunnelManager();

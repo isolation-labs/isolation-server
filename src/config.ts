@@ -27,6 +27,15 @@ export interface Enrollment {
   mode: "quick";
 }
 
+// The public-web plane: a NAMED wildcard tunnel (`*.<domain>` → this gate) injected by
+// the cloud (Cloud VMs: seeded at provision; any server: `POST /sandbox` or the launch
+// body). Never hardcoded. Absent → web views are addressed as `<slug>.localhost`.
+export interface SandboxConfig {
+  provider: "cloudflared";
+  creds: string; // the named tunnel's run token
+  domain: string; // e.g. "<id>-web.run.isolation.cloud"
+}
+
 export interface OsbConfig {
   url: string; // the local opensandbox-server, loopback
   apiKey: string;
@@ -38,6 +47,7 @@ interface Config {
   pairing?: Pairing;
   enrollment?: Enrollment;
   osb?: OsbConfig;
+  sandbox?: SandboxConfig;
 }
 
 let cfg: Config = {};
@@ -94,6 +104,12 @@ export function saveEnrollment(e: Enrollment | undefined): void {
 export function getOsb(): OsbConfig {
   return cfg.osb ?? { url: "http://127.0.0.1:8080", apiKey: "" };
 }
+export const getSandbox = (): SandboxConfig | undefined => cfg.sandbox;
+export function saveSandbox(sb: SandboxConfig | undefined): void {
+  cfg.sandbox = sb;
+  persist();
+}
+
 export function saveOsb(o: OsbConfig): void {
   cfg.osb = o;
   persist();

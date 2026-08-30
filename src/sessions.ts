@@ -9,7 +9,7 @@
 import { randomBytes } from "node:crypto";
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { DATA, ensureDataDir } from "./config.js";
+import { DATA, PORT, ensureDataDir, getSandbox } from "./config.js";
 import { launch, scaffoldView, type LaunchRequest, type ViewSpec } from "./launch.js";
 import { deleteSandbox } from "./opensandbox.js";
 import { run } from "./execd.js";
@@ -182,10 +182,18 @@ export function viewJson(v: View, sessionId: string): Record<string, unknown> {
     id: v.id,
     sessionId,
     type: v.type,
-    target: { port: v.port, ...(v.type === "web" ? { appPort: v.appPort ?? v.port, ...(v.appPath ? { appPath: v.appPath } : {}) } : {}) },
+    target: { port: v.port, ...(v.type === "web" ? { appPort: v.appPort ?? v.port, ...(v.appPath ? { appPath: v.appPath } : {}), url: webUrl(v) } : {}) },
     ...(v.label ? { label: v.label } : {}),
     ...(v.specKey ? { specKey: v.specKey } : {}),
   };
+}
+
+// A web view's public address: its slug as a hostname — on the wildcard sandbox domain
+// when the cloud injected one, else `<slug>.localhost` (loopback in every browser).
+function webUrl(v: View): string {
+  const path = v.appPath ?? "/";
+  const domain = getSandbox()?.domain;
+  return domain ? `https://${v.slug}.${domain}${path}` : `http://${v.slug}.localhost:${PORT}${path}`;
 }
 
 export function sessionViews(s: SessionRecord): View[] {

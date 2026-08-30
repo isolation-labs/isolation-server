@@ -6,7 +6,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { HOST, PORT, getName, getPairing, getToken, isLoopbackOrigin, originAllowed, savePairing, tokenMatches } from "./config.js";
 import { beatOffline, detach, pairingStatus, startHeartbeat } from "./heartbeat.js";
 import { deleteSandbox, getSandbox, listSandboxes, osbHealthy, pauseSandbox, resumeSandbox, sandboxLogs } from "./opensandbox.js";
-import { handleViewRequest, handleViewUpgrade, invalidateEndpoints } from "./doorman.js";
+import { handlePublicWebRequest, handlePublicWebUpgrade, handleViewRequest, handleViewUpgrade, invalidateEndpoints } from "./doorman.js";
 import { launch, type LaunchRequest } from "./launch.js";
 import { dropSink, saveWorkspace, syncWorkspace } from "./persistence.js";
 import { dropView, dropViewsForSandbox, getView, mintViewToken, viewsForSandbox } from "./views.js";
@@ -24,7 +24,7 @@ import {
   viewJson,
   type DaemonLaunchBody,
 } from "./sessions.js";
-import { tunnelManager } from "./tunnel.js";
+import { sandboxTunnelManager, tunnelManager } from "./tunnel.js";
 
 const VERSION = "0.0.1";
 const log = (...a: unknown[]) => console.log("[isogate]", ...a);
@@ -65,7 +65,7 @@ function backendUrlSafe(u: string): boolean {
 
 // Bring up whatever the config prescribes: tunnel when enrolled, heartbeat when
 // paired. Idempotent — the boot path and the pair path share it.
-import { getEnrollment, saveEnrollment } from "./config.js";
+import { getEnrollment, getSandbox as getSandboxConfig, saveEnrollment, saveSandbox } from "./config.js";
 export async function startConfigured(): Promise<void> {
   if (getEnrollment() && !tunnelManager.status().connected) {
     try {
@@ -75,6 +75,24 @@ export async function startConfigured(): Promise<void> {
     }
   }
   if (getPairing()) startHeartbeat();
+  if (getSandboxConfig() && !sandboxTunnelManager.status().connected) {
+    await sandboxTunnelManager.start().catch((e: Error) => log(`sandbox tunnel bring-up failed: ${e.message}`));
+  }
+}
+
+// The cloud injects the public-web (sandbox) tunnel — at provision on a Cloud VM, or
+// inline on a launch / via POST /sandbox. Persist + dial; a repeat of the current
+// config is a no-op.
+function applyInjectedSandbox(s: unknown): void {
+  if (!s || typeof s !== "object") return;
+  const o = s as Record<string, unknown>;
+  const domain = typeof o.domain === "string" ? o.domain.trim().toLowerCase() : "";
+  const creds = typeof o.creds === "string" ? o.creds.trim() : "";
+  if (!domain || !creds) return;
+  const cur = getSandboxConfig();
+  if (cur && cur.domain === domain && cur.creds === creds) return;
+  saveSandbox({ provider: "cloudflared", creds, domain });
+  void sandboxTunnelManager.start().catch((e: Error) => log(`sandbox tunnel (injected) failed: ${e.message}`));
 }
 
 async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -90,7 +108,10 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   }
   if (method === "OPTIONS") return void res.writeHead(204).end();
 
-  // Data plane first — its auth is per-view, not the master token.
+  // The public web plane claims its hostnames FIRST — those hosts never reach /v/ or the API.
+  if (await handlePublicWebRequest(req, res)) return;
+
+  // Data plane next — its auth is per-view, not the master token.
   if (url.startsWith("/v/")) {
     if (await handleViewRequest(req, res)) return;
   }
@@ -130,6 +151,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       maxViews: 28,
       runtime: { kind: "opensandbox", healthy: await osbHealthy() },
       tunnel: t,
+      sandbox: sandboxTunnelManager.status(),
       pairing: pairingStatus(),
     });
   }
@@ -202,7 +224,15 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   // ── The daemon-compatible session surface (PLAN O3) — what the web app drives ──
 
   if (method === "POST" && url === "/sessions") {
-    return json(res, 200, sessionJson(startSession((await readBody(req)) as DaemonLaunchBody)));
+    const body = await readBody(req);
+    applyInjectedSandbox(body.sandbox);
+    return json(res, 200, sessionJson(startSession(body as DaemonLaunchBody)));
+  }
+
+  // Configure the public-web tunnel out of band (self-hosters / the cloud on pairing).
+  if (method === "POST" && url === "/sandbox") {
+    applyInjectedSandbox(await readBody(req));
+    return json(res, 200, { ok: true, sandbox: sandboxTunnelManager.status() });
   }
   if (method === "GET" && url === "/sessions") {
     const q = new URL(req.url ?? "/", "http://x").searchParams;
@@ -373,7 +403,9 @@ export function startServer(): void {
     });
   });
   server.on("upgrade", (req, socket, head) => {
-    void handleViewUpgrade(req, socket, head);
+    void handlePublicWebUpgrade(req, socket, head).then((claimed) => {
+      if (!claimed) return handleViewUpgrade(req, socket, head);
+    });
   });
   server.listen(PORT, HOST, () => log(`listening on http://${HOST}:${PORT}`));
 
@@ -381,6 +413,7 @@ export function startServer(): void {
     log("shutting down");
     await beatOffline();
     await tunnelManager.stop();
+    await sandboxTunnelManager.stop();
     server.close();
     process.exit(0);
   };

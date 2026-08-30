@@ -10,9 +10,9 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 import httpProxy from "http-proxy-3";
-import { tokenMatches } from "./config.js";
+import { getSandbox, tokenMatches } from "./config.js";
 import { endpointFor } from "./opensandbox.js";
-import { getView, verifyViewToken } from "./views.js";
+import { getView, verifyViewToken, viewBySlug } from "./views.js";
 
 const proxy = httpProxy.createProxyServer({ ws: true, xfwd: true });
 proxy.on("error", (err, _req, res) => {
@@ -144,4 +144,92 @@ export async function handleViewUpgrade(req: IncomingMessage, socket: Duplex, he
     targets.delete(`${view.sandboxId}:${view.port}`);
     socket.destroy();
   }
+}
+
+// --- The public web plane (sandbox hostnames) -----------------------------------
+// A web view is reachable at `<slug>.<sandboxDomain>` over the wildcard sandbox tunnel,
+// or `<slug>.localhost` on a connected/local server (browsers resolve *.localhost to
+// loopback with no DNS). We route by Host — NOT a /v/ path — so the app sits at `/` and
+// its root-absolute asset URLs resolve. This plane is PUBLIC + unauthenticated by
+// design (the slug is the secret: ≥128-bit, unguessable) and it claims sandbox hosts
+// whole: the token-gated API and /v/ views are never reachable on these hostnames.
+
+const hostOnly = (h: string | undefined): string => (h ?? "").split(":")[0].trim().toLowerCase();
+
+// The slug when this request's Host belongs to the public plane; undefined otherwise.
+// A configured sandbox domain claims ALL its subdomains (unknown slug → 404, never the
+// API). `.localhost` claims only labels that match a live web view, so plain
+// `localhost` keeps serving the control plane.
+function publicSlug(req: IncomingMessage): { slug: string; claimed: boolean } | undefined {
+  const host = hostOnly(req.headers.host);
+  const domain = getSandbox()?.domain;
+  if (domain && (host === domain || host.endsWith(`.${domain}`))) {
+    return { slug: host === domain ? "" : host.slice(0, host.length - domain.length - 1), claimed: true };
+  }
+  if (host.endsWith(".localhost")) {
+    const slug = host.slice(0, host.length - ".localhost".length);
+    if (slug && viewBySlug(slug)) return { slug, claimed: true };
+  }
+  return undefined;
+}
+
+// Self-refreshing "app is starting" page: the iframe loads the instant the session is
+// ready, but the dev server it fronts binds its port only after install/compile. A
+// reset/502 would leave the browser on a dead error page that never retries.
+const APP_STARTING_HTML =
+  `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
+  `<meta http-equiv="refresh" content="2"><title>Starting…</title>` +
+  `<style>html,body{height:100%;margin:0}body{display:flex;align-items:center;justify-content:center;background:#0b0d10;color:#9aa4b2;` +
+  `font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}.c{text-align:center}` +
+  `.s{width:26px;height:26px;margin:0 auto 14px;border:3px solid #232a33;border-top-color:#5b8cff;border-radius:50%;animation:spin .8s linear infinite}` +
+  `@keyframes spin{to{transform:rotate(360deg)}}.h{opacity:.6;font-size:12px;margin-top:6px}</style></head>` +
+  `<body><div class="c"><div class="s"></div>Starting your app…<div class="h">Waiting for the dev server to come online — this retries automatically.</div></div></body></html>`;
+
+function serveAppStarting(res: ServerResponse): void {
+  if (res.headersSent) {
+    try { res.end(); } catch { /* client gone */ }
+    return;
+  }
+  res.writeHead(503, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "retry-after": "2" });
+  res.end(APP_STARTING_HTML);
+}
+
+// Returns true when the request was on a public-plane host (handled here, success or not).
+export async function handlePublicWebRequest(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
+  const pub = publicSlug(req);
+  if (!pub) return false;
+  const view = pub.slug ? viewBySlug(pub.slug) : undefined;
+  if (!view) {
+    res.writeHead(404, { "content-type": "text/plain" }).end("unknown app");
+    return true;
+  }
+  try {
+    const t = await resolveTarget(view.sandboxId, view.port);
+    req.url = `${t.basePath}${req.url ?? "/"}`;
+    // Per-call error → the app port isn't listening yet: serve the retrying holding page.
+    proxy.web(req, res, { target: `http://${t.host}`, changeOrigin: true }, () => serveAppStarting(res));
+  } catch {
+    targets.delete(`${view.sandboxId}:${view.port}`);
+    serveAppStarting(res);
+  }
+  return true;
+}
+
+export async function handlePublicWebUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): Promise<boolean> {
+  const pub = publicSlug(req);
+  if (!pub) return false;
+  const view = pub.slug ? viewBySlug(pub.slug) : undefined;
+  if (!view) {
+    socket.destroy();
+    return true;
+  }
+  try {
+    const t = await resolveTarget(view.sandboxId, view.port);
+    req.url = `${t.basePath}${req.url ?? "/"}`;
+    proxy.ws(req, socket, head, { target: `http://${t.host}`, changeOrigin: true });
+  } catch {
+    targets.delete(`${view.sandboxId}:${view.port}`);
+    socket.destroy();
+  }
+  return true;
 }

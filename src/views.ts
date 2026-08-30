@@ -20,6 +20,7 @@ export interface View {
   specKey?: string; // the workspace-level view id (layout binding across launches)
   appPath?: string; // web: subpage the view opens on
   appPort?: number; // web: the app's OWN port (view.port is the forwarder's shadow port)
+  slug?: string; // web: the PUBLIC hostname label (unguessable, ≥128-bit) — the view's address on the sandbox plane
 }
 
 let views: Record<string, View> = {};
@@ -36,7 +37,7 @@ function persist(): void {
   renameSync(tmp, VIEWS_FILE);
 }
 
-export function addView(sandboxId: string, type: ViewType, port: number, extra: Pick<View, "label" | "specKey" | "appPath" | "appPort"> = {}): View {
+export function addView(sandboxId: string, type: ViewType, port: number, extra: Pick<View, "label" | "specKey" | "appPath" | "appPort" | "slug"> = {}): View {
   const v: View = { id: `v-${randomBytes(6).toString("hex")}`, sandboxId, type, port, ...extra };
   views[v.id] = v;
   persist();
@@ -53,6 +54,12 @@ export function dropView(id: string): View | undefined {
 }
 
 export const getView = (id: string): View | undefined => views[id];
+export const viewBySlug = (slug: string): View | undefined => Object.values(views).find((v) => v.type === "web" && v.slug === slug);
+// 26 base32 chars = 130 bits: a web view's slug IS its public, unauthenticated address.
+export const newWebSlug = (): string => {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+  return [...randomBytes(26)].map((b) => alphabet[b % 32]).join("");
+};
 export const viewsForSandbox = (sandboxId: string): View[] => Object.values(views).filter((v) => v.sandboxId === sandboxId);
 
 export function dropViewsForSandbox(sandboxId: string): void {

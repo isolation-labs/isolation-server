@@ -8,7 +8,7 @@ import { createSandbox, type Sandbox } from "./opensandbox.js";
 import { run, waitReady, writeFile } from "./execd.js";
 import { sealedOrInline } from "./envelope.js";
 import { restoreWorkspace, type WorkspaceSink } from "./persistence.js";
-import { addView, mintViewToken, viewsForSandbox, type View, type ViewType } from "./views.js";
+import { addView, mintViewToken, newWebSlug, viewsForSandbox, type View, type ViewType } from "./views.js";
 
 // The launch's persistence envelope (same shape the web sends the daemon today:
 // `workspaceId` + `persistence.workspace.{endpoint, creds}`).
@@ -216,7 +216,7 @@ export async function scaffoldView(sandboxId: string, w: ViewSpec): Promise<View
     const base = w.type === "terminal" ? TERMINAL_PORT : w.type === "code" ? CODE_PORT : DIRECTORY_PORT;
     port = nextFree(base);
   }
-  const v = addView(sandboxId, w.type, port, { label: w.label, specKey: w.specKey, appPath, appPort });
+  const v = addView(sandboxId, w.type, port, { label: w.label, specKey: w.specKey, appPath, appPort, ...(w.type === "web" ? { slug: newWebSlug() } : {}) });
   await startViewProcess(sandboxId, v);
   return v;
 }
