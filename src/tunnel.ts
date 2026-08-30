@@ -2,9 +2,6 @@
 // stays behind this interface (the enrollment names it); the URL is never hardcoded
 // and changes on every restart, which the heartbeat self-heals.
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { HOST, PORT } from "./config.js";
 
 const log = (...a: unknown[]) => console.log("[tunnel]", ...a);
@@ -12,20 +9,7 @@ const log = (...a: unknown[]) => console.log("[tunnel]", ...a);
 const URL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/;
 const RESTART_BACKOFF_MS = [2_000, 5_000, 15_000, 60_000];
 
-// PATH first; then the legacy isolation install location (a migrated machine already
-// has a pinned binary there) and isogate's own future install dir.
-function findCloudflared(): string {
-  for (const p of [
-    join(homedir(), ".isogate", "bin", "cloudflared"),
-    join(homedir(), ".isolation", "bin", "cloudflared"),
-    "/opt/homebrew/bin/cloudflared",
-    "/usr/local/bin/cloudflared",
-    "/usr/bin/cloudflared",
-  ]) {
-    if (existsSync(p)) return p;
-  }
-  return "cloudflared"; // hope for PATH; spawn error surfaces via lastError
-}
+import { ensureCloudflared } from "./cloudflared.js";
 
 export interface TunnelStatus {
   connected: boolean;
@@ -64,7 +48,15 @@ class TunnelManager {
   }
 
   private spawnOnce(onFirstUrl?: (u: string) => void): void {
-    const bin = findCloudflared();
+    void ensureCloudflared(log)
+      .then((bin) => this.spawnWith(bin, onFirstUrl))
+      .catch((e: Error) => {
+        this.lastError = e.message;
+        log(e.message);
+      });
+  }
+
+  private spawnWith(bin: string, onFirstUrl?: (u: string) => void): void {
     const child = spawn(bin, ["tunnel", "--url", `http://${HOST}:${PORT}`], { stdio: ["ignore", "pipe", "pipe"] });
     this.child = child;
     let announced = false;

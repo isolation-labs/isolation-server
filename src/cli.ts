@@ -9,7 +9,9 @@
 // The pair token is self-describing — base64url({u: <backend origin>, c: <code>}) —
 // so the CLI never hardcodes a SaaS URL.
 import { HOST, PORT, getToken } from "./config.js";
-import { serviceDown, serviceUp } from "./service.js";
+import { gateArgv, installService, uninstallService } from "./service.js";
+import { prepareRuntime, waitForRuntime } from "./runtime.js";
+import { ensureCloudflared } from "./cloudflared.js";
 
 const base = `http://${HOST}:${PORT}`;
 const authed = (init?: RequestInit): RequestInit => ({
@@ -26,8 +28,19 @@ async function main(): Promise<void> {
   }
 
   if (cmd === "up") {
-    serviceUp();
-    // Wait for the service to come up, then show its status.
+    const say = (m: string) => console.log(`  ${m}`);
+    // 1. The runtime: pinned opensandbox-server via uv, loopback config with a minted
+    //    API key, as a service — unless one is already running (adopted as-is).
+    const rt = await prepareRuntime(say);
+    if (!rt.alreadyRunning) {
+      installService({ id: "runtime", argv: [rt.serverBin] });
+      if (!(await waitForRuntime())) return fail("opensandbox-server didn't become healthy — is Docker running? see ~/.isogate/opensandbox.log");
+      say(`opensandbox-server ${rt.port ? `on :${rt.port}` : ""} up (login service)`);
+    }
+    // 2. The relay binary, pre-fetched so `connect` never waits on a download.
+    await ensureCloudflared(say).catch((e: Error) => say(`(cloudflared not provisioned yet: ${e.message})`));
+    // 3. The gate itself.
+    installService({ id: "gate", argv: gateArgv() });
     for (let i = 0; i < 20; i++) {
       await new Promise((r) => setTimeout(r, 500));
       const r = await fetch(`${base}/status`, authed()).catch(() => undefined);
@@ -40,8 +53,9 @@ async function main(): Promise<void> {
   }
 
   if (cmd === "down") {
-    serviceDown();
-    console.log("isogate service stopped");
+    uninstallService("gate");
+    uninstallService("runtime");
+    console.log("isogate + runtime services stopped");
     return;
   }
 
