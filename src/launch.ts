@@ -245,6 +245,9 @@ async function startViewProcess(sandboxId: string, view: View): Promise<void> {
     // Dual-stack loopback forwarder: 0.0.0.0:<shadow> → 127.0.0.1 or [::1]:<appPort>,
     // whichever accepts, per connection (so it also copes with the app restarting).
     await writeFile(sandboxId, PORTFWD_PATH, PORTFWD_SRC, 0o644);
+    // Belt and braces: a stale forwarder on this shadow port (e.g. after a gate
+    // restart lost the registry) would win the bind and point at the wrong app.
+    await run(sandboxId, `pkill -f "portfwd.mjs ${view.port} " || true`);
     await run(sandboxId, `node ${PORTFWD_PATH} ${view.port} ${view.appPort}`, { cwd: "/workspace", background: true });
   } else if (view.type === "directory") {
     // filebrowser emits absolute asset paths, so it must own its public base URL —
