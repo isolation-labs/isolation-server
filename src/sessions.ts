@@ -182,7 +182,7 @@ export function viewJson(v: View, sessionId: string): Record<string, unknown> {
     id: v.id,
     sessionId,
     type: v.type,
-    target: { port: v.port, ...(v.type === "web" ? { appPort: v.port, ...(v.appPath ? { appPath: v.appPath } : {}) } : {}) },
+    target: { port: v.port, ...(v.type === "web" ? { appPort: v.appPort ?? v.port, ...(v.appPath ? { appPath: v.appPath } : {}) } : {}) },
     ...(v.label ? { label: v.label } : {}),
     ...(v.specKey ? { specKey: v.specKey } : {}),
   };

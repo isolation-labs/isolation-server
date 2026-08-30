@@ -31,6 +31,7 @@ export const TOOLING_IMAGE = "isogate/tooling:0.4";
 const TERMINAL_PORT = 7681;
 const CODE_PORT = 13337;
 const DIRECTORY_PORT = 8055;
+const WEB_SHADOW_BASE = 42000;
 
 // Runtime metadata values are k8s-style labels: alphanumeric/-/_/. , ≤63 chars,
 // alphanumeric at both ends. Display names live on the session record instead.
@@ -153,6 +154,24 @@ async function cloneRepo(sandboxId: string, repo: RepoSpec, creds: GitCreds): Pr
 
 // --- views ---------------------------------------------------------------------
 
+// The in-sandbox forwarder behind every web view (see startViewProcess). Needs
+// node in the image (the tooling image ships it; devcontainer images will get a
+// static binary instead — PLAN O4).
+const PORTFWD_PATH = "/tmp/.iso-portfwd.mjs";
+const PORTFWD_SRC = `import net from "node:net";
+const [listen, target] = process.argv.slice(2).map(Number);
+const dial = (hosts, onOk, onFail) => {
+  if (!hosts.length) return onFail();
+  const s = net.connect({ host: hosts[0], port: target });
+  s.once("connect", () => onOk(s));
+  s.once("error", () => dial(hosts.slice(1), onOk, onFail));
+};
+net.createServer((c) => {
+  c.pause();
+  dial(["127.0.0.1", "::1"], (u) => { c.pipe(u).pipe(c); c.resume(); u.on("error", () => c.destroy()); c.on("error", () => u.destroy()); }, () => c.destroy());
+}).listen(listen, "0.0.0.0");
+`;
+
 export interface ViewSpec {
   type: ViewType;
   port?: number; // web: the in-container app port (or derived from `url`)
@@ -179,14 +198,25 @@ export async function scaffoldView(sandboxId: string, w: ViewSpec): Promise<View
   // taken by this sandbox's views — a second terminal must not collide with the
   // first (both processes would race the bind and the doorman would front the
   // survivor for both views).
-  if (!port) {
-    const base = w.type === "terminal" ? TERMINAL_PORT : w.type === "code" ? CODE_PORT : w.type === "directory" ? DIRECTORY_PORT : undefined;
-    if (!base) return undefined; // only web needs an explicit port (the app's own)
-    const taken = new Set(viewsForSandbox(sandboxId).map((x) => x.port));
-    port = base;
-    while (taken.has(port)) port++;
+  const taken = new Set(viewsForSandbox(sandboxId).map((x) => x.port));
+  const nextFree = (base: number): number => {
+    let p = base;
+    while (taken.has(p)) p++;
+    return p;
+  };
+  let appPort: number | undefined;
+  if (w.type === "web") {
+    if (!port) return undefined; // web needs the app's own port
+    // The doorman never targets the app port directly: dev servers routinely bind
+    // `localhost` as IPv6-only (Vite → [::1]) while execd's proxy connects over IPv4.
+    // A per-view forwarder on an all-interfaces shadow port tries both loopbacks.
+    appPort = port;
+    port = nextFree(WEB_SHADOW_BASE);
+  } else if (!port) {
+    const base = w.type === "terminal" ? TERMINAL_PORT : w.type === "code" ? CODE_PORT : DIRECTORY_PORT;
+    port = nextFree(base);
   }
-  const v = addView(sandboxId, w.type, port, { label: w.label, specKey: w.specKey, appPath });
+  const v = addView(sandboxId, w.type, port, { label: w.label, specKey: w.specKey, appPath, appPort });
   await startViewProcess(sandboxId, v);
   return v;
 }
@@ -211,6 +241,11 @@ async function startViewProcess(sandboxId: string, view: View): Promise<void> {
       cwd: "/workspace",
       background: true,
     });
+  } else if (view.type === "web" && view.appPort) {
+    // Dual-stack loopback forwarder: 0.0.0.0:<shadow> → 127.0.0.1 or [::1]:<appPort>,
+    // whichever accepts, per connection (so it also copes with the app restarting).
+    await writeFile(sandboxId, PORTFWD_PATH, PORTFWD_SRC, 0o644);
+    await run(sandboxId, `node ${PORTFWD_PATH} ${view.port} ${view.appPort}`, { cwd: "/workspace", background: true });
   } else if (view.type === "directory") {
     // filebrowser emits absolute asset paths, so it must own its public base URL —
     // the doorman forwards the UNSTRIPPED path for directory views to match.

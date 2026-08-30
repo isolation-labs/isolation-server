@@ -19,6 +19,7 @@ export interface View {
   label?: string; // display name
   specKey?: string; // the workspace-level view id (layout binding across launches)
   appPath?: string; // web: subpage the view opens on
+  appPort?: number; // web: the app's OWN port (view.port is the forwarder's shadow port)
 }
 
 let views: Record<string, View> = {};
@@ -35,7 +36,7 @@ function persist(): void {
   renameSync(tmp, VIEWS_FILE);
 }
 
-export function addView(sandboxId: string, type: ViewType, port: number, extra: Pick<View, "label" | "specKey" | "appPath"> = {}): View {
+export function addView(sandboxId: string, type: ViewType, port: number, extra: Pick<View, "label" | "specKey" | "appPath" | "appPort"> = {}): View {
   const v: View = { id: `v-${randomBytes(6).toString("hex")}`, sandboxId, type, port, ...extra };
   views[v.id] = v;
   persist();
