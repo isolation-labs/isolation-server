@@ -2,7 +2,7 @@
 // stays behind this interface (the enrollment names it); the URL is never hardcoded
 // and changes on every restart, which the heartbeat self-heals.
 import { type ChildProcess, spawn } from "node:child_process";
-import { HOST, PORT, getSandbox } from "./config.js";
+import { HOST, PORT, getEnrollment, getSandbox } from "./config.js";
 
 const log = (...a: unknown[]) => console.log("[tunnel]", ...a);
 
@@ -57,6 +57,43 @@ class TunnelManager {
   }
 
   private spawnWith(bin: string, onFirstUrl?: (u: string) => void): void {
+    const enr = getEnrollment();
+    // Named tunnel (Cloud VMs): a cloud-minted tunnel whose ingress the backend pointed at
+    // this gate's loopback port. We only run it with its token; the public URL is the STABLE
+    // one the cloud minted, announced immediately (no trycloudflare URL to scan for).
+    if (enr?.mode === "named" && enr.creds) {
+      const child = spawn(bin, ["tunnel", "run", "--token", enr.creds], { stdio: ["ignore", "pipe", "pipe"] });
+      this.child = child;
+      let up = false;
+      const watch = (chunk: Buffer) => {
+        if (!up && /Registered tunnel connection/i.test(chunk.toString())) {
+          up = true;
+          this.url = enr.publicUrl;
+          this.restarts = 0;
+          if (enr.publicUrl) {
+            log(`named tunnel up: ${enr.publicUrl}`);
+            onFirstUrl?.(enr.publicUrl);
+          }
+        }
+      };
+      child.stdout?.on("data", watch);
+      child.stderr?.on("data", watch);
+      child.on("error", (e) => {
+        this.lastError = e.message;
+        log(`spawn failed: ${e.message}`);
+      });
+      child.on("exit", (code) => {
+        this.child = undefined;
+        this.url = undefined;
+        if (this.stopping) return;
+        const delay = RESTART_BACKOFF_MS[Math.min(this.restarts++, RESTART_BACKOFF_MS.length - 1)];
+        log(`named tunnel exited (code ${code}) — restarting in ${delay / 1000}s`);
+        setTimeout(() => {
+          if (!this.stopping) this.spawnOnce();
+        }, delay);
+      });
+      return;
+    }
     const child = spawn(bin, ["tunnel", "--url", `http://${HOST}:${PORT}`], { stdio: ["ignore", "pipe", "pipe"] });
     this.child = child;
     let announced = false;

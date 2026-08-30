@@ -26,7 +26,11 @@ export interface Pairing {
 
 export interface Enrollment {
   provider: "cloudflared";
-  mode: "quick";
+  // "quick" — a free trycloudflare URL that changes on restart (the heartbeat self-heals it);
+  // "named" — a cloud-minted tunnel with a STABLE publicUrl (Cloud VMs, seeded at provision).
+  mode: "quick" | "named";
+  creds?: string; // named: the tunnel run token
+  publicUrl?: string; // named: the stable public URL
 }
 
 // The public-web plane: a NAMED wildcard tunnel (`*.<domain>` → this gate) injected by
