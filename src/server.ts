@@ -263,8 +263,10 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
             v.type === "terminal" ? `ttyd .*-p ${v.port}`
             : v.type === "code" ? `code-server .*:${v.port}`
             : v.type === "directory" ? `filebrowser .*-p ${v.port}`
-            : `portfwd.mjs ${v.port} `;
-          void run(v.sandboxId, `pkill -f ${JSON.stringify(pat)} || true`).catch(() => undefined);
+            : `portfwd.mjs .* ${v.id}`;
+          // AWAITED: the SPA deletes then immediately recreates on a spec change; an
+          // un-awaited kill raced the new view's process on the same port.
+          await run(v.sandboxId, `pkill -f ${JSON.stringify(pat)} || true`).catch(() => undefined);
         }
         return json(res, 200, { ok: true });
       }

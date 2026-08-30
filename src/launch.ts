@@ -242,13 +242,7 @@ async function startViewProcess(sandboxId: string, view: View): Promise<void> {
       background: true,
     });
   } else if (view.type === "web" && view.appPort) {
-    // Dual-stack loopback forwarder: 0.0.0.0:<shadow> → 127.0.0.1 or [::1]:<appPort>,
-    // whichever accepts, per connection (so it also copes with the app restarting).
-    await writeFile(sandboxId, PORTFWD_PATH, PORTFWD_SRC, 0o644);
-    // Belt and braces: a stale forwarder on this shadow port (e.g. after a gate
-    // restart lost the registry) would win the bind and point at the wrong app.
-    await run(sandboxId, `pkill -f "portfwd.mjs ${view.port} " || true`);
-    await run(sandboxId, `node ${PORTFWD_PATH} ${view.port} ${view.appPort}`, { cwd: "/workspace", background: true });
+    await startWebForwarder(view);
   } else if (view.type === "directory") {
     // filebrowser emits absolute asset paths, so it must own its public base URL —
     // the doorman forwards the UNSTRIPPED path for directory views to match.
@@ -258,6 +252,24 @@ async function startViewProcess(sandboxId: string, view: View): Promise<void> {
       { cwd: "/workspace", background: true },
     );
   }
+}
+
+// Dual-stack loopback forwarder: 0.0.0.0:<shadow> → 127.0.0.1 or [::1]:<appPort>, whichever
+// accepts, per connection (so it also copes with the app restarting). Its argv carries the
+// VIEW ID, so lifecycle ops (delete, self-heal) target exactly this view's process — never a
+// neighbour that happens to reuse the port. Any stale forwarder on the port is cleared first
+// (it would win the bind and point at the wrong app).
+export async function startWebForwarder(view: View): Promise<void> {
+  if (!view.appPort) return;
+  await writeFile(view.sandboxId, PORTFWD_PATH, PORTFWD_SRC, 0o644);
+  await run(view.sandboxId, `pkill -f "portfwd.mjs ${view.port} " || true`);
+  await run(view.sandboxId, `node ${PORTFWD_PATH} ${view.port} ${view.appPort} ${view.id}`, { cwd: "/workspace", background: true });
+}
+
+// True when this view's forwarder process is alive inside its sandbox.
+export async function webForwarderAlive(view: View): Promise<boolean> {
+  const r = await run(view.sandboxId, `pgrep -f "portfwd.mjs ${view.port} ${view.appPort ?? 0} ${view.id}" >/dev/null && echo alive || echo dead`, { timeoutMs: 10_000 });
+  return /alive/.test(r.stdout);
 }
 
 // --- the launch ----------------------------------------------------------------

@@ -12,7 +12,8 @@ import type { Duplex } from "node:stream";
 import httpProxy from "http-proxy-3";
 import { getSandbox, tokenMatches } from "./config.js";
 import { endpointFor } from "./opensandbox.js";
-import { getView, verifyViewToken, viewBySlug } from "./views.js";
+import { getView, verifyViewToken, viewBySlug, type View } from "./views.js";
+import { startWebForwarder, webForwarderAlive } from "./launch.js";
 
 const proxy = httpProxy.createProxyServer({ ws: true, xfwd: true });
 proxy.on("error", (err, _req, res) => {
@@ -194,6 +195,41 @@ function serveAppStarting(res: ServerResponse): void {
   res.end(APP_STARTING_HTML);
 }
 
+// The public plane owns its responses (selfHandleResponse): execd answers a refused
+// app port with a 502 RESPONSE (not a connection error), and relaying it would leave
+// the iframe on a dead "Bad Gateway" that never retries. A 502 upstream → the
+// holding page instead, plus a throttled self-heal of the view's forwarder.
+const publicProxy = httpProxy.createProxyServer({ ws: true, xfwd: true, changeOrigin: true, selfHandleResponse: true });
+publicProxy.on("error", (_err, _req, res) => {
+  const r = res as ServerResponse | Duplex | undefined;
+  if (r && "writeHead" in r) serveAppStarting(r);
+  else if (r && "destroy" in r) (r as Duplex).destroy();
+});
+publicProxy.on("proxyRes", (proxyRes, _req, res) => {
+  const out = res as ServerResponse;
+  if (proxyRes.statusCode === 502) {
+    proxyRes.resume();
+    serveAppStarting(out);
+    return;
+  }
+  const h = { ...proxyRes.headers };
+  delete h["x-frame-options"];
+  out.writeHead(proxyRes.statusCode ?? 200, h);
+  proxyRes.pipe(out);
+});
+
+// Self-heal: a 502 on the public plane can mean the view's forwarder is gone (a
+// lifecycle race, a gate restart). Check + restart it, at most once per 10s per view.
+const healing = new Map<string, number>();
+function healForwarder(view: View): void {
+  const last = healing.get(view.id) ?? 0;
+  if (Date.now() - last < 10_000) return;
+  healing.set(view.id, Date.now());
+  void webForwarderAlive(view)
+    .then((alive) => (alive ? undefined : startWebForwarder(view)))
+    .catch(() => undefined);
+}
+
 // Returns true when the request was on a public-plane host (handled here, success or not).
 export async function handlePublicWebRequest(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
   const pub = publicSlug(req);
@@ -206,11 +242,14 @@ export async function handlePublicWebRequest(req: IncomingMessage, res: ServerRe
   try {
     const t = await resolveTarget(view.sandboxId, view.port);
     req.url = `${t.basePath}${req.url ?? "/"}`;
-    // Per-call error → the app port isn't listening yet: serve the retrying holding page.
-    proxy.web(req, res, { target: `http://${t.host}`, changeOrigin: true }, () => serveAppStarting(res));
+    res.once("finish", () => {
+      if (res.statusCode === 503) healForwarder(view);
+    });
+    publicProxy.web(req, res, { target: `http://${t.host}` });
   } catch {
     targets.delete(`${view.sandboxId}:${view.port}`);
     serveAppStarting(res);
+    healForwarder(view);
   }
   return true;
 }
@@ -226,7 +265,7 @@ export async function handlePublicWebUpgrade(req: IncomingMessage, socket: Duple
   try {
     const t = await resolveTarget(view.sandboxId, view.port);
     req.url = `${t.basePath}${req.url ?? "/"}`;
-    proxy.ws(req, socket, head, { target: `http://${t.host}`, changeOrigin: true });
+    publicProxy.ws(req, socket, head, { target: `http://${t.host}` });
   } catch {
     targets.delete(`${view.sandboxId}:${view.port}`);
     socket.destroy();
