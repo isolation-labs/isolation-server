@@ -3,6 +3,7 @@
 // URL + proves liveness. The backend probes that URL inbound (the same path a browser
 // takes) and drives the server's liveness dot from the verdict. Daemon→backend only.
 import { PORT, getPairing, isLoopbackOrigin, savePairing, saveEnrollment } from "./config.js";
+import { GATE_VERSION } from "./version.js";
 import { tunnelManager } from "./tunnel.js";
 
 const log = (...a: unknown[]) => console.log("[heartbeat]", ...a);
@@ -33,7 +34,7 @@ async function beat(): Promise<void> {
   const p = getPairing();
   if (!p) return;
   const url = currentUrl();
-  const body: Record<string, string> = { connectionId: p.connectionId, secret: p.secret };
+  const body: Record<string, string> = { connectionId: p.connectionId, secret: p.secret, version: GATE_VERSION };
   // Report the URL only when changed — and never report the loopback fallback to a
   // REMOTE cloud (a beat racing the tunnel dial would clobber a still-valid tunnel URL).
   if (url !== lastSent && (isLoopbackOrigin(p.backendUrl) || !isLoopbackOrigin(url))) body.url = url;

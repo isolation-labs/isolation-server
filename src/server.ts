@@ -3,6 +3,7 @@
 // node:http: the doorman needs the raw 'upgrade' event anyway, and the API surface
 // is small enough that a framework would outweigh it.
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { GATE_VERSION } from "./version.js";
 import { HOST, PORT, getName, getPairing, getToken, isLoopbackOrigin, originAllowed, savePairing, tokenMatches } from "./config.js";
 import { beatOffline, detach, pairingStatus, startHeartbeat } from "./heartbeat.js";
 import { deleteSandbox, getSandbox, listSandboxes, osbHealthy, pauseSandbox, resumeSandbox, sandboxLogs } from "./opensandbox.js";
@@ -28,7 +29,7 @@ import { pauseSession, resumeSession,
 } from "./sessions.js";
 import { sandboxTunnelManager, tunnelManager } from "./tunnel.js";
 
-const VERSION = "0.0.1";
+const VERSION = GATE_VERSION;
 const log = (...a: unknown[]) => console.log("[isolation-server]", ...a);
 
 const json = (res: ServerResponse, status: number, body: unknown): void => {

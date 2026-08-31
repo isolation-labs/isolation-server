@@ -83,7 +83,18 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (cmd === "status") {
+  if (cmd === "update") {
+  // Update = reinstall from npm + refresh the service to the new build. The service
+  // runs the build it was installed from, so `up` must follow the install.
+  const { execFileSync } = await import("node:child_process");
+  console.log("updating isolation-server from npm…");
+  execFileSync("npm", ["install", "-g", "isolation-server@latest"], { stdio: "inherit" });
+  const pkgRoot = execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
+  execFileSync(process.execPath, [`${pkgRoot}/isolation-server/dist/cli.js`, "up"], { stdio: "inherit" });
+  process.exit(0);
+}
+
+if (cmd === "status") {
     const r = await fetch(`${base}/status`, authed()).catch(() => undefined);
     if (!r) return fail(`the gate isn't running on ${base} — start it with: isolation-server run`);
     console.log(JSON.stringify(await r.json(), null, 2));
