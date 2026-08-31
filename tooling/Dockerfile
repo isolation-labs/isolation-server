@@ -1,4 +1,4 @@
-# isogate tooling image — the minimal layer a session needs for the shipped views:
+# isolation-server tooling image — the minimal layer a session needs for the shipped views:
 # git (clones), tmux + ttyd (terminal view), code-server (code view). Language
 # runtimes come from the workspace's own devcontainer image later (O4).
 FROM debian:bookworm-slim
