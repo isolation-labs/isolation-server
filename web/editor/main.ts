@@ -195,6 +195,11 @@ function renderMedia(t: Tab): void {
 function activate(t: Tab): void {
   if (active && active !== t && active.model) active.viewState = editor.saveViewState();
   active = t;
+  // A successful open supersedes any standing error (errors don't auto-expire).
+  if (statusMsg.classList.contains("error")) {
+    statusMsg.textContent = "";
+    statusMsg.classList.remove("error");
+  }
   if (t.kind === "text" && t.model) {
     mediaEl.hidden = true;
     mediaEl.replaceChildren(); // stop any playing video/audio

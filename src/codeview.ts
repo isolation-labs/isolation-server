@@ -123,6 +123,13 @@ async function readFile(sandboxId: string, rel: string, res: ServerResponse): Pr
     "Content-Type": MEDIA_TYPES[rel.slice(rel.lastIndexOf(".")).toLowerCase()] ?? "application/octet-stream",
     "Content-Length": total,
     "Cache-Control": "no-store",
+    // Workspace bytes served on the doorman/data-plane origin. The preview loads them
+    // as <img>/<video>/<audio> subresources (CSP ignored there), but a direct top-level
+    // navigation to this endpoint would render an SVG as a document — its inline script
+    // would run with the view cookie and reach api/file, api/save, api/op. Sandbox the
+    // response and forbid scripts so that path can never execute, and never sniff.
+    "Content-Security-Policy": "default-src 'none'; sandbox",
+    "X-Content-Type-Options": "nosniff",
     ...(mtime ? { "X-Iso-Mtime": String(mtime) } : {}),
   });
   for (const c of chunks) res.write(c);
