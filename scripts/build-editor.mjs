@@ -64,16 +64,18 @@ function stampHtml(srcHtml, dir) {
 }
 stampHtml(join(root, "web/editor/index.html"), out);
 
-// The agent view (PLAN V2): a small chat app, same doorman-served pattern.
-const agentOut = join(root, "dist", "agent");
-mkdirSync(agentOut, { recursive: true });
-await build({
-  entryPoints: [join(root, "web/agent/main.ts")],
-  bundle: true,
-  minify: true,
-  format: "esm",
-  outdir: agentOut,
-  logLevel: "warning",
-});
-stampHtml(join(root, "web/agent/index.html"), agentOut);
-console.log("[build-editor] dist/editor + dist/agent ready");
+// The agent (PLAN V2) and git (PLAN V3) views: small apps, same doorman-served pattern.
+for (const app of ["agent", "git"]) {
+  const appOut = join(root, "dist", app);
+  mkdirSync(appOut, { recursive: true });
+  await build({
+    entryPoints: [join(root, `web/${app}/main.ts`)],
+    bundle: true,
+    minify: true,
+    format: "esm",
+    outdir: appOut,
+    logLevel: "warning",
+  });
+  stampHtml(join(root, `web/${app}/index.html`), appOut);
+}
+console.log("[build-editor] dist/{editor,agent,git} ready");

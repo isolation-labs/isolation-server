@@ -9,7 +9,7 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { VIEWS_FILE, ensureDataDir, getToken } from "./config.js";
 
-export type ViewType = "terminal" | "code" | "web" | "directory" | "agent";
+export type ViewType = "terminal" | "code" | "web" | "directory" | "agent" | "git";
 
 export interface View {
   id: string;
@@ -21,6 +21,7 @@ export interface View {
   appPath?: string; // web: subpage the view opens on
   appPort?: number; // web: the app's OWN port (view.port is the forwarder's shadow port)
   agentId?: string; // agent: the roster DEFINITION id this view is a window onto
+  dir?: string; // git: the repo directory (workspace-relative; "" = /workspace itself)
   slug?: string; // web: the PUBLIC hostname label (unguessable, ≥128-bit) — the view's address on the sandbox plane
 }
 
@@ -38,7 +39,7 @@ function persist(): void {
   renameSync(tmp, VIEWS_FILE);
 }
 
-export function addView(sandboxId: string, type: ViewType, port: number, extra: Pick<View, "label" | "specKey" | "appPath" | "appPort" | "slug" | "agentId"> = {}): View {
+export function addView(sandboxId: string, type: ViewType, port: number, extra: Pick<View, "label" | "specKey" | "appPath" | "appPort" | "slug" | "agentId" | "dir"> = {}): View {
   const v: View = { id: `v-${randomBytes(6).toString("hex")}`, sandboxId, type, port, ...extra };
   views[v.id] = v;
   persist();

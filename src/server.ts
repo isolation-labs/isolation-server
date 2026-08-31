@@ -371,6 +371,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
           url: typeof b.url === "string" ? b.url : undefined,
           label: typeof b.label === "string" ? b.label : undefined,
           specKey: typeof b.specKey === "string" ? b.specKey : undefined,
+          dir: typeof b.dir === "string" && b.dir.trim() ? b.dir.trim().replace(/^\/+|\/+$/g, "") : undefined,
           agentId,
         });
         if (!v) return json(res, 400, { error: "view spec not satisfiable" });
