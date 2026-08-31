@@ -34,6 +34,8 @@ export interface SessionRecord {
   phase?: string;
   origin?: "local";
   createdAt: number;
+  workspaceName?: string; // display name from the launch body (the record is daemon-shaped for clients)
+  viewsPending?: number; // countdown for the daemon's viewsProgress contract (0 = all views live)
   roster?: AgentDef[];
 }
 
@@ -117,6 +119,8 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
     phase: "starting container",
     ...(body.origin === "local" ? { origin: "local" as const } : {}),
     createdAt: Date.now(),
+    workspaceName: body.workspace?.name,
+    viewsPending: viewSpecsFrom(body).length,
     roster: parseRoster(body.agents),
   };
   sessions[id] = rec;
@@ -139,12 +143,12 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
 
   void launch(req)
     .then((out) => {
-      update(id, { sandboxId: out.sandbox.id, state: "ready", phase: undefined });
+      update(id, { sandboxId: out.sandbox.id, state: "ready", phase: undefined, viewsPending: 0 });
       if (rec.roster?.length) registerRoster(rec.workspaceId ?? id, id, out.sandbox.id, rec.roster);
       log(`${id} ready (sandbox ${out.sandbox.id.slice(0, 8)})${rec.roster?.length ? `, ${rec.roster.length} agent(s)` : ""}`);
     })
     .catch((e: Error) => {
-      update(id, { state: "error", error: e.message, phase: undefined });
+      update(id, { state: "error", error: e.message, phase: undefined, viewsPending: 0 });
       log(`${id} failed: ${e.message}`);
     });
   return rec;
@@ -180,7 +184,36 @@ export function sessionJson(s: SessionRecord): Record<string, unknown> {
     state: s.state,
     ...(s.error ? { error: s.error } : {}),
     ...(s.phase ? { phase: s.phase } : {}),
+    // The daemon contract pieces the CLI reads: ISO createdAt, origin scoping,
+    // the inline workspace name, and views-progress (pending counts down to 0).
+    createdAt: new Date(s.createdAt).toISOString(),
+    ...(s.origin ? { origin: s.origin } : {}),
+    ...(s.workspaceName ? { workspace: { name: s.workspaceName } } : {}),
+    viewsProgress: { pending: s.viewsPending ?? 0, skipped: [] },
   };
+}
+
+// Pause/resume a session by pausing its sandbox (OpenSandbox keeps state; views'
+// processes stop with it and revive on resume). Local mode's `--pause/--resume`.
+export async function pauseSession(id: string): Promise<SessionRecord | undefined> {
+  const s = sessions[id];
+  if (!s?.sandboxId) return undefined;
+  if (s.state !== "stopped") {
+    const { pauseSandbox } = await import("./opensandbox.js");
+    await pauseSandbox(s.sandboxId);
+    update(id, { state: "stopped" });
+  }
+  return sessions[id];
+}
+export async function resumeSession(id: string): Promise<SessionRecord | undefined> {
+  const s = sessions[id];
+  if (!s?.sandboxId) return undefined;
+  if (s.state === "stopped") {
+    const { resumeSandbox } = await import("./opensandbox.js");
+    await resumeSandbox(s.sandboxId);
+    update(id, { state: "ready" });
+  }
+  return sessions[id];
 }
 
 // The daemon View shape the web renders: target.port is informational here (the
@@ -190,7 +223,7 @@ export function viewJson(v: View, sessionId: string): Record<string, unknown> {
     id: v.id,
     sessionId,
     type: v.type,
-    target: { port: v.port, ...(v.type === "web" ? { appPort: v.appPort ?? v.port, ...(v.appPath ? { appPath: v.appPath } : {}), url: webUrl(v) } : {}) },
+    target: { port: v.port, ...(v.type === "directory" ? { dir: "/" } : {}), ...(v.type === "web" ? { appPort: v.appPort ?? v.port, ...(v.appPath ? { appPath: v.appPath } : {}), url: webUrl(v) } : {}) },
     ...(v.label ? { label: v.label } : {}),
     ...(v.specKey ? { specKey: v.specKey } : {}),
   };

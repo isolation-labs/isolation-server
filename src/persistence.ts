@@ -153,7 +153,7 @@ export async function restoreWorkspace(sandboxId: string, sink: WorkspaceSink, r
 // fetch the fresh bundle's main into a side ref, advance local main, and merge it
 // into the session branch; a conflict aborts cleanly (409-shaped) with the session
 // branch untouched.
-export async function syncWorkspace(sandboxId: string): Promise<{ updated: boolean; etag?: string }> {
+export async function syncWorkspace(sandboxId: string, resolve = false): Promise<{ updated: boolean; etag?: string; conflict?: boolean; conflicts?: string[] }> {
   const st = state.get(sandboxId);
   if (!st) throw new Error("no persistence configured for this sandbox");
   const r = await fetch(blobUrl(st.sink), {
@@ -173,6 +173,15 @@ export async function syncWorkspace(sandboxId: string): Promise<{ updated: boole
   });
   await run(sandboxId, `rm -f ${BUNDLE}`, { cwd: "/workspace" });
   if (!merge.ok || /CONFLICT/.test(merge.stdout + merge.stderr)) {
+    if (resolve) {
+      // Resolve mode (the daemon contract): keep git's conflict markers in the working
+      // tree and report the conflicted paths — the client resolves them and a later
+      // save completes the merge. The merge stays in progress on purpose.
+      const u = await run(sandboxId, `git diff --name-only --diff-filter=U`, { cwd: "/workspace" });
+      st.etag = r.headers.get("etag") ?? st.etag;
+      persistSinks();
+      return { updated: false, etag: st.etag, conflict: true, conflicts: u.stdout.split("\n").filter(Boolean) };
+    }
     await run(sandboxId, `git merge --abort`, { cwd: "/workspace" });
     const err = new Error("sync conflict — hub changes collide with this session's work") as Error & { conflict?: boolean };
     err.conflict = true;
@@ -182,6 +191,14 @@ export async function syncWorkspace(sandboxId: string): Promise<{ updated: boole
   persistSinks();
   log(`${sandboxId.slice(0, 8)}: synced to hub main (etag ${st.etag ?? "none"})`);
   return { updated: true, etag: st.etag };
+}
+
+// Abort an in-progress (resolve-mode) merge: the working tree returns to its
+// pre-pull state on the session branch. Safe when no merge is running.
+export async function abortMerge(sandboxId: string): Promise<void> {
+  const st = state.get(sandboxId);
+  await run(sandboxId, `git merge --abort || true`, { cwd: "/workspace" });
+  if (st) await run(sandboxId, `git checkout -q ${st.sessionBranch} || true`, { cwd: "/workspace" });
 }
 
 // Save: commit the session branch, merge --no-ff into main, bundle everything, PUT

@@ -8,12 +8,12 @@ import { beatOffline, detach, pairingStatus, startHeartbeat } from "./heartbeat.
 import { deleteSandbox, getSandbox, listSandboxes, osbHealthy, pauseSandbox, resumeSandbox, sandboxLogs } from "./opensandbox.js";
 import { handlePublicWebRequest, handlePublicWebUpgrade, handleViewRequest, handleViewUpgrade, invalidateEndpoints } from "./doorman.js";
 import { launch, type LaunchRequest } from "./launch.js";
-import { dropSink, saveWorkspace, syncWorkspace } from "./persistence.js";
+import { sinkFor, abortMerge, dropSink, saveWorkspace, syncWorkspace } from "./persistence.js";
 import { dropView, dropViewsForSandbox, getView, mintViewToken, viewsForSandbox } from "./views.js";
 import { forgetExecd, run } from "./execd.js";
 import { agentJson, getAgent, listAgents, parseRoster, sendMessage, spawnAgent, startAgent, stopAgent } from "./agents.js";
 import { listHarnesses } from "./harness.js";
-import {
+import { pauseSession, resumeSession,
   createSessionView,
   finishSession,
   getSessionRecord,
@@ -223,6 +223,34 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     }
   }
 
+  // ── The local workspace hub (local mode) — the R2 blob contract on loopback ──
+  const lw = /^\/local-workspaces\/([A-Za-z0-9._-]+)$/.exec(url);
+  if (lw) {
+    const { readLocalBlob, writeLocalBlob } = await import("./localsink.js");
+    if (method === "GET") {
+      const blob = readLocalBlob(lw[1]);
+      if (!blob) return json(res, 404, { error: "no bundle yet" });
+      if (req.headers["if-none-match"] === blob.etag) {
+        res.writeHead(304, { ETag: blob.etag });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/octet-stream", ETag: blob.etag, "Content-Length": blob.bytes.length });
+      res.end(blob.bytes);
+      return;
+    }
+    if (method === "PUT") {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const out = writeLocalBlob(lw[1], Buffer.concat(chunks), req.headers["if-match"] as string | undefined, req.headers["if-none-match"] === "*");
+      if (!out) return json(res, 400, { error: "bad workspace id" });
+      if (out === "conflict") return json(res, 412, { error: "bundle advanced (ETag mismatch)" });
+      res.writeHead(200, { ETag: out.etag });
+      res.end();
+      return;
+    }
+  }
+
   // ── The daemon-compatible session surface (PLAN O3) — what the web app drives ──
 
   if (method === "POST" && url === "/sessions") {
@@ -238,7 +266,14 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   }
   if (method === "GET" && url === "/sessions") {
     const q = new URL(req.url ?? "/", "http://x").searchParams;
-    return json(res, 200, listSessionRecords(q.get("workspace") ?? undefined).map(sessionJson));
+    // Visibility scoping (local mode, daemon contract): CLI-launched sessions are none of the
+    // web's business — the DEFAULT excludes origin:"local"; `?origin=local` → only those;
+    // `?origin=all` → everything. Filtering, not auth (same user, same token).
+    const origin = q.get("origin");
+    let all = listSessionRecords(q.get("workspace") ?? undefined);
+    if (origin === "local") all = all.filter((r) => r.origin === "local");
+    else if (origin !== "all") all = all.filter((r) => r.origin !== "local");
+    return json(res, 200, all.map(sessionJson));
   }
 
   if (method === "GET" && url === "/credentials") {
@@ -323,6 +358,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       }
       if (method === "POST" && action === "save") {
         if (!s.sandboxId) return json(res, 409, { error: "session not ready" });
+        if (!sinkFor(s.sandboxId)) return json(res, 200, { ok: true, skipped: true, reason: "standalone session (no persistence)" });
         try {
           await saveWorkspace(s.sandboxId);
           return json(res, 200, { ok: true });
@@ -333,12 +369,16 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       }
       if (method === "POST" && action === "sync") {
         if (!s.sandboxId) return json(res, 409, { error: "session not ready" });
+        if (!sinkFor(s.sandboxId)) return json(res, 200, { merged: false, conflict: false, skipped: true, reason: "standalone session (no persistence)" });
+        const b = await readBody(req);
         try {
-          const out = await syncWorkspace(s.sandboxId);
-          return json(res, 200, { merged: out.updated });
+          const out = await syncWorkspace(s.sandboxId, b.resolve === true);
+          // Resolve mode: a conflict is the EXPECTED outcome (markers left in the tree,
+          // conflicted paths reported) — 200, not 409. Default mode still 409s below.
+          return json(res, 200, { merged: out.updated, conflict: out.conflict ?? false, ...(out.conflicts ? { conflicts: out.conflicts } : {}) });
         } catch (e) {
           const err = e as Error & { conflict?: boolean };
-          return json(res, err.conflict ? 409 : 502, { error: err.message });
+          return json(res, err.conflict ? 409 : 502, { error: err.message, merged: false, conflict: !!err.conflict });
         }
       }
       if (method === "POST" && action === "rename") {
@@ -363,6 +403,14 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         if (!def) return json(res, 400, { error: "agent needs id + name" });
         return json(res, 201, agentJson(spawnAgent(id, s.workspaceId ?? id, s.sandboxId, def)));
       }
+      if (method === "POST" && action === "stop") {
+        const out = await pauseSession(id);
+        return out ? json(res, 200, sessionJson(out)) : json(res, 409, { error: "session not ready" });
+      }
+      if (method === "POST" && action === "start") {
+        const out = await resumeSession(id);
+        return out ? json(res, 200, sessionJson(out)) : json(res, 409, { error: "session not ready" });
+      }
       // Not implemented on this runtime yet — explicit, not silent.
       if (["restart", "files", "merge"].includes(action ?? "")) return json(res, 501, { error: "not supported by this server runtime yet" });
     } catch (e) {
@@ -373,6 +421,12 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const nested = /^\/sessions\/(s-[a-z0-9]+)\/(.+)$/.exec(url);
   if (nested) {
     const sub = nested[2];
+    if (method === "POST" && sub === "merge/abort") {
+      const s2 = getSessionRecord(nested[1]);
+      if (!s2?.sandboxId) return json(res, 404, { error: "unknown session" });
+      await abortMerge(s2.sandboxId).catch(() => undefined);
+      return json(res, 200, { ok: true });
+    }
     if (method === "GET" && sub === "agents/approvals") return json(res, 200, { approvals: [] });
     if (method === "GET" && sub === "agents/harnesses") return json(res, 200, { harnesses: listHarnesses() });
     return json(res, 501, { error: "not supported by this server runtime yet" });
