@@ -56,8 +56,24 @@ await build({
 // Assets are served with an hour of cache; a version query on every reference makes an
 // upgraded server take effect on the next page load instead. The doorman ignores the
 // query when resolving asset names.
-const html = readFileSync(join(root, "web/editor/index.html"), "utf8")
-  .replace("./main.css", `./main.css?v=${hashOf(join(out, "main.css"))}`)
-  .replace("./main.js", `./main.js?v=${hashOf(join(out, "main.js"))}`);
-writeFileSync(join(out, "index.html"), html);
-console.log("[build-editor] dist/editor ready");
+function stampHtml(srcHtml, dir) {
+  const html = readFileSync(srcHtml, "utf8")
+    .replace("./main.css", `./main.css?v=${hashOf(join(dir, "main.css"))}`)
+    .replace("./main.js", `./main.js?v=${hashOf(join(dir, "main.js"))}`);
+  writeFileSync(join(dir, "index.html"), html);
+}
+stampHtml(join(root, "web/editor/index.html"), out);
+
+// The agent view (PLAN V2): a small chat app, same doorman-served pattern.
+const agentOut = join(root, "dist", "agent");
+mkdirSync(agentOut, { recursive: true });
+await build({
+  entryPoints: [join(root, "web/agent/main.ts")],
+  bundle: true,
+  minify: true,
+  format: "esm",
+  outdir: agentOut,
+  logLevel: "warning",
+});
+stampHtml(join(root, "web/agent/index.html"), agentOut);
+console.log("[build-editor] dist/editor + dist/agent ready");

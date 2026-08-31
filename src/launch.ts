@@ -191,6 +191,7 @@ export interface ViewSpec {
   url?: string; // web: the app URL — port + optional subpage (daemon-compatible)
   label?: string;
   specKey?: string;
+  agentId?: string; // agent views: the roster definition id
 }
 
 // Create one view (registry entry + in-sandbox process). Shared by launch scaffolding
@@ -225,13 +226,13 @@ export async function scaffoldView(sandboxId: string, w: ViewSpec): Promise<View
     // A per-view forwarder on an all-interfaces shadow port tries both loopbacks.
     appPort = port;
     port = nextFree(WEB_SHADOW_BASE);
-  } else if (w.type === "code") {
-    // First-party Monaco view (PLAN V1): the doorman serves it — no sandbox port.
+  } else if (w.type === "code" || w.type === "agent") {
+    // First-party doorman-served views (PLAN V1/V2): no sandbox port, no process.
     port = 0;
   } else if (!port) {
     port = nextFree(w.type === "terminal" ? TERMINAL_PORT : DIRECTORY_PORT);
   }
-  const v = addView(sandboxId, w.type, port, { label: w.label, specKey: w.specKey, appPath, appPort, ...(w.type === "web" ? { slug: newWebSlug() } : {}) });
+  const v = addView(sandboxId, w.type, port, { label: w.label, specKey: w.specKey, appPath, appPort, ...(w.type === "agent" && w.agentId ? { agentId: w.agentId } : {}), ...(w.type === "web" ? { slug: newWebSlug() } : {}) });
   await startViewProcess(sandboxId, v);
   return v;
 }
