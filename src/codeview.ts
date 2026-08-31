@@ -89,6 +89,16 @@ async function fileOp(sandboxId: string, body: Record<string, unknown>, res: Ser
   json(res, 200, { ok: true });
 }
 
+// Media the editor previews in-page gets a real content type; everything else stays
+// octet-stream (text is decoded client-side either way).
+const MEDIA_TYPES: Record<string, string> = {
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+  ".svg": "image/svg+xml", ".webp": "image/webp", ".ico": "image/x-icon", ".bmp": "image/bmp",
+  ".avif": "image/avif", ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
+  ".m4v": "video/x-m4v", ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
+  ".m4a": "audio/mp4", ".flac": "audio/flac",
+};
+
 async function readFile(sandboxId: string, rel: string, res: ServerResponse): Promise<void> {
   const mtime = await mtimeOf(sandboxId, rel);
   const r = await downloadFile(sandboxId, `${WORKSPACE}/${rel}`);
@@ -110,7 +120,7 @@ async function readFile(sandboxId: string, rel: string, res: ServerResponse): Pr
     chunks.push(value);
   }
   res.writeHead(200, {
-    "Content-Type": "application/octet-stream",
+    "Content-Type": MEDIA_TYPES[rel.slice(rel.lastIndexOf(".")).toLowerCase()] ?? "application/octet-stream",
     "Content-Length": total,
     "Cache-Control": "no-store",
     ...(mtime ? { "X-Iso-Mtime": String(mtime) } : {}),

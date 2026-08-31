@@ -123,18 +123,30 @@ const editor = monaco.editor.create($("editor"), {
   stickyScroll: { enabled: false },
 });
 
+// A media file opens as a preview pane, not a Monaco model — Monaco itself is
+// text-only. `model` and friends exist only for kind "text".
+type TabKind = "text" | "image" | "video" | "audio";
+
 interface Tab {
   path: string;
-  model: monaco.editor.ITextModel;
-  savedVersion: number;
+  kind: TabKind;
+  model?: monaco.editor.ITextModel;
+  savedVersion?: number;
   mtime?: number;
-  viewState: monaco.editor.ICodeEditorViewState | null;
+  viewState?: monaco.editor.ICodeEditorViewState | null;
 }
 
 const tabs = new Map<string, Tab>();
 let active: Tab | undefined;
 
-const isDirty = (t: Tab): boolean => t.model.getAlternativeVersionId() !== t.savedVersion;
+const MEDIA_KIND: Record<string, TabKind> = {};
+const mk = (k: TabKind, exts: string[]) => exts.forEach((e) => (MEDIA_KIND[e] = k));
+mk("image", ["png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "bmp", "avif"]);
+mk("video", ["mp4", "webm", "mov", "m4v"]);
+mk("audio", ["mp3", "wav", "ogg", "m4a", "flac"]);
+const mediaKindOf = (name: string): TabKind | undefined => MEDIA_KIND[name.slice(name.lastIndexOf(".") + 1).toLowerCase()];
+
+const isDirty = (t: Tab): boolean => !!t.model && t.model.getAlternativeVersionId() !== t.savedVersion;
 
 function renderTabs(): void {
   tabsEl.replaceChildren(
@@ -169,29 +181,50 @@ function syncUrl(): void {
   history.replaceState(null, "", u);
 }
 
+const mediaEl = $("media-view");
+
+function renderMedia(t: Tab): void {
+  const src = `api/file?path=${encodeURIComponent(t.path)}`;
+  const el = t.kind === "image" ? document.createElement("img") : document.createElement(t.kind);
+  el.setAttribute("src", src);
+  if (el instanceof HTMLMediaElement) el.controls = true;
+  el.onerror = () => flash(`preview failed to load ${basename(t.path)}`, true);
+  mediaEl.replaceChildren(el);
+}
+
 function activate(t: Tab): void {
-  if (active && active !== t) active.viewState = editor.saveViewState();
+  if (active && active !== t && active.model) active.viewState = editor.saveViewState();
   active = t;
-  editor.setModel(t.model);
-  if (t.viewState) editor.restoreViewState(t.viewState);
+  if (t.kind === "text" && t.model) {
+    mediaEl.hidden = true;
+    mediaEl.replaceChildren(); // stop any playing video/audio
+    editor.setModel(t.model);
+    if (t.viewState) editor.restoreViewState(t.viewState);
+    statusLang.textContent = t.model.getLanguageId();
+  } else {
+    renderMedia(t);
+    mediaEl.hidden = false;
+    statusLang.textContent = t.kind;
+  }
   emptyEl.classList.add("hidden");
   statusPath.textContent = t.path;
-  statusLang.textContent = t.model.getLanguageId();
   renderTabs();
   markActiveTreeNode();
   syncUrl();
-  editor.focus();
+  if (t.kind === "text") editor.focus();
 }
 
 function closeTab(t: Tab, force = false): void {
   if (!force && isDirty(t) && !confirm(`${t.path} has unsaved changes. Close anyway?`)) return;
   tabs.delete(t.path);
-  t.model.dispose();
+  t.model?.dispose();
   if (active === t) {
     active = [...tabs.values()].pop();
     if (active) activate(active);
     else {
       editor.setModel(null);
+      mediaEl.hidden = true;
+      mediaEl.replaceChildren();
       emptyEl.classList.remove("hidden");
       statusPath.textContent = "";
       statusLang.textContent = "";
@@ -204,6 +237,11 @@ function closeTab(t: Tab, force = false): void {
 
 async function openFile(path: string, line?: number): Promise<void> {
   let t = tabs.get(path);
+  const media = mediaKindOf(path);
+  if (!t && media) {
+    t = { path, kind: media };
+    tabs.set(path, t);
+  }
   if (!t) {
     let read: { bytes: ArrayBuffer; mtime?: number };
     try {
@@ -219,13 +257,13 @@ async function openFile(path: string, line?: number): Promise<void> {
     }
     const text = new TextDecoder().decode(read.bytes);
     const model = monaco.editor.createModel(text, undefined, monaco.Uri.file(`/${path}`));
-    t = { path, model, savedVersion: model.getAlternativeVersionId(), mtime: read.mtime, viewState: null };
+    t = { path, kind: "text", model, savedVersion: model.getAlternativeVersionId(), mtime: read.mtime, viewState: null };
     model.onDidChangeContent(() => renderTabs());
     tabs.set(path, t);
   }
   activate(t);
   void revealInTree(path);
-  if (line && line > 0) {
+  if (line && line > 0 && t.model) {
     editor.revealLineInCenter(line);
     editor.setPosition({ lineNumber: line, column: 1 });
   }
@@ -233,10 +271,10 @@ async function openFile(path: string, line?: number): Promise<void> {
 
 async function save(): Promise<void> {
   const t = active;
-  if (!t || !isDirty(t)) return;
+  if (!t?.model || !isDirty(t)) return;
   const version = t.model.getAlternativeVersionId();
   try {
-    const out = await apiSave(t.path, t.model.getValue(), t.mtime);
+    const out = await apiSave(t.path, t.model!.getValue(), t.mtime);
     t.savedVersion = version;
     t.mtime = out.mtime;
     renderTabs();
@@ -248,7 +286,7 @@ async function save(): Promise<void> {
       // buffer unsaved — reopening the file loads the sandbox version.
       if (confirm(`${t.path} changed in the sandbox since you opened it.\n\nOK overwrites the sandbox version with yours; Cancel keeps your buffer unsaved (close and reopen the file to load the sandbox version).`)) {
         try {
-          const out = await apiSave(t.path, t.model.getValue());
+          const out = await apiSave(t.path, t.model!.getValue());
           t.savedVersion = version;
           t.mtime = out.mtime;
           renderTabs();
@@ -280,13 +318,21 @@ function retargetTab(oldPath: string, newPath: string): void {
   const t = tabs.get(oldPath);
   if (!t) return;
   tabs.delete(oldPath);
+  if (!t.model) {
+    // media preview: re-key and re-point the preview at the new path
+    t.path = newPath;
+    tabs.set(newPath, t);
+    if (active === t) activate(t);
+    else renderTabs();
+    return;
+  }
   const wasDirty = isDirty(t);
   const wasActive = active === t;
   const value = t.model.getValue();
   const state = wasActive ? editor.saveViewState() : t.viewState;
   t.model.dispose();
   const model = monaco.editor.createModel(value, undefined, monaco.Uri.file(`/${newPath}`));
-  const nt: Tab = { path: newPath, model, savedVersion: wasDirty ? -1 : model.getAlternativeVersionId(), mtime: t.mtime, viewState: state };
+  const nt: Tab = { path: newPath, kind: "text", model, savedVersion: wasDirty ? -1 : model.getAlternativeVersionId(), mtime: t.mtime, viewState: state };
   model.onDidChangeContent(() => renderTabs());
   tabs.set(newPath, nt);
   if (wasActive) activate(nt);

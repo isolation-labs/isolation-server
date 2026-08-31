@@ -78,6 +78,12 @@ body { background: var(--bg); color: var(--text); font: 13px/1.45 var(--sans); o
 .empty-mark { font: 600 26px var(--mono); color: var(--line); margin-bottom: 12px; }
 .empty-hint { margin-top: 6px; font: 11px var(--mono); opacity: .8; }
 
+/* --- media preview --- */
+#media-view { position: absolute; inset: 0; z-index: 5; display: grid; place-items: center; background: var(--bg); overflow: auto; padding: 20px; }
+#media-view[hidden] { display: none; }
+#media-view img, #media-view video { max-width: 100%; max-height: 100%; object-fit: contain; border: 1px solid var(--line); border-radius: 4px; background: repeating-conic-gradient(#12161c 0% 25%, #0b0d10 0% 50%) 0 0 / 16px 16px; }
+#media-view audio { width: min(420px, 90%); }
+
 /* --- statusbar --- */
 #statusbar { display: flex; align-items: center; gap: 14px; padding: 4px 12px; border-top: 1px solid var(--line); background: var(--bg-raised); font: 11px var(--mono); color: var(--faint); min-height: 25px; }
 #status-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
