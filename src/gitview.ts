@@ -110,8 +110,9 @@ async function gitOp(sandboxId: string, repoRel: string, op: string, body: Recor
   const envs: Record<string, string> = { ISO_REPO: absRepo(repoRel) };
   let cmd = "";
   if (op === "stage" || op === "unstage" || op === "discard") {
-    // Repo-relative paths come from `git status` itself; still refuse escapes.
-    if (!file || file.includes("\0") || file.split("/").some((s) => s === "..")) return { error: "bad path" };
+    // Repo-relative paths come from `git status` itself; still refuse escapes — an
+    // absolute path would let `discard` rm -rf outside the repo the view is scoped to.
+    if (!file || file.includes("\0") || file.startsWith("/") || file.split("/").some((s) => s === "..")) return { error: "bad path" };
     envs.ISO_F = file;
     if (op === "stage") cmd = `git -C "$ISO_REPO" add -- "$ISO_F"`;
     else if (op === "unstage") cmd = `git -C "$ISO_REPO" reset -q HEAD -- "$ISO_F"`;
@@ -150,7 +151,7 @@ export async function handleGitView(req: IncomingMessage, res: ServerResponse, v
       }
       if (rest === "/api/diff" && method === "GET") {
         const file = q.get("path") ?? "";
-        if (!file || file.split("/").some((s) => s === "..")) return json(res, 400, { error: "bad path" });
+        if (!file || file.startsWith("/") || file.split("/").some((s) => s === "..")) return json(res, 400, { error: "bad path" });
         const out = await gitDiff(view.sandboxId, repo, file, q.get("staged") === "1");
         return json(res, "error" in out ? 409 : 200, out);
       }
