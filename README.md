@@ -31,14 +31,16 @@ reimplements the runtime.
 
 ```
 npm install -g isolation-server
-isolation connect <token-from-the-web-app>
+isolation up                                # install + start the server
+isolation connect <token-from-the-web-app>  # pair it to your account
 ```
 
-That's the whole server: `connect` pairs it and runs `up`, which installs the pinned
-OpenSandbox runtime (via uv), mints its API key, and registers both as login
-services. Prerequisites: Node 20+ and Docker. State lives in `~/.isolation-server`.
+`up` is the whole server in one command: it installs the pinned OpenSandbox
+runtime (via uv), mints its API key, and registers both as login services.
+`connect` then pairs the running server to your account. Prerequisites: Node 20+
+and Docker. State lives in `~/.isolation-server`.
 
-Other verbs: `isolation up | down | status | update | disconnect`.
+Other verbs: `isolation down | status | update | disconnect`.
 
 ## Develop
 
