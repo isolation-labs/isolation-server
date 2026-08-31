@@ -17,8 +17,10 @@ import * as monaco from "monaco-editor/editor/editor.slim.main.js";
 import "./editor.css";
 
 // Monaco's language smarts run in a worker; we bundle the base worker next to main.js.
+// __WORKER_V__ is stamped by build-editor.mjs so a server upgrade busts the asset cache.
+declare const __WORKER_V__: string;
 (self as unknown as { MonacoEnvironment: unknown }).MonacoEnvironment = {
-  getWorker: () => new Worker(new URL("./editor.worker.js", location.href)),
+  getWorker: () => new Worker(new URL(`./editor.worker.js?v=${__WORKER_V__}`, location.href)),
 };
 
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;

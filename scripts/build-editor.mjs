@@ -3,7 +3,8 @@
 // index.html. Runs as part of `npm run build`, so the assets ship inside the npm
 // tarball — the doorman serves them; nothing is fetched at runtime.
 import { build } from "esbuild";
-import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -26,16 +27,7 @@ const slim = readFileSync(join(monacoEditorDir, "editor.main.js"), "utf8")
 const slimEntry = join(monacoEditorDir, "editor.slim.main.js");
 writeFileSync(slimEntry, slim);
 
-await build({
-  entryPoints: [join(root, "web/editor/main.ts")],
-  bundle: true,
-  minify: true,
-  format: "esm",
-  outdir: out,
-  loader: { ".ttf": "file" },
-  assetNames: "[name]", // stable codicon.ttf — the doorman serves the flat directory
-  logLevel: "warning",
-});
+const hashOf = (file) => createHash("sha256").update(readFileSync(file)).digest("hex").slice(0, 10);
 
 // The worker must be its own classic-script bundle (Monaco spawns it by URL).
 await build({
@@ -46,6 +38,26 @@ await build({
   outfile: join(out, "editor.worker.js"),
   logLevel: "warning",
 });
+const workerV = hashOf(join(out, "editor.worker.js"));
 
-copyFileSync(join(root, "web/editor/index.html"), join(out, "index.html"));
+await build({
+  entryPoints: [join(root, "web/editor/main.ts")],
+  bundle: true,
+  minify: true,
+  format: "esm",
+  outdir: out,
+  loader: { ".ttf": "file" },
+  assetNames: "[name]", // stable codicon.ttf — the doorman serves the flat directory
+  // Cache-busting for the worker URL main.js constructs at runtime.
+  define: { __WORKER_V__: JSON.stringify(workerV) },
+  logLevel: "warning",
+});
+
+// Assets are served with an hour of cache; a version query on every reference makes an
+// upgraded server take effect on the next page load instead. The doorman ignores the
+// query when resolving asset names.
+const html = readFileSync(join(root, "web/editor/index.html"), "utf8")
+  .replace("./main.css", `./main.css?v=${hashOf(join(out, "main.css"))}`)
+  .replace("./main.js", `./main.js?v=${hashOf(join(out, "main.js"))}`);
+writeFileSync(join(out, "index.html"), html);
 console.log("[build-editor] dist/editor ready");
