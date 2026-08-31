@@ -14,7 +14,7 @@ import { imageExists, pullImage, pushImageInBackground, type ImageRegistry } fro
 const log = (...a: unknown[]) => console.log("[cache]", ...a);
 const building = new Set<string>();
 
-export const cacheImageTag = (key: string) => `isogate-cache:${key.slice(0, 32)}`;
+export const cacheImageTag = (key: string) => `isolation-server-cache:${key.slice(0, 32)}`;
 
 const DEP_MANIFESTS = ["package.json", "requirements.txt", "pyproject.toml", "Gemfile", "composer.json", "Cargo.toml", "go.mod"];
 
@@ -90,7 +90,7 @@ export function buildDependencyCacheInBackground(key: string, specImage: string,
     return;
   }
   building.add(key);
-  const ctx = mkdtempSync(join(tmpdir(), "isogate-cache-"));
+  const ctx = mkdtempSync(join(tmpdir(), "isolation-server-cache-"));
   try {
     cpSync(scratchDir, ctx, { recursive: true });
     writeFileSync(join(ctx, "Dockerfile"), cacheDockerfile(scratchDir, specImage, dirs));

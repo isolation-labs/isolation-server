@@ -1,4 +1,4 @@
-// Session images (PLAN O4). A workspace runs from `isogate-spec:<wsHash>` = FROM <base>
+// Session images (PLAN O4). A workspace runs from `isolation-server-spec:<wsHash>` = FROM <base>
 // + our tooling layer. The base is, in order: a host-side `devcontainer build` result
 // (Dockerfile/build/features configs), else the config's pre-built image, else the
 // language image analysis picked, else DEFAULT_BASE. Built ONCE per workspace hash with
@@ -90,8 +90,8 @@ const DEVCONTAINER_CLI_VERSION = "0.80.0";
 const PULL_TIMEOUT_MS = 10 * 60_000;
 const DOCKER_CFG_ROOT = join(HOME, "docker-config");
 
-export const specImageTag = (wsHash: string) => `isogate-spec:${wsHash.slice(0, 32)}`;
-const devcImageTag = (wsHash: string) => `isogate-devc:${wsHash.slice(0, 32)}`;
+export const specImageTag = (wsHash: string) => `isolation-server-spec:${wsHash.slice(0, 32)}`;
+const devcImageTag = (wsHash: string) => `isolation-server-devc:${wsHash.slice(0, 32)}`;
 
 export function imageExists(tag: string): boolean {
   return spawnSync("docker", ["image", "inspect", tag], { stdio: "ignore" }).status === 0;
@@ -137,7 +137,7 @@ async function buildDevcontainerBase(spec: LaunchSpec, repos: AnalysisRepo[], ws
   if (!needsDevcontainerBuild(spec)) return undefined;
   const tag = devcImageTag(wsHash);
   if (imageExists(tag)) return tag;
-  const work = mkdtempSync(join(tmpdir(), "isogate-devc-"));
+  const work = mkdtempSync(join(tmpdir(), "isolation-server-devc-"));
   try {
     const folder = join(work, "ws");
     if (spec.source === "generated") {
@@ -179,7 +179,7 @@ export async function ensureSpecImage(spec: LaunchSpec, repos: AnalysisRepo[], w
     if (await pullImage(registry, tag)) return tag;
   }
   const base = (await buildDevcontainerBase(spec, repos, wsHash, onLine)) ?? spec.devContainer.image ?? DEFAULT_BASE;
-  const ctx = mkdtempSync(join(tmpdir(), "isogate-spec-"));
+  const ctx = mkdtempSync(join(tmpdir(), "isolation-server-spec-"));
   try {
     writeFileSync(join(ctx, "Dockerfile"), specDockerfile(base));
     onLine?.(`building session image from ${base}`);

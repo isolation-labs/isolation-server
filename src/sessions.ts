@@ -1,5 +1,5 @@
 // The daemon-compatible session surface (PLAN O3). The web's DaemonClient drives
-// every server through one wire contract; isogate implements the core of it —
+// every server through one wire contract; isolation-server implements the core of it —
 // launch/list/get/save/sync/rename/finish, views, changes, logs — so the existing
 // web app works against an OpenSandbox server with ZERO cloud-side changes. A
 // session here is a thin record over one sandbox: `s-…` id ↔ sandbox id, name,
@@ -68,9 +68,9 @@ function update(id: string, patch: Partial<SessionRecord>): void {
   persist();
 }
 
-// --- the daemon launch body → isogate launch ----------------------------------
+// --- the daemon launch body → isolation-server launch ----------------------------------
 
-// What the web actually sends POST /sessions (the subset isogate honors; unknown
+// What the web actually sends POST /sessions (the subset isolation-server honors; unknown
 // fields — agent, harnesses, claude — are accepted and ignored for now).
 export interface DaemonLaunchBody {
   workspace?: {

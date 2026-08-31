@@ -1,4 +1,4 @@
-// isogate config — one JSON file, read on boot, written atomically on change.
+// isolation-server config — one JSON file, read on boot, written atomically on change.
 // Everything a server needs to belong to an account lives here: the master token
 // (loopback API auth), the pairing (backend + per-server secret), the relay
 // enrollment, and how to reach the local OpenSandbox runtime.
@@ -7,7 +7,21 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 
-export const HOME = process.env.ISOGATE_HOME ?? join(homedir(), ".isogate");
+// The config home. `~/.isogate` (the pre-rename dir) is ADOPTED on first run — a paired
+// box keeps its token/pairing/secrets across the rename. NEVER `~/.isolation`: old-daemon
+// installs still own that dir. The old env names keep working as fallbacks (cloud-init
+// from before the rename seeds ISOGATE_HOME).
+function defaultHome(): string {
+  const next = join(homedir(), ".isolation-server");
+  const legacy = join(homedir(), ".isogate");
+  try {
+    if (!existsSync(next) && existsSync(legacy)) renameSync(legacy, next);
+  } catch {
+    /* adoption is best-effort; a fresh dir is minted below either way */
+  }
+  return next;
+}
+export const HOME = process.env.ISOLATION_SERVER_HOME ?? process.env.ISOGATE_HOME ?? defaultHome();
 export const CONFIG_FILE = join(HOME, "config.json");
 export const DATA = join(HOME, "data");
 export const VIEWS_FILE = join(DATA, "views.json");
@@ -15,8 +29,8 @@ export const LAUNCH_SCRATCH = join(HOME, "launch", "scratch");
 export const SECRETS = join(HOME, "secrets"); // 0700: sandbox-lifetime secret state (sink bearers/encKeys)
 
 // 8090: side-by-side with a legacy isolation daemon (8088) during the migration window.
-export const PORT = Number(process.env.ISOGATE_PORT ?? 8090);
-export const HOST = process.env.ISOGATE_HOST ?? "127.0.0.1";
+export const PORT = Number(process.env.ISOLATION_SERVER_PORT ?? process.env.ISOGATE_PORT ?? 8090);
+export const HOST = process.env.ISOLATION_SERVER_HOST ?? process.env.ISOGATE_HOST ?? "127.0.0.1";
 
 export interface Pairing {
   backendUrl: string;
@@ -106,7 +120,7 @@ export function saveEnrollment(e: Enrollment | undefined): void {
 }
 
 // The OpenSandbox runtime this gate fronts. Defaults match `opensandbox-server`'s
-// docker example config; `isogate up` will eventually mint + own the API key.
+// docker example config; `isolation-server up` will eventually mint + own the API key.
 export function getOsb(): OsbConfig {
   return cfg.osb ?? { url: "http://127.0.0.1:8080", apiKey: "" };
 }

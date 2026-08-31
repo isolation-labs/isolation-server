@@ -4,7 +4,7 @@
 //   key = HKDF-SHA256(secret, info="isolation:claude-envelope:v1").
 // The seal key is the per-server PAIRING SECRET (paired) or the MASTER TOKEN
 // (manual). We try both — the GCM tag picks the right one. Keeping the label and
-// format identical means the existing cloud sealing code works against isogate
+// format identical means the existing cloud sealing code works against isolation-server
 // with zero changes.
 import { createDecipheriv, hkdfSync } from "node:crypto";
 import { getPairing, getToken } from "./config.js";

@@ -1,4 +1,4 @@
-// The isogate HTTP surface — control plane (loopback + tunnel, master-token-gated)
+// The isolation-server HTTP surface — control plane (loopback + tunnel, master-token-gated)
 // plus the /v/* data plane (view-token-gated, handled by the doorman). Plain
 // node:http: the doorman needs the raw 'upgrade' event anyway, and the API surface
 // is small enough that a framework would outweigh it.
@@ -29,7 +29,7 @@ import { pauseSession, resumeSession,
 import { sandboxTunnelManager, tunnelManager } from "./tunnel.js";
 
 const VERSION = "0.0.1";
-const log = (...a: unknown[]) => console.log("[isogate]", ...a);
+const log = (...a: unknown[]) => console.log("[isolation-server]", ...a);
 
 const json = (res: ServerResponse, status: number, body: unknown): void => {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -128,7 +128,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       const { readFileSync } = await import("node:fs");
       const { join } = await import("node:path");
       const { HOME } = await import("./config.js");
-      const lines = readFileSync(join(HOME, "isogate.log"), "utf8").split("\n").filter(Boolean).slice(-500);
+      const lines = readFileSync(join(HOME, "isolation-server.log"), "utf8").split("\n").filter(Boolean).slice(-500);
       return json(res, 200, {
         entries: lines.map((line, i) => ({ seq: i, ts: "", stream: "out" as const, line })),
         cursor: lines.length,
@@ -140,7 +140,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   }
 
   // Daemon-shaped status (superset: the web reads ok/version/name/relay/sessions/
-  // views; the isogate-native fields ride along).
+  // views; the isolation-server-native fields ride along).
   if (method === "GET" && url === "/status") {
     const t = tunnelManager.status();
     return json(res, 200, {
@@ -277,7 +277,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   }
 
   if (method === "GET" && url === "/credentials") {
-    // isogate discovers nothing on its host by design — credentials come sealed at launch.
+    // isolation-server discovers nothing on its host by design — credentials come sealed at launch.
     return json(res, 200, { claude: [], github: { present: false } });
   }
 
@@ -344,7 +344,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       }
       if (method === "POST" && action === "views") {
         const b = await readBody(req);
-        // The agent chat embed is a daemon-side view type isogate doesn't host (the
+        // The agent chat embed is a daemon-side view type isolation-server doesn't host (the
         // agent layer lands in O5); refuse explicitly rather than minting a dead view.
         if (b.type === "agent") return json(res, 501, { error: "agent views are not supported by this server runtime yet" });
         const v = await createSessionView(s, {

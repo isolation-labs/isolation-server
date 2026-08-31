@@ -1,5 +1,5 @@
 // Client for execd — the exec/file daemon OpenSandbox injects into every sandbox.
-// isogate reaches it on the sandbox's published host port (endpoints API, port
+// isolation-server reaches it on the sandbox's published host port (endpoints API, port
 // 44772) and uses it for everything that happens INSIDE a sandbox: view processes,
 // clones, secret-file materialization, and (later) the persistence choreography.
 import { endpointFor } from "./opensandbox.js";

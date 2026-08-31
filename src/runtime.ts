@@ -1,4 +1,4 @@
-// The OpenSandbox runtime, owned by the gate: `isogate up` makes sure a PINNED
+// The OpenSandbox runtime, owned by the gate: `isolation-server up` makes sure a PINNED
 // `opensandbox-server` is installed (via uv, no root), configured for the Docker
 // runtime on loopback with an API key the gate minted, and running as a service
 // next to the gate. Users never touch OpenSandbox directly — one command stands
@@ -13,7 +13,7 @@ import { getOsb, saveOsb } from "./config.js";
 import { osbHealthy } from "./opensandbox.js";
 
 export const OPENSANDBOX_VERSION = "0.2.3";
-export const SANDBOX_TOML = process.env.ISOGATE_SANDBOX_TOML ?? join(homedir(), ".sandbox.toml");
+export const SANDBOX_TOML = process.env.ISOLATION_SERVER_SANDBOX_TOML ?? join(homedir(), ".sandbox.toml");
 
 const candidates = (name: string): string[] => [
   join(homedir(), ".local", "bin", name),
@@ -32,7 +32,7 @@ function ensureUv(log: (m: string) => void): string {
   log("installing uv (user-local)…");
   const r = spawnSync("sh", ["-c", "curl -LsSf https://astral.sh/uv/install.sh | sh"], { stdio: "ignore", env: { ...process.env, UV_NO_MODIFY_PATH: "1" } });
   const after = find("uv");
-  if (r.status !== 0 || !after) throw new Error("could not install uv — install it from https://docs.astral.sh/uv/ and re-run `isogate up`");
+  if (r.status !== 0 || !after) throw new Error("could not install uv — install it from https://docs.astral.sh/uv/ and re-run `isolation-server up`");
   return after;
 }
 

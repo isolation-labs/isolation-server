@@ -1,4 +1,4 @@
-// Launch orchestration — the isogate slice of what the old daemon's launch path
+// Launch orchestration — the isolation-server slice of what the old daemon's launch path
 // did, re-targeted at OpenSandbox: create the sandbox, materialize the launch
 // secrets, clone the repos, start the view processes. The devcontainer pipeline and
 // workspace persistence layer on top of this in later phases; nothing here persists
@@ -41,7 +41,7 @@ function parseWorkspaceSink(body: LaunchRequest): WorkspaceSink | undefined {
 
 const log = (...a: unknown[]) => console.log("[launch]", ...a);
 
-export const TOOLING_IMAGE = "isogate/tooling:0.4";
+export const TOOLING_IMAGE = "isolation-server/tooling:0.4";
 const TERMINAL_PORT = 7681;
 const CODE_PORT = 13337;
 const DIRECTORY_PORT = 8055;
@@ -56,7 +56,7 @@ const labelSafe = (s: string): string =>
 // let a launch body shadow system env) -----------------------------------------
 
 const VAR_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const RESERVED_PREFIXES = ["ISOGATE_", "ISO_", "OPEN_SANDBOX_"];
+const RESERVED_PREFIXES = ["ISOLATION_SERVER_", "ISO_", "OPEN_SANDBOX_"];
 const RESERVED_NAMES = new Set(["PATH", "HOME", "GIT_ASKPASS", "GIT_TOKEN", "GIT_SSH_COMMAND"]);
 
 interface EnvConfig {
@@ -321,7 +321,7 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
   for (const v of envConfig.vars) env[v.name] = v.value;
 
   // The image (PLAN O4): analyze the repos' detection files host-side, hash them, and
-  // build/reuse `isogate-spec:<wsHash>` — a repo's own .devcontainer (image / Dockerfile /
+  // build/reuse `isolation-server-spec:<wsHash>` — a repo's own .devcontainer (image / Dockerfile /
   // features) or a generated language base, plus our tooling layer. An explicit `image`
   // in the body wins; no docker CLI on the host (or a build failure) → the static
   // tooling image, so a launch never dies on image prep.
@@ -377,7 +377,7 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
     entrypoint: ["sleep", "infinity"],
     env: Object.keys(env).length ? env : undefined,
     // Metadata values must be label-safe for the runtime (alphanum/-/_/. only, ≤63).
-    metadata: { managedBy: "isogate", ...(body.name ? { name: labelSafe(body.name) } : {}), ...(body.metadata ?? {}) },
+    metadata: { managedBy: "isolation-server", ...(body.name ? { name: labelSafe(body.name) } : {}), ...(body.metadata ?? {}) },
   });
   log(`sandbox ${sandbox.id} created (${image})`);
 

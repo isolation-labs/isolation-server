@@ -1,4 +1,4 @@
-// Thin client for the local opensandbox-server. isogate never reimplements anything
+// Thin client for the local opensandbox-server. isolation-server never reimplements anything
 // the runtime already does — if it can be expressed as a call here, it must be.
 import { getOsb } from "./config.js";
 

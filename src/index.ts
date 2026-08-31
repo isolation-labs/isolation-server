@@ -1,4 +1,4 @@
-// isogate — boot the gate: mint the master token if first run, start the HTTP
+// isolation-server — boot the gate: mint the master token if first run, start the HTTP
 // surface, then bring up whatever the config prescribes (tunnel, heartbeat).
 import { getToken } from "./config.js";
 import { startConfigured, startServer } from "./server.js";

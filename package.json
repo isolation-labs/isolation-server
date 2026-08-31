@@ -1,11 +1,11 @@
 {
-  "name": "isogate",
+  "name": "isolation-server",
   "version": "0.0.1",
-  "description": "The light layer between Isolation Cloud and an OpenSandbox server: pairing, tunnel, view-auth doorman, secrets, workspace persistence.",
+  "description": "The Isolation server: the light layer between Isolation Cloud and an OpenSandbox runtime \u2014 pairing, tunnel, view-auth doorman, secrets, workspace persistence.",
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
-    "isogate": "dist/cli.js"
+    "isolation-server": "dist/cli.js"
   },
   "main": "dist/index.js",
   "engines": {

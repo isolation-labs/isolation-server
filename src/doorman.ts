@@ -1,11 +1,11 @@
-// The doorman — isogate's data plane. One public origin (the tunnel) fronts every
+// The doorman — isolation-server's data plane. One public origin (the tunnel) fronts every
 // view of every sandbox:  /v/<viewId>/*  →  the sandbox port, via the runtime's
 // per-sandbox proxy (execd publishes one host port; its /proxy/<port> path forwards
 // to the app port inside the sandbox). WebSocket-capable.
 //
 // Browser auth (ported contract): a browser can't set Authorization on an iframe or
 // WS handshake, so we accept the master token OR a view-scoped token via `?token=`
-// or the `isogate_token` cookie; a valid query token is promoted to a Path=/v/<id>
+// or the `isolation-server_token` cookie; a valid query token is promoted to a Path=/v/<id>
 // cookie so subsequent asset/WS requests authenticate automatically.
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
@@ -59,7 +59,7 @@ function tokenFromRequest(req: IncomingMessage, viewId: string): string | undefi
   const cookies = req.headers.cookie ?? "";
   for (const c of cookies.split(";")) {
     const [k, ...rest] = c.trim().split("=");
-    if (k === "isogate_token") return decodeURIComponent(rest.join("="));
+    if (k === "isolation-server_token") return decodeURIComponent(rest.join("="));
   }
   void viewId;
   return undefined;
@@ -107,7 +107,7 @@ export async function handleViewRequest(req: IncomingMessage, res: ServerRespons
   }
   // Promote a valid query token to a view-scoped cookie for the follow-up requests.
   if (queryToken) {
-    res.setHeader("Set-Cookie", `isogate_token=${encodeURIComponent(queryToken)}; Path=/v/${viewId}; HttpOnly; SameSite=None; Secure`);
+    res.setHeader("Set-Cookie", `isolation-server_token=${encodeURIComponent(queryToken)}; Path=/v/${viewId}; HttpOnly; SameSite=None; Secure`);
   }
   try {
     const t = await resolveTarget(view.sandboxId, view.port);

@@ -2,7 +2,7 @@
 //   1. fetchDetectionFiles — a host-side blobless, sparse, shallow fetch of only the
 //      detection files (kilobytes), so hashes + analysis run before we create the sandbox.
 //   2. analyzeLaunch — a repo's own .devcontainer wins; else generate a config from the
-//      detected languages. images.ts turns the result into `isogate-spec:<wsHash>`.
+//      detected languages. images.ts turns the result into `isolation-server-spec:<wsHash>`.
 import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -52,7 +52,7 @@ function git(args: string[], cwd?: string, env?: NodeJS.ProcessEnv): { ok: boole
 // Host-side clone with the credential handed to git via GIT_ASKPASS from the env —
 // never argv, never the URL, never .git/config.
 export function hostClone(url: string, dest: string, token: string | undefined, extra: string[] = []): boolean {
-  const askDir = token ? mkdtempSync(join(tmpdir(), "isogate-askpass-")) : "";
+  const askDir = token ? mkdtempSync(join(tmpdir(), "isolation-server-askpass-")) : "";
   try {
     const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
     if (token) {

@@ -1,8 +1,8 @@
 // Auto-provision cloudflared (the relay binary) — the one `connect` prerequisite a
 // user would otherwise install by hand. When nothing runnable exists we fetch the
-// pinned static build into the gate-managed bin (~/.isogate/bin), checksum-verified
+// pinned static build into the gate-managed bin (~/.isolation-server/bin), checksum-verified
 // against the release's published digests, atomically swapped in, no root needed.
-// Resolution: ISOGATE_CLOUDFLARED override → managed bin → PATH. Only the managed
+// Resolution: ISOLATION_SERVER_CLOUDFLARED override → managed bin → PATH. Only the managed
 // slot is ever written; a user-supplied binary is never touched.
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -36,9 +36,9 @@ const installedVersion = (): string | undefined => {
 // Resolve a runnable cloudflared, downloading into the managed slot when there is
 // none. Returns the path/command to spawn.
 export async function ensureCloudflared(log: (m: string) => void = () => {}): Promise<string> {
-  const override = process.env.ISOGATE_CLOUDFLARED;
+  const override = process.env.ISOLATION_SERVER_CLOUDFLARED;
   if (override) {
-    if (!runnable(override)) throw new Error(`ISOGATE_CLOUDFLARED points at '${override}' but it can't be run`);
+    if (!runnable(override)) throw new Error(`ISOLATION_SERVER_CLOUDFLARED points at '${override}' but it can't be run`);
     return override;
   }
   if (existsSync(MANAGED) && runnable(MANAGED)) {
@@ -62,7 +62,7 @@ async function download(log: (m: string) => void): Promise<void> {
   if (!a) {
     throw new Error(
       `cloudflared not found and there is no prebuilt binary for ${key} — install it ` +
-        `(https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) or set ISOGATE_CLOUDFLARED`,
+        `(https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) or set ISOLATION_SERVER_CLOUDFLARED`,
     );
   }
   const url = `https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/${a.asset}`;

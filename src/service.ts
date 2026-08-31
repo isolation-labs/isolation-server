@@ -1,5 +1,5 @@
-// OS services — `isogate up` installs/refreshes the gate AND (unless adopted) the
-// OpenSandbox runtime as the user's login services and starts them; `isogate down`
+// OS services — `isolation-server up` installs/refreshes the gate AND (unless adopted) the
+// OpenSandbox runtime as the user's login services and starts them; `isolation-server down`
 // stops + disables them. Service-only model (no PID-file mode): dev/CI runs
 // `node dist/index.js` directly. macOS = launchd user agents; Linux = systemd --user.
 import { execFileSync } from "node:child_process";
@@ -15,7 +15,9 @@ export interface ServiceSpec {
   env?: Record<string, string>;
 }
 
-const LABELS: Record<ServiceSpec["id"], string> = { gate: "cc.isolation.isogate", runtime: "cc.isolation.opensandbox" };
+const LABELS: Record<ServiceSpec["id"], string> = { gate: "cc.isolation.server", runtime: "cc.isolation.opensandbox" };
+// The gate's pre-rename label — cleaned up on install so the old service can't keep the port.
+const LEGACY_GATE_LABEL = "cc.isolation.isogate";
 const uid = (): number => process.getuid?.() ?? 501;
 
 // The compiled gate entry next to this file — the service runs the build it was installed from.
@@ -41,7 +43,17 @@ const xml = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;"
 
 function launchdInstall(spec: ServiceSpec): void {
   mkdirSync(join(homedir(), "Library", "LaunchAgents"), { recursive: true });
-  const log = join(HOME, `${spec.id === "gate" ? "isogate" : "opensandbox"}.log`);
+  if (spec.id === "gate") {
+    // Retire a pre-rename gate service (best-effort — absent on a fresh box).
+    const legacy = join(homedir(), "Library", "LaunchAgents", `${LEGACY_GATE_LABEL}.plist`);
+    try {
+      launchctl("bootout", `gui/${uid()}`, legacy);
+    } catch { /* not loaded */ }
+    try {
+      rmSync(legacy, { force: true });
+    } catch { /* not there */ }
+  }
+  const log = join(HOME, `${spec.id === "gate" ? "isolation-server" : "opensandbox"}.log`);
   const env = { PATH: `${join(homedir(), ".local", "bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`, HOME: homedir(), ...(spec.env ?? {}) };
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -82,10 +94,19 @@ const unitName = (id: ServiceSpec["id"]): string => `${LABELS[id]}.service`;
 const systemctl = (...args: string[]): void => void execFileSync("systemctl", ["--user", ...args], { stdio: "ignore" });
 
 function systemdInstall(spec: ServiceSpec): void {
+  if (spec.id === "gate") {
+    // Retire a pre-rename gate unit (best-effort — absent on a fresh box).
+    try {
+      execFileSync("systemctl", ["--user", "disable", "--now", `${LEGACY_GATE_LABEL}.service`], { stdio: "ignore" });
+    } catch { /* not installed */ }
+    try {
+      rmSync(join(unitDir(), `${LEGACY_GATE_LABEL}.service`), { force: true });
+    } catch { /* not there */ }
+  }
   mkdirSync(unitDir(), { recursive: true });
   const env = { PATH: `${join(homedir(), ".local", "bin")}:/usr/local/bin:/usr/bin:/bin`, ...(spec.env ?? {}) };
   const unit = `[Unit]
-Description=${spec.id === "gate" ? "isogate — the Isolation gate" : "OpenSandbox runtime (managed by isogate)"}
+Description=${spec.id === "gate" ? "isolation-server — the Isolation gate" : "OpenSandbox runtime (managed by isolation-server)"}
 After=network-online.target docker.service
 
 [Service]
@@ -95,7 +116,7 @@ ${Object.entries(env)
   .join("\n")}
 Restart=always
 RestartSec=3
-StandardOutput=append:${join(HOME, `${spec.id === "gate" ? "isogate" : "opensandbox"}.log`)}
+StandardOutput=append:${join(HOME, `${spec.id === "gate" ? "isolation-server" : "opensandbox"}.log`)}
 StandardError=inherit
 
 [Install]

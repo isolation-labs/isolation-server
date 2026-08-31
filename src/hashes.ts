@@ -16,7 +16,7 @@ export const DETECTION_GLOBS = [".devcontainer", ".devcontainer.json", ...WS_HAS
 // Version of the tooling layer (images.ts Dockerfile template + the in-sandbox
 // forwarder). Folded into the workspace hash so a tooling change rebuilds spec images
 // instead of silently reusing stale ones. BUMP on any change to the template.
-//   1 — first isogate tooling layer: git/tmux/ttyd/code-server/filebrowser + iso-node.
+//   1 — first isolation-server tooling layer: git/tmux/ttyd/code-server/filebrowser + iso-node.
 export const TOOLING_VERSION = "1";
 
 const SKIP_DIRS = new Set(["node_modules", ".git"]);

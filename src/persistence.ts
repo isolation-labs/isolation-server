@@ -63,7 +63,7 @@ interface SinkState {
 
 // Per-sandbox persistence state. It holds the sink's bearer + encKey, so it lives in
 // the gate's 0600 secret store (HOME/secrets/sinks.json) — sandbox-lifetime only,
-// dropped on finish — and survives a gate restart (a rebuild/`isogate up` mid-session
+// dropped on finish — and survives a gate restart (a rebuild/`isolation-server up` mid-session
 // must not strand the session's ability to save or sync).
 const state = new Map<string, SinkState>();
 const SINKS_FILE = join(SECRETS, "sinks.json");
