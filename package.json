@@ -17,7 +17,7 @@
     "dev": "npm run build && node dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "prepublishOnly": "npm run build",
-    "test": "npm run build && node --test test/"
+    "test": "npm run build && node --test test/*.test.mjs"
   },
   "dependencies": {
     "http-proxy-3": "^1.20.5"
