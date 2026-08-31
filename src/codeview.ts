@@ -42,8 +42,12 @@ export function safeRelPath(raw: string | null): string | undefined {
 async function listDir(sandboxId: string, rel: string, res: ServerResponse): Promise<void> {
   const dir = rel ? `${WORKSPACE}/${rel}` : WORKSPACE;
   // `ls -1Ap` marks directories with a trailing slash and is the portable common
-  // denominator (GNU and busybox alike) — no -printf, no stat flavor games.
-  const r = await run(sandboxId, `ls -1Ap ${JSON.stringify(dir)}`, { timeoutMs: 20_000 });
+  // denominator (GNU and busybox alike) — no -printf, no stat flavor games. The dir
+  // rides in an env var, never interpolated into the command text: safeRelPath blocks
+  // traversal but NOT shell metacharacters ($, backticks), and `"$D"` inside a shell
+  // string is not re-parsed for command substitution — so a name like `x$(id)` lists,
+  // it doesn't execute.
+  const r = await run(sandboxId, `ls -1Ap "$ISO_LS_DIR"`, { envs: { ISO_LS_DIR: dir }, timeoutMs: 20_000 });
   if (!r.ok) return json(res, 404, { error: r.stderr.trim().slice(0, 200) || "not a directory" });
   const entries = r.stdout
     .split("\n")
