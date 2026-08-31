@@ -335,6 +335,7 @@ interface DirNode {
   expanded: boolean;
   loaded: boolean;
   depth: number;
+  sig?: string; // signature of the rendered listing (diff-based refresh)
 }
 
 const dirNodes = new Map<string, DirNode>();
@@ -389,28 +390,41 @@ function makeRow(path: string, name: string, dir: boolean, depth: number): HTMLE
   return wrap;
 }
 
+const sortEntries = (entries: Entry[]): Entry[] =>
+  entries.sort((a, b) => {
+    if (a.dir !== b.dir) return Number(b.dir) - Number(a.dir);
+    const an = a.dir && NOISE_DIRS.has(a.name) ? 1 : 0;
+    const bn = b.dir && NOISE_DIRS.has(b.name) ? 1 : 0;
+    return an - bn || a.name.localeCompare(b.name);
+  });
+
+// Signature of a rendered listing — the diff-based refresh skips the DOM entirely
+// when a directory's contents haven't changed.
+const sigOf = (entries: Entry[]): string => entries.map((e) => `${e.name}${e.dir ? "/" : ""}`).join("\n");
+
+function renderEntries(path: string, entries: Entry[]): void {
+  const node = dirNodes.get(path);
+  if (!node) return;
+  // Rebuilding this container drops any descendant registry entries.
+  for (const p of [...dirNodes.keys()]) if (p !== path && (path === "" || p.startsWith(`${path}/`))) dirNodes.delete(p);
+  for (const p of [...fileRows.keys()]) if (path === "" || p.startsWith(`${path}/`)) fileRows.delete(p);
+  node.kidsEl.replaceChildren(...entries.map((e) => makeRow(path ? `${path}/${e.name}` : e.name, e.name, e.dir, node.depth + (path === "" ? 0 : 1))));
+  if (!entries.length) {
+    const note = document.createElement("div");
+    note.className = "tree-note";
+    note.textContent = "(empty)";
+    node.kidsEl.replaceChildren(note);
+  }
+  node.loaded = true;
+  node.sig = sigOf(entries);
+  markActiveTreeNode();
+}
+
 async function listInto(path: string): Promise<void> {
   const node = dirNodes.get(path);
   if (!node) return;
   try {
-    const entries = (await apiList(path)).sort((a, b) => {
-      if (a.dir !== b.dir) return Number(b.dir) - Number(a.dir);
-      const an = a.dir && NOISE_DIRS.has(a.name) ? 1 : 0;
-      const bn = b.dir && NOISE_DIRS.has(b.name) ? 1 : 0;
-      return an - bn || a.name.localeCompare(b.name);
-    });
-    // Rebuilding this container drops any descendant registry entries.
-    for (const p of [...dirNodes.keys()]) if (p !== path && (path === "" || p.startsWith(`${path}/`))) dirNodes.delete(p);
-    for (const p of [...fileRows.keys()]) if (path === "" || p.startsWith(`${path}/`)) fileRows.delete(p);
-    node.kidsEl.replaceChildren(...entries.map((e) => makeRow(path ? `${path}/${e.name}` : e.name, e.name, e.dir, node.depth + (path === "" ? 0 : 1))));
-    if (!entries.length) {
-      const note = document.createElement("div");
-      note.className = "tree-note";
-      note.textContent = "(empty)";
-      node.kidsEl.replaceChildren(note);
-    }
-    node.loaded = true;
-    markActiveTreeNode();
+    renderEntries(path, sortEntries(await apiList(path)));
   } catch (e) {
     const note = document.createElement("div");
     note.className = "tree-note";
@@ -441,22 +455,49 @@ async function revealInTree(path: string): Promise<void> {
   fileRows.get(path)?.scrollIntoView({ block: "nearest" });
 }
 
-// Full refresh that keeps the tree's shape: remember expanded dirs, rebuild the root,
-// re-expand what survives. Ops and window focus both funnel here.
+// Diff-based refresh: re-list every expanded directory IN PARALLEL, then touch the DOM
+// only where a listing actually changed — an unchanged tree refreshes invisibly (no
+// collapse/re-expand flicker). A changed directory re-renders and its previously
+// expanded descendants that survive are re-expanded. Ops and window focus funnel here.
 let reloading = false;
+let rerunWanted = false;
 async function reloadTree(): Promise<void> {
-  if (reloading) return;
+  // A refresh requested while one is in flight runs AFTER it, not never — dropping it
+  // made a post-op refresh silently miss changes when it raced the focus refresh.
+  if (reloading) {
+    rerunWanted = true;
+    return;
+  }
   reloading = true;
   try {
-    const expanded = [...dirNodes.entries()].filter(([p, n]) => p && n.expanded).map(([p]) => p).sort();
-    const scroll = treeEl.scrollTop;
-    await listInto("");
-    for (const p of expanded) {
-      if (dirNodes.has(p)) await toggleDir(p, true);
+    const targets = [...dirNodes.entries()].filter(([, n]) => n.expanded && n.loaded).map(([p]) => p).sort();
+    const fetched = await Promise.all(
+      targets.map(async (p) => {
+        try {
+          return { p, entries: sortEntries(await apiList(p)) };
+        } catch {
+          return { p, entries: undefined }; // vanished or unreadable — a parent's re-render handles it
+        }
+      }),
+    );
+    for (const { p, entries } of fetched) {
+      const node = dirNodes.get(p); // a parent's re-render may have replaced or dropped this dir
+      if (!node || !entries || (node.loaded && node.sig === sigOf(entries))) continue;
+      const expandedDesc = [...dirNodes.entries()]
+        .filter(([q, n]) => q !== p && n.expanded && (p === "" || q.startsWith(`${p}/`)))
+        .map(([q]) => q)
+        .sort();
+      renderEntries(p, entries);
+      for (const q of expandedDesc) {
+        if (dirNodes.has(q)) await toggleDir(q, true);
+      }
     }
-    treeEl.scrollTop = scroll;
   } finally {
     reloading = false;
+    if (rerunWanted) {
+      rerunWanted = false;
+      void reloadTree();
+    }
   }
 }
 
@@ -559,7 +600,6 @@ function fileMenu(path: string): (MenuItem | "sep")[] {
     { label: "Cut", onAct: () => { clipboard = { path, cut: true }; flash(`cut ${basename(path)}`); } },
     "sep",
     { label: "Download", onAct: () => void download(path) },
-    { label: "Copy path", onAct: () => void navigator.clipboard.writeText(path).then(() => flash("path copied")) },
     "sep",
     { label: "Delete…", danger: true, onAct: () => void remove(path) },
   ];
@@ -576,7 +616,6 @@ function dirMenu(path: string): (MenuItem | "sep")[] {
     { label: "Duplicate", onAct: () => void duplicate(path) },
     { label: "Copy", onAct: () => { clipboard = { path, cut: false }; flash(`copied ${basename(path)}`); } },
     { label: "Cut", onAct: () => { clipboard = { path, cut: true }; flash(`cut ${basename(path)}`); } },
-    { label: "Copy path", onAct: () => void navigator.clipboard.writeText(path).then(() => flash("path copied")) },
     "sep",
     { label: "Delete…", danger: true, onAct: () => void remove(path) },
   ];
@@ -740,15 +779,40 @@ async function download(path: string): Promise<void> {
 
 // --- upload (picker + OS-file drop) ----------------------------------------------
 
+// XHR, not fetch: upload progress events. Percent shows live in the status bar.
+function apiUpload(path: string, file: File, onProgress: (frac: number) => void): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", `api/file?path=${encodeURIComponent(path)}`);
+    xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded / e.total);
+    xhr.onload = () => {
+      if (xhr.status < 300) return resolve();
+      let msg = `HTTP ${xhr.status}`;
+      try {
+        msg = (JSON.parse(xhr.responseText) as { error?: string }).error ?? msg;
+      } catch { /* non-JSON error body */ }
+      reject(new Error(msg));
+    };
+    xhr.onerror = () => reject(new Error("network error"));
+    xhr.send(file);
+  });
+}
+
 async function uploadFiles(dirPath: string, files: FileList | File[]): Promise<void> {
+  const list = [...files];
   let ok = 0;
-  for (const f of files) {
+  for (let i = 0; i < list.length; i++) {
+    const f = list[i];
     if (f.size > MAX_UPLOAD) {
       flash(`${f.name} exceeds 10MB — skipped`, true);
       continue;
     }
+    const tag = list.length > 1 ? ` (${i + 1}/${list.length})` : "";
     try {
-      await apiSave(dirPath ? `${dirPath}/${f.name}` : f.name, f);
+      await apiUpload(dirPath ? `${dirPath}/${f.name}` : f.name, f, (frac) => {
+        statusMsg.classList.remove("error");
+        statusMsg.textContent = `uploading ${f.name}${tag}… ${Math.round(frac * 100)}%`;
+      });
       ok++;
     } catch (e) {
       flash(`upload of ${f.name} failed: ${(e as Error).message}`, true);
