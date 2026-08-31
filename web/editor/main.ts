@@ -484,6 +484,60 @@ async function listInto(path: string): Promise<void> {
   }
 }
 
+// Per-entry reconciliation for an already-rendered directory: rows for vanished
+// entries are removed (with their registry subtrees), rows for new entries are
+// inserted at their sorted position, and KEPT rows are left untouched — an expanded
+// subtree survives a sibling appearing or vanishing with zero refetch and zero
+// flicker. Element moves via .after() relocate the whole wrap, state included.
+function reconcileEntries(path: string, entries: Entry[]): void {
+  const node = dirNodes.get(path);
+  if (!node) return;
+  if (!node.loaded) return renderEntries(path, entries);
+  const keyOf = (name: string, dir: boolean) => `${name}${dir ? "/" : ""}`;
+  const existing = new Map<string, HTMLElement>();
+  for (const wrap of [...node.kidsEl.children] as HTMLElement[]) {
+    const row = wrap.firstElementChild as HTMLElement | null;
+    if (!row?.dataset?.path) {
+      wrap.remove(); // "(empty)" / error notes — recomputed below
+      continue;
+    }
+    existing.set(keyOf(basename(row.dataset.path), row.dataset.dir === "true"), wrap);
+  }
+  const desiredKeys = new Set(entries.map((e) => keyOf(e.name, e.dir)));
+  for (const [key, wrap] of existing) {
+    if (desiredKeys.has(key)) continue;
+    const p = (wrap.firstElementChild as HTMLElement).dataset.path!;
+    wrap.remove();
+    dirNodes.delete(p);
+    fileRows.delete(p);
+    for (const q of [...dirNodes.keys()]) if (q.startsWith(`${p}/`)) dirNodes.delete(q);
+    for (const q of [...fileRows.keys()]) if (q.startsWith(`${p}/`)) fileRows.delete(q);
+  }
+  let cursor: HTMLElement | undefined;
+  for (const e of entries) {
+    const key = keyOf(e.name, e.dir);
+    let wrap = existing.get(key);
+    if (!wrap || !wrap.isConnected) {
+      wrap = makeRow(path ? `${path}/${e.name}` : e.name, e.name, e.dir, node.depth + (path === "" ? 0 : 1));
+    }
+    // Only move DOM when the order is actually wrong — .after() on an already-placed
+    // node is what would flicker.
+    if (cursor ? wrap.previousElementSibling !== cursor : node.kidsEl.firstElementChild !== wrap) {
+      if (cursor) cursor.after(wrap);
+      else node.kidsEl.prepend(wrap);
+    }
+    cursor = wrap;
+  }
+  if (!entries.length) {
+    const note = document.createElement("div");
+    note.className = "tree-note";
+    note.textContent = "(empty)";
+    node.kidsEl.replaceChildren(note);
+  }
+  node.sig = sigOf(entries);
+  markActiveTreeNode();
+}
+
 async function toggleDir(path: string, force?: boolean): Promise<void> {
   const node = dirNodes.get(path);
   if (!node) return;
@@ -532,16 +586,9 @@ async function reloadTree(): Promise<void> {
       }),
     );
     for (const { p, entries } of fetched) {
-      const node = dirNodes.get(p); // a parent's re-render may have replaced or dropped this dir
+      const node = dirNodes.get(p); // reconciliation may have dropped a vanished dir
       if (!node || !entries || (node.loaded && node.sig === sigOf(entries))) continue;
-      const expandedDesc = [...dirNodes.entries()]
-        .filter(([q, n]) => q !== p && n.expanded && (p === "" || q.startsWith(`${p}/`)))
-        .map(([q]) => q)
-        .sort();
-      renderEntries(p, entries);
-      for (const q of expandedDesc) {
-        if (dirNodes.has(q)) await toggleDir(q, true);
-      }
+      reconcileEntries(p, entries);
     }
   } finally {
     reloading = false;
@@ -729,7 +776,7 @@ function startInlineCreate(dirPath: string, isDir: boolean): void {
       const path = dirPath ? `${dirPath}/${name}` : name;
       void apiOp(isDir ? "mkdir" : "create", path)
         .then(async () => {
-          await listInto(dirPath);
+          await reloadTree();
           await toggleDir(dirPath || "", true);
           if (!isDir) await openFile(path);
         })
