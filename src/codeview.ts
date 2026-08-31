@@ -57,7 +57,40 @@ async function listDir(sandboxId: string, rel: string, res: ServerResponse): Pro
   json(res, 200, { entries });
 }
 
+// The file's mtime (unix seconds) inside the sandbox, or undefined. `stat -c %Y` is
+// GNU + busybox common ground. Powers the editor's stale-save detection.
+async function mtimeOf(sandboxId: string, rel: string): Promise<number | undefined> {
+  const r = await run(sandboxId, `stat -c %Y "$ISO_P" 2>/dev/null`, { envs: { ISO_P: `${WORKSPACE}/${rel}` }, timeoutMs: 10_000 });
+  const n = Number(r.stdout.trim());
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+// Tree file operations, one endpoint: create/mkdir/rename/copy/delete. Both paths ride
+// env vars (the listDir lesson — safeRelPath blocks traversal, not shell metacharacters)
+// and destination-taking ops refuse to clobber an existing target.
+async function fileOp(sandboxId: string, body: Record<string, unknown>, res: ServerResponse): Promise<void> {
+  const op = String(body.op ?? "");
+  const rel = safeRelPath(typeof body.path === "string" ? body.path : null);
+  const to = safeRelPath(typeof body.to === "string" ? body.to : null);
+  if (!rel) return json(res, 400, { error: "bad path" });
+  const envs = { ISO_A: `${WORKSPACE}/${rel}`, ...(to ? { ISO_B: `${WORKSPACE}/${to}` } : {}) };
+  const CMDS: Record<string, { cmd: string; needsTo?: boolean }> = {
+    create: { cmd: `[ -e "$ISO_A" ] && { echo exists >&2; exit 1; }; : > "$ISO_A"` },
+    mkdir: { cmd: `[ -e "$ISO_A" ] && { echo exists >&2; exit 1; }; mkdir -p "$ISO_A"` },
+    rename: { cmd: `[ -e "$ISO_B" ] && { echo "target exists" >&2; exit 1; }; mv "$ISO_A" "$ISO_B"`, needsTo: true },
+    copy: { cmd: `[ -e "$ISO_B" ] && { echo "target exists" >&2; exit 1; }; cp -a "$ISO_A" "$ISO_B"`, needsTo: true },
+    delete: { cmd: `rm -rf "$ISO_A"` },
+  };
+  const spec = CMDS[op];
+  if (!spec) return json(res, 400, { error: "unknown op" });
+  if (spec.needsTo && !to) return json(res, 400, { error: "bad target path" });
+  const r = await run(sandboxId, spec.cmd, { envs, timeoutMs: 30_000 });
+  if (!r.ok) return json(res, 409, { error: r.stderr.trim().slice(0, 200) || `${op} failed` });
+  json(res, 200, { ok: true });
+}
+
 async function readFile(sandboxId: string, rel: string, res: ServerResponse): Promise<void> {
+  const mtime = await mtimeOf(sandboxId, rel);
   const r = await downloadFile(sandboxId, `${WORKSPACE}/${rel}`);
   if (!r.ok || !r.body) {
     return json(res, r.status === 404 ? 404 : 502, { error: `read failed (HTTP ${r.status})` });
@@ -76,12 +109,25 @@ async function readFile(sandboxId: string, rel: string, res: ServerResponse): Pr
     }
     chunks.push(value);
   }
-  res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": total, "Cache-Control": "no-store" });
+  res.writeHead(200, {
+    "Content-Type": "application/octet-stream",
+    "Content-Length": total,
+    "Cache-Control": "no-store",
+    ...(mtime ? { "X-Iso-Mtime": String(mtime) } : {}),
+  });
   for (const c of chunks) res.write(c);
   res.end();
 }
 
 async function saveFile(sandboxId: string, rel: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  // Stale-save gate: when the editor sends the mtime it read, refuse the write if the
+  // file moved on underneath it (an agent, a terminal) — the client offers overwrite
+  // (retry without the header) or reload. Best-effort: no stat, no gate.
+  const expect = Number(req.headers["x-iso-expect-mtime"]);
+  if (Number.isFinite(expect) && expect > 0) {
+    const cur = await mtimeOf(sandboxId, rel);
+    if (cur && cur !== expect) return json(res, 409, { error: "file changed in the sandbox since it was opened", stale: true, mtime: cur });
+  }
   const parts: Buffer[] = [];
   let total = 0;
   for await (const c of req) {
@@ -91,7 +137,7 @@ async function saveFile(sandboxId: string, rel: string, req: IncomingMessage, re
   }
   // 0644, not the secrets' 0600 — these are ordinary workspace files.
   await writeFile(sandboxId, `${WORKSPACE}/${rel}`, Buffer.concat(parts), 0o644);
-  json(res, 200, { ok: true });
+  json(res, 200, { ok: true, mtime: await mtimeOf(sandboxId, rel) });
 }
 
 // Handle a code view's request. `rest` is the path AFTER /v/<id> (always /-prefixed).
@@ -112,6 +158,20 @@ export async function handleCodeView(req: IncomingMessage, res: ServerResponse, 
       if (rest === "/api/file" && (method === "GET" || method === "PUT")) {
         if (!rel) return json(res, 400, { error: "bad path" });
         return method === "GET" ? await readFile(view.sandboxId, rel, res) : await saveFile(view.sandboxId, rel, req, res);
+      }
+      if (rest === "/api/op" && method === "POST") {
+        const chunks: Buffer[] = [];
+        for await (const c of req) {
+          chunks.push(c as Buffer);
+          if (chunks.reduce((n, b) => n + b.length, 0) > 64 * 1024) return json(res, 413, { error: "body too large" });
+        }
+        let body: Record<string, unknown>;
+        try {
+          body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+        } catch {
+          return json(res, 400, { error: "bad json" });
+        }
+        return await fileOp(view.sandboxId, body, res);
       }
       return json(res, 404, { error: "unknown api route" });
     } catch (e) {
