@@ -41,9 +41,8 @@ function parseWorkspaceSink(body: LaunchRequest): WorkspaceSink | undefined {
 
 const log = (...a: unknown[]) => console.log("[launch]", ...a);
 
-export const TOOLING_IMAGE = "isolation-server/tooling:0.4";
+export const TOOLING_IMAGE = "isolation-server/tooling:0.5";
 const TERMINAL_PORT = 7681;
-const CODE_PORT = 13337;
 const DIRECTORY_PORT = 8055;
 const WEB_SHADOW_BASE = 42000;
 
@@ -226,9 +225,11 @@ export async function scaffoldView(sandboxId: string, w: ViewSpec): Promise<View
     // A per-view forwarder on an all-interfaces shadow port tries both loopbacks.
     appPort = port;
     port = nextFree(WEB_SHADOW_BASE);
+  } else if (w.type === "code") {
+    // First-party Monaco view (PLAN V1): the doorman serves it — no sandbox port.
+    port = 0;
   } else if (!port) {
-    const base = w.type === "terminal" ? TERMINAL_PORT : w.type === "code" ? CODE_PORT : DIRECTORY_PORT;
-    port = nextFree(base);
+    port = nextFree(w.type === "terminal" ? TERMINAL_PORT : DIRECTORY_PORT);
   }
   const v = addView(sandboxId, w.type, port, { label: w.label, specKey: w.specKey, appPath, appPort, ...(w.type === "web" ? { slug: newWebSlug() } : {}) });
   await startViewProcess(sandboxId, v);
@@ -238,20 +239,13 @@ export async function scaffoldView(sandboxId: string, w: ViewSpec): Promise<View
 // Start the in-sandbox process a view type needs and return its inside port.
 // terminal: ttyd fronting a per-view tmux session — every browser tab attaches the
 // same tmux (shared state + live mirror), and a ttyd restart reattaches. web: the
-// app's own port, nothing to start. code/directory: land with the tooling image
-// growing code-server/a file server (later phase).
+// app's own port, nothing to start. code: nothing at all — the doorman serves the
+// Monaco editor itself over execd's file APIs (PLAN V1).
 async function startViewProcess(sandboxId: string, view: View): Promise<void> {
   // execd's background mode owns each process's lifetime — no nohup/& wrappers (a
   // shell that exits immediately takes its children with it).
   if (view.type === "terminal") {
     await run(sandboxId, `ttyd --writable -p ${view.port} tmux new -A -s iso-view-${view.id}`, {
-      cwd: "/workspace",
-      background: true,
-    });
-  } else if (view.type === "code") {
-    // Auth is the doorman's job (view tokens); code-server itself runs open on a
-    // loopback-only published port. Multi-client natively.
-    await run(sandboxId, `code-server --auth none --disable-telemetry --bind-addr 0.0.0.0:${view.port} /workspace`, {
       cwd: "/workspace",
       background: true,
     });

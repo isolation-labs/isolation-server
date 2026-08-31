@@ -70,6 +70,13 @@ export async function run(sandboxId: string, command: string, opts: RunOpts = {}
   return { ok: !sawError, stdout, stderr };
 }
 
+// Fetch a file's bytes out of the sandbox as a streaming Response — the caller owns
+// the body (and any size cap; execd sends the whole file otherwise).
+export async function downloadFile(sandboxId: string, path: string): Promise<Response> {
+  const host = await execdHost(sandboxId);
+  return fetch(`http://${host}/files/download?path=${encodeURIComponent(path)}`);
+}
+
 // Write a file inside the sandbox (multipart upload; parent dirs created by execd).
 export async function writeFile(sandboxId: string, path: string, content: string | Buffer, mode = 0o600): Promise<void> {
   const host = await execdHost(sandboxId);

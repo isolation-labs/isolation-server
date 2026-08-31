@@ -1,7 +1,7 @@
 {
   "name": "isolation-server",
   "version": "0.0.1",
-  "description": "The Isolation server: the light layer between Isolation Cloud and an OpenSandbox runtime \u2014 pairing, tunnel, view-auth doorman, secrets, workspace persistence.",
+  "description": "The Isolation server: the light layer between Isolation Cloud and an OpenSandbox runtime — pairing, tunnel, view-auth doorman, secrets, workspace persistence.",
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
@@ -13,7 +13,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/build-editor.mjs",
     "dev": "npm run build && node dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "prepublishOnly": "npm run build",
@@ -24,6 +24,8 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "esbuild": "^0.28.2",
+    "monaco-editor": "^0.56.0",
     "typescript": "^5.6.0"
   },
   "files": [

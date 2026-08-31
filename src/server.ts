@@ -312,17 +312,18 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         const v = dropView(vid);
         // Best-effort: stop the view's in-sandbox server so the port frees up.
         if (v) {
-          // Every view type owns a process — including a web view's forwarder. Leaving
-          // one behind pins its shadow port, and the next view allocated there fails
-          // to bind while the stale one keeps pointing at the old app port.
+          // Every ported view type owns a process — including a web view's forwarder.
+          // Leaving one behind pins its port, and the next view allocated there fails
+          // to bind while the stale one keeps pointing at the old app port. Code views
+          // are doorman-served (no in-sandbox process) — nothing to kill.
           const pat =
             v.type === "terminal" ? `ttyd .*-p ${v.port}`
-            : v.type === "code" ? `code-server .*:${v.port}`
             : v.type === "directory" ? `filebrowser .*-p ${v.port}`
-            : `portfwd.mjs .* ${v.id}`;
+            : v.type === "web" ? `portfwd.mjs .* ${v.id}`
+            : undefined;
           // AWAITED: the SPA deletes then immediately recreates on a spec change; an
           // un-awaited kill raced the new view's process on the same port.
-          await run(v.sandboxId, `pkill -f ${JSON.stringify(pat)} || true`).catch(() => undefined);
+          if (pat) await run(v.sandboxId, `pkill -f ${JSON.stringify(pat)} || true`).catch(() => undefined);
         }
         return json(res, 200, { ok: true });
       }

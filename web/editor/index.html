@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>Code — Isolation</title>
+  <link rel="icon" href="data:," /><!-- the server root would 401 the browser's probe -->
+
+  <link rel="stylesheet" href="./main.css" />
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div id="sidebar-head">
+        <span class="brand-dot"></span><span id="sidebar-title">workspace</span>
+        <button id="refresh" title="Refresh file tree" aria-label="Refresh file tree">&#8635;</button>
+      </div>
+      <div id="tree" role="tree"></div>
+    </aside>
+    <main id="main">
+      <div id="tabs" role="tablist"></div>
+      <div id="editor-host">
+        <div id="editor"></div>
+        <div id="empty-state">
+          <div class="empty-inner">
+            <div class="empty-mark">{ }</div>
+            <div>Select a file to start editing</div>
+            <div class="empty-hint">&#8984;S / Ctrl+S saves back to the sandbox</div>
+          </div>
+        </div>
+      </div>
+      <div id="statusbar">
+        <span id="status-path"></span>
+        <span id="status-msg"></span>
+        <span id="status-lang"></span>
+      </div>
+    </main>
+  </div>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
