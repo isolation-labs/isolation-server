@@ -5,7 +5,8 @@
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
-    "isolation-server": "dist/cli.js"
+    "isolation-server": "dist/cli.js",
+    "isolation": "dist/cli.js"
   },
   "main": "dist/index.js",
   "engines": {
