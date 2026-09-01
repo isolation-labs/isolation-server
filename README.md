@@ -32,8 +32,12 @@ reimplements the runtime.
 ```
 npm install -g isolation-server
 isolation up                                # install + start the server
-isolation connect <token-from-the-web-app>  # pair it to your account
+isolation connect <code-from-the-web-app>   # pair it to your account
 ```
+
+The code is the short one the web app shows (`isolation connect UDWYUV`). It pairs
+against Isolation Cloud; point it somewhere else — staging, a self-hosted backend —
+with `--backend <url>`, which the web app puts in the command for you.
 
 `up` is the whole server in one command: it installs the pinned OpenSandbox
 runtime (via uv), mints its API key, and registers both as login services.
