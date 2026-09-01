@@ -1,6 +1,6 @@
 {
   "name": "isolation-server",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "The Isolation server: the light layer between Isolation Cloud and an OpenSandbox runtime — pairing, tunnel, view-auth doorman, secrets, workspace persistence.",
   "license": "Apache-2.0",
   "type": "module",
