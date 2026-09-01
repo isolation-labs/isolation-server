@@ -80,3 +80,13 @@ test("local sink: ETag CAS contract (create, stale, advance, id safety)", () => 
   assert.equal(localsink.readLocalBlob("wl-t").bytes.toString(), "v2");
   assert.equal(localsink.writeLocalBlob("../escape", Buffer.from("x")), undefined); // unsafe id
 });
+
+test("code view path gate: workspace-relative only, no traversal or control bytes", async () => {
+  const { safeRelPath } = await import("../dist/codeview.js");
+  assert.equal(safeRelPath("repo/src/index.ts"), "repo/src/index.ts");
+  assert.equal(safeRelPath("repo/dir/"), "repo/dir"); // trailing slash normalized
+  assert.equal(safeRelPath("a b/wéird name.txt"), "a b/wéird name.txt"); // spaces + unicode fine
+  for (const bad of ["", "/etc/passwd", "../secrets", "a/../../b", "a/./b", "a//b", "a\\b", "a\tb", "a\u0000b", null]) {
+    assert.equal(safeRelPath(bad), undefined, JSON.stringify(bad));
+  }
+});

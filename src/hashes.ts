@@ -17,7 +17,8 @@ export const DETECTION_GLOBS = [".devcontainer", ".devcontainer.json", ...WS_HAS
 // forwarder). Folded into the workspace hash so a tooling change rebuilds spec images
 // instead of silently reusing stale ones. BUMP on any change to the template.
 //   1 — first isolation-server tooling layer: git/tmux/ttyd/code-server/filebrowser + iso-node.
-export const TOOLING_VERSION = "1";
+//   2 — code-server removed (the code view is doorman-served Monaco — PLAN V1).
+export const TOOLING_VERSION = "2";
 
 const SKIP_DIRS = new Set(["node_modules", ".git"]);
 

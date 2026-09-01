@@ -312,17 +312,18 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         const v = dropView(vid);
         // Best-effort: stop the view's in-sandbox server so the port frees up.
         if (v) {
-          // Every view type owns a process — including a web view's forwarder. Leaving
-          // one behind pins its shadow port, and the next view allocated there fails
-          // to bind while the stale one keeps pointing at the old app port.
+          // Every ported view type owns a process — including a web view's forwarder.
+          // Leaving one behind pins its port, and the next view allocated there fails
+          // to bind while the stale one keeps pointing at the old app port. Code views
+          // are doorman-served (no in-sandbox process) — nothing to kill.
           const pat =
             v.type === "terminal" ? `ttyd .*-p ${v.port}`
-            : v.type === "code" ? `code-server .*:${v.port}`
             : v.type === "directory" ? `filebrowser .*-p ${v.port}`
-            : `portfwd.mjs .* ${v.id}`;
+            : v.type === "web" ? `portfwd.mjs .* ${v.id}`
+            : undefined;
           // AWAITED: the SPA deletes then immediately recreates on a spec change; an
           // un-awaited kill raced the new view's process on the same port.
-          await run(v.sandboxId, `pkill -f ${JSON.stringify(pat)} || true`).catch(() => undefined);
+          if (pat) await run(v.sandboxId, `pkill -f ${JSON.stringify(pat)} || true`).catch(() => undefined);
         }
         return json(res, 200, { ok: true });
       }
@@ -345,14 +346,33 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       }
       if (method === "POST" && action === "views") {
         const b = await readBody(req);
-        // The agent chat embed is a daemon-side view type isolation-server doesn't host (the
-        // agent layer lands in O5); refuse explicitly rather than minting a dead view.
-        if (b.type === "agent") return json(res, 501, { error: "agent views are not supported by this server runtime yet" });
+        // Agent views (PLAN V2): a doorman-served chat window onto ONE agent. The body
+        // either names a roster agent (`agentId` — def or runtime id) or defines a NEW
+        // agent inline (`agent: {name, harness?, model?, systemPrompt?}`) which is
+        // spawned into the SESSION (not the workspace roster).
+        let agentId: string | undefined;
+        if (b.type === "agent") {
+          const wanted = typeof b.agentId === "string" ? b.agentId.trim() : "";
+          if (wanted) {
+            const rec = listAgents(id).find((a) => a.def.id === wanted || a.runtimeId === wanted);
+            if (!rec) return json(res, 404, { error: "no such agent in this session" });
+            agentId = rec.def.id;
+            if (!b.label) b.label = rec.def.name;
+          } else {
+            const inline = parseRoster([{ id: `ag-${Date.now().toString(36)}`, ...(typeof b.agent === "object" && b.agent ? b.agent : {}) }])[0];
+            if (!inline) return json(res, 400, { error: "agent view needs agentId or an inline agent {name, …}" });
+            const rec = spawnAgent(id, s.workspaceId ?? id, s.sandboxId, inline);
+            agentId = rec.def.id;
+            if (!b.label) b.label = rec.def.name;
+          }
+        }
         const v = await createSessionView(s, {
           type: (typeof b.type === "string" ? b.type : "terminal") as never,
           url: typeof b.url === "string" ? b.url : undefined,
           label: typeof b.label === "string" ? b.label : undefined,
           specKey: typeof b.specKey === "string" ? b.specKey : undefined,
+          dir: typeof b.dir === "string" && b.dir.trim() ? b.dir.trim().replace(/^\/+|\/+$/g, "") : undefined,
+          agentId,
         });
         if (!v) return json(res, 400, { error: "view spec not satisfiable" });
         return json(res, 200, viewJson(v, id));

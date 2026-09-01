@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>Git — Isolation</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="./main.css" />
+</head>
+<body>
+  <div id="app">
+    <aside id="panel">
+      <header id="head">
+        <span class="brand-dot"></span>
+        <select id="repo-pick" hidden></select>
+        <span id="branch"></span>
+        <span class="spacer"></span>
+        <span id="aheadbehind"></span>
+        <button id="refresh" title="Refresh" aria-label="Refresh">&#8635;</button>
+      </header>
+      <div id="commit-box">
+        <textarea id="commit-msg" rows="2" placeholder="Commit message"></textarea>
+        <button id="commit-btn" disabled>Commit</button>
+      </div>
+      <div id="lists">
+        <div class="group">
+          <div class="group-head">Staged<span id="staged-count"></span></div>
+          <div id="staged-list"></div>
+        </div>
+        <div class="group">
+          <div class="group-head">Changes<span id="changes-count"></span></div>
+          <div id="changes-list"></div>
+        </div>
+        <div id="clean-note" hidden>Working tree clean</div>
+      </div>
+    </aside>
+    <main id="diff-pane">
+      <div id="diff-head" hidden>
+        <span id="diff-file"></span>
+        <button id="open-in-editor" title="Open in the code editor">open in editor</button>
+      </div>
+      <pre id="diff"></pre>
+      <div id="diff-empty">
+        <div class="empty-inner">
+          <div class="empty-mark">±</div>
+          <div>Select a file to see its diff</div>
+        </div>
+      </div>
+    </main>
+  </div>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

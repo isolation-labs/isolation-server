@@ -99,9 +99,10 @@ export function imageExists(tag: string): boolean {
 
 // The tooling layer every session gets, whatever its base: git/tmux (clones, terminal
 // mirror), a static Node bundled as `iso-node` (the web-view forwarder — exposed as
-// node/npm only when the base has none), ttyd, code-server, filebrowser. Every fetch is
+// node/npm only when the base has none), ttyd, filebrowser. Every fetch is
 // arch-matched and the optional ones are guarded so an exotic base degrades a view
-// instead of failing the build.
+// instead of failing the build. (The code view is doorman-served Monaco — nothing to
+// install in the image; PLAN V1 dropped code-server.)
 export function specDockerfile(base: string): string {
   return `FROM ${base}
 USER root
@@ -113,8 +114,6 @@ RUN set -eux; ARCH="$(uname -m)"; case "$ARCH" in x86_64) N=x64;; aarch64|arm64)
     if ! command -v node >/dev/null 2>&1; then for b in node npm npx corepack; do ln -sf /opt/iso/bin/$b /usr/local/bin/$b; done; fi
 RUN set -eux; ARCH="$(uname -m)"; case "$ARCH" in x86_64) T=x86_64;; aarch64|arm64) T=aarch64;; *) T="$ARCH";; esac; \\
     curl -fsSL -o /usr/local/bin/ttyd "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.$T" && chmod +x /usr/local/bin/ttyd
-RUN (curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone --prefix=/opt/iso-code \\
-      && ln -sf /opt/iso-code/bin/code-server /usr/local/bin/code-server) || true
 RUN (set -eux; ARCH="$(uname -m)"; case "$ARCH" in x86_64) F=amd64;; aarch64|arm64) F=arm64;; *) F="$ARCH";; esac; \\
     curl -fsSL "https://github.com/filebrowser/filebrowser/releases/download/v${FILEBROWSER_VERSION}/linux-$F-filebrowser.tar.gz" | tar -xz -C /usr/local/bin filebrowser \\
     && chmod +x /usr/local/bin/filebrowser) || true

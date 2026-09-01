@@ -14,6 +14,9 @@ import { getSandbox, tokenMatches } from "./config.js";
 import { endpointFor } from "./opensandbox.js";
 import { getView, verifyViewToken, viewBySlug, type View } from "./views.js";
 import { startWebForwarder, webForwarderAlive } from "./launch.js";
+import { handleCodeView } from "./codeview.js";
+import { handleAgentView } from "./agentview.js";
+import { handleGitView } from "./gitview.js";
 
 const proxy = httpProxy.createProxyServer({ ws: true, xfwd: true });
 proxy.on("error", (err, _req, res) => {
@@ -109,6 +112,20 @@ export async function handleViewRequest(req: IncomingMessage, res: ServerRespons
   if (queryToken) {
     res.setHeader("Set-Cookie", `isolation-server_token=${encodeURIComponent(queryToken)}; Path=/v/${viewId}; HttpOnly; SameSite=None; Secure`);
   }
+  // Code and agent views are first-party (PLAN V1/V2): the doorman serves the app and
+  // its API itself — there is no sandbox port to proxy to.
+  if (view.type === "code") {
+    await handleCodeView(req, res, view, m[2] || "/");
+    return true;
+  }
+  if (view.type === "agent") {
+    await handleAgentView(req, res, view, m[2] || "/");
+    return true;
+  }
+  if (view.type === "git") {
+    await handleGitView(req, res, view, m[2] || "/");
+    return true;
+  }
   try {
     const t = await resolveTarget(view.sandboxId, view.port);
     req.url = `${t.basePath}${viewPath(view, req.url, viewId)}`;
@@ -132,7 +149,8 @@ function viewPath(view: { type: string }, url: string | undefined, viewId: strin
 export async function handleViewUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
   const viewId = viewIdFromUrl(req.url);
   const view = viewId ? getView(viewId) : undefined;
-  if (!viewId || !view || !authorized(req, viewId).ok) {
+  if (!viewId || !view || view.type === "code" || view.type === "agent" || view.type === "git" || !authorized(req, viewId).ok) {
+    // Code/agent views are doorman-served static pages + REST — no WebSocket to upgrade to.
     socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
     socket.destroy();
     return;
