@@ -85,6 +85,34 @@ export function parseEnvConfig(body: unknown): EnvConfig {
   return { files, vars };
 }
 
+// The session-wide AI credential (the cloud's "launch credential" — claude.ts CredPair). Two
+// shapes: an API key (usually a scoped isogw_… gateway token + the metering gateway's base URL;
+// a real key + endpoint for providers the gateway can't front) and a subscription OAuth token
+// (injected raw — Anthropic blocks proxied OAuth). Arrives sealed to this server's pairing
+// secret (`claudeBlob`) or inline for a plain gateway pair (`claude`).
+export interface AiCred {
+  auth: "apiKey" | "subscription";
+  apiKey?: string;
+  oauthToken?: string;
+  baseUrl?: string;
+}
+
+export function parseAiCred(body: unknown): AiCred | undefined {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v.trim() : undefined);
+  if (b.auth === "apiKey" && str(b.apiKey)) return { auth: "apiKey", apiKey: str(b.apiKey), baseUrl: str(b.baseUrl) };
+  if (b.auth === "subscription" && str(b.oauthToken)) return { auth: "subscription", oauthToken: str(b.oauthToken) };
+  return undefined;
+}
+
+// The env the harnesses and the user's own terminal read. Claude Code takes either shape
+// natively; goose and other OpenAI-compatible tooling read the same pair under their own
+// names, exported at the adapter layer from these.
+export function aiCredEnv(cred: AiCred): Record<string, string> {
+  if (cred.auth === "subscription") return { CLAUDE_CODE_OAUTH_TOKEN: cred.oauthToken! };
+  return { ANTHROPIC_API_KEY: cred.apiKey!, ...(cred.baseUrl ? { ANTHROPIC_BASE_URL: cred.baseUrl } : {}) };
+}
+
 interface GitCreds {
   githubOauth?: string;
   repoTokens: { url: string; token: string }[];
@@ -293,6 +321,7 @@ export interface LaunchRequest {
   views?: ViewSpec[];
   envConfig?: unknown; // sealed string or inline {files, vars}
   repoTokens?: unknown; // sealed string or inline GitCreds
+  claude?: unknown; // sealed string or inline AiCred — the session-wide AI credential
   git?: { name?: string; email?: string };
   env?: Record<string, string>;
   metadata?: Record<string, string>;
@@ -315,6 +344,12 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
   // reserved for trusted internals, so launch-body vars are validated above.
   const env: Record<string, string> = { ...(body.env ?? {}) };
   for (const v of envConfig.vars) env[v.name] = v.value;
+  // The AI credential last, so the deliberately-chosen provider beats a plain env var of the
+  // same name (the cloud already applied its own precedence — environment override → agent/
+  // account choice — before sealing). Nothing is written to disk; the value lives only in the
+  // sandbox's env for the sandbox's lifetime.
+  const aiCred = parseAiCred(sealedOrInline(body.claude));
+  if (aiCred) Object.assign(env, aiCredEnv(aiCred));
 
   // The image (PLAN O4): analyze the repos' detection files host-side, hash them, and
   // build/reuse `isolation-server-spec:<wsHash>` — a repo's own .devcontainer (image / Dockerfile /

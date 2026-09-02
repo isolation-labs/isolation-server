@@ -71,7 +71,8 @@ function update(id: string, patch: Partial<SessionRecord>): void {
 // --- the daemon launch body → isolation-server launch ----------------------------------
 
 // What the web actually sends POST /sessions (the subset isolation-server honors; unknown
-// fields — agent, harnesses, claude — are accepted and ignored for now).
+// fields — agent, agentSecrets, harnesses — are accepted and ignored until the harness
+// adapters land (PLAN §5 P1); the session-wide AI credential IS honored now).
 export interface DaemonLaunchBody {
   workspace?: {
     name?: string;
@@ -85,6 +86,8 @@ export interface DaemonLaunchBody {
   persistence?: unknown;
   envConfig?: unknown;
   repoTokens?: unknown;
+  claudeBlob?: unknown; // the session-wide AI credential, sealed to this server (the usual path)
+  claude?: unknown; // inline pair — only ever a scoped gateway token (a raw key is never sent plain)
   git?: { name?: string; email?: string };
   name?: string;
   origin?: string;
@@ -137,6 +140,7 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
     views: viewSpecsFrom(body),
     envConfig: body.envConfig,
     repoTokens: body.repoTokens,
+    claude: body.claudeBlob ?? body.claude,
     git: body.git ?? (body.workspace?.gitIdentity?.name && body.workspace?.gitIdentity?.email ? { name: body.workspace.gitIdentity.name, email: body.workspace.gitIdentity.email } : undefined),
     metadata: { sessionId: id },
     // Build logs ride the phase string — strip control chars and cap it so the record

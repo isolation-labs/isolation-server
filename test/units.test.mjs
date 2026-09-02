@@ -14,6 +14,7 @@ const views = await import("../dist/views.js");
 const agents = await import("../dist/agents.js");
 const harness = await import("../dist/harness.js");
 const localsink = await import("../dist/localsink.js");
+const launch = await import("../dist/launch.js");
 
 test("view tokens: mint → verify roundtrip; tampering and expiry fail", () => {
   const v = views.addView("sb-1", "terminal", 7000, {});
@@ -23,6 +24,21 @@ test("view tokens: mint → verify roundtrip; tampering and expiry fail", () => 
   const [body] = token.split(".");
   assert.equal(views.verifyViewToken(`${body}.deadbeef`, v.id), false);
   assert.equal(views.verifyViewToken(token, "v-other"), false); // scoped to ONE view
+});
+
+test("parseAiCred/aiCredEnv: both credential shapes materialize the right env; garbage is refused", () => {
+  // The gateway pair — the common case: a scoped isogw_ token + our metering base URL.
+  const gw = launch.parseAiCred({ auth: "apiKey", apiKey: "isogw_abc", baseUrl: "https://cloud.example/anthropic" });
+  assert.deepEqual(launch.aiCredEnv(gw), { ANTHROPIC_API_KEY: "isogw_abc", ANTHROPIC_BASE_URL: "https://cloud.example/anthropic" });
+  // A direct key with no base URL sets only the key.
+  assert.deepEqual(launch.aiCredEnv(launch.parseAiCred({ auth: "apiKey", apiKey: "sk-x" })), { ANTHROPIC_API_KEY: "sk-x" });
+  // Subscription OAuth → the raw-injection exception, one env var.
+  assert.deepEqual(launch.aiCredEnv(launch.parseAiCred({ auth: "subscription", oauthToken: "oat-1" })), { CLAUDE_CODE_OAUTH_TOKEN: "oat-1" });
+  // Wrong or missing pieces parse to nothing rather than a half-credential.
+  assert.equal(launch.parseAiCred({ auth: "apiKey" }), undefined);
+  assert.equal(launch.parseAiCred({ auth: "subscription", apiKey: "sk-x" }), undefined);
+  assert.equal(launch.parseAiCred("not-an-object"), undefined);
+  assert.equal(launch.parseAiCred(undefined), undefined);
 });
 
 test("web slugs are long enough to be addresses (≥128-bit)", () => {
