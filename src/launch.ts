@@ -113,6 +113,17 @@ export function aiCredEnv(cred: AiCred): Record<string, string> {
   return { ANTHROPIC_API_KEY: cred.apiKey!, ...(cred.baseUrl ? { ANTHROPIC_BASE_URL: cred.baseUrl } : {}) };
 }
 
+// A credential replaces the WHOLE pair, so every var it could own is cleared first: a
+// leftover ANTHROPIC_API_KEY from the environment config would out-rank the chosen
+// subscription token, and a leftover ANTHROPIC_BASE_URL would ship the chosen token to
+// someone else's endpoint. Partial application is worse than none.
+export const AI_ENV_KEYS = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN"];
+
+export function applyAiCred(env: Record<string, string>, cred: AiCred): void {
+  for (const k of AI_ENV_KEYS) delete env[k];
+  Object.assign(env, aiCredEnv(cred));
+}
+
 interface GitCreds {
   githubOauth?: string;
   repoTokens: { url: string; token: string }[];
@@ -344,12 +355,12 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
   // reserved for trusted internals, so launch-body vars are validated above.
   const env: Record<string, string> = { ...(body.env ?? {}) };
   for (const v of envConfig.vars) env[v.name] = v.value;
-  // The AI credential last, so the deliberately-chosen provider beats a plain env var of the
-  // same name (the cloud already applied its own precedence — environment override → agent/
-  // account choice — before sealing). Nothing is written to disk; the value lives only in the
-  // sandbox's env for the sandbox's lifetime.
+  // The AI credential last, and as a whole pair (see applyAiCred), so the deliberately-chosen
+  // provider beats plain env vars of the same names (the cloud already applied its own
+  // precedence — environment override → agent/account choice — before sealing). Nothing is
+  // written to disk; the value lives only in the sandbox's env for the sandbox's lifetime.
   const aiCred = parseAiCred(sealedOrInline(body.claude));
-  if (aiCred) Object.assign(env, aiCredEnv(aiCred));
+  if (aiCred) applyAiCred(env, aiCred);
 
   // The image (PLAN O4): analyze the repos' detection files host-side, hash them, and
   // build/reuse `isolation-server-spec:<wsHash>` — a repo's own .devcontainer (image / Dockerfile /

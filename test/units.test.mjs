@@ -41,6 +41,19 @@ test("parseAiCred/aiCredEnv: both credential shapes materialize the right env; g
   assert.equal(launch.parseAiCred(undefined), undefined);
 });
 
+test("applyAiCred replaces the whole pair — no leftover env var out-ranks or redirects it", () => {
+  // A user's own key + endpoint in the environment config must not survive alongside the
+  // session's subscription token (Claude Code would prefer the key, and the stale base URL
+  // would send the token to someone else's endpoint).
+  const env = { ANTHROPIC_API_KEY: "sk-user", ANTHROPIC_BASE_URL: "https://elsewhere.example", KEEP: "1" };
+  launch.applyAiCred(env, { auth: "subscription", oauthToken: "oat-1" });
+  assert.deepEqual(env, { CLAUDE_CODE_OAUTH_TOKEN: "oat-1", KEEP: "1" });
+  // And the other direction: a gateway pair with no base URL clears a stale one.
+  const env2 = { ANTHROPIC_BASE_URL: "https://elsewhere.example", CLAUDE_CODE_OAUTH_TOKEN: "oat-old" };
+  launch.applyAiCred(env2, { auth: "apiKey", apiKey: "isogw_abc" });
+  assert.deepEqual(env2, { ANTHROPIC_API_KEY: "isogw_abc" });
+});
+
 test("web slugs are long enough to be addresses (≥128-bit)", () => {
   const slug = views.newWebSlug();
   assert.match(slug, /^[a-z2-7]{26}$/);
