@@ -203,13 +203,16 @@ export function parseRoster(raw: unknown): AgentDef[] {
   if (!Array.isArray(raw)) return [];
   const out: AgentDef[] = [];
   for (const a of raw) {
-    if (typeof a?.id !== "string" || typeof a?.name !== "string") continue;
+    // The cloud's compose-launch specs carry the agent id as `key` and the prompt as
+    // `instructions` (PLAN §12); the daemon-era roster used `id` / `systemPrompt`. Take either.
+    const id = typeof a?.id === "string" ? a.id : typeof a?.key === "string" ? a.key : undefined;
+    if (!id || typeof a?.name !== "string") continue;
     out.push({
-      id: a.id,
+      id,
       name: a.name,
       harness: (typeof a.harness === "string" ? a.harness : "echo") as HarnessId,
       model: typeof a.model === "string" ? a.model : null,
-      systemPrompt: typeof a.systemPrompt === "string" ? a.systemPrompt : "",
+      systemPrompt: typeof a.systemPrompt === "string" ? a.systemPrompt : typeof a.instructions === "string" ? a.instructions : "",
       npub: typeof a.npub === "string" ? a.npub : undefined,
       lifecycle: a.lifecycle === "lazy" ? "lazy" : "always",
     });

@@ -339,6 +339,33 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     }
   }
 
+  // Threads by WORKSPACE-LEVEL key (PLAN §12 v3): the cloud's channel connectors (Slack, Buzz)
+  // address a chat as `session + thread key`, never a session-local view id. GET reads the
+  // transcript; POST runs a turn — creating the (unplaced) agent view on first contact when the
+  // body names the agent, so a channel's first message is enough to start its thread.
+  const th = /^\/sessions\/(s-[a-z0-9]+)\/threads\/([A-Za-z0-9._-]+)\/messages$/.exec(url);
+  if (th) {
+    const [, sid, key] = th;
+    const s = getSessionRecord(sid);
+    if (!s?.sandboxId) return json(res, 404, { error: "session not ready" });
+    let v = viewsForSandbox(s.sandboxId).find((x) => x.type === "agent" && x.specKey === key);
+    if (method === "GET") return v ? json(res, 200, { messages: await threadMessages(v) }) : json(res, 200, { messages: [] });
+    if (method === "POST") {
+      const b = await readBody(req);
+      const text = typeof b.text === "string" ? b.text : "";
+      if (!text.trim()) return json(res, 400, { error: "text required" });
+      if (!v) {
+        const agentId = typeof b.agentId === "string" ? b.agentId : "";
+        if (!agentId) return json(res, 404, { error: "no such thread in this session (send agentId to start one)" });
+        const { scaffoldView } = await import("./launch.js");
+        v = await scaffoldView(s.sandboxId, { type: "agent", specKey: key, agentId, label: typeof b.label === "string" ? b.label : undefined });
+        if (!v) return json(res, 502, { error: "could not create the thread's view" });
+      }
+      const out = await sendMessage(v, text, typeof b.from === "string" ? b.from : "channel");
+      return "error" in out ? json(res, 502, out) : json(res, 200, { ...out, viewId: v.id });
+    }
+  }
+
   const sess = /^\/sessions\/(s-[a-z0-9]+)(\/([a-z-]+))?$/.exec(url);
   if (sess) {
     const [, id, , action] = sess;

@@ -152,12 +152,17 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
     // Build logs ride the phase string — strip control chars and cap it so the record
     // stays clean JSON and the web's status line stays one line.
     onPhase: (phase) => update(id, { phase: phase.replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 160) }),
+    // The roster is live from the moment the sandbox exists: agent views are scaffolded during
+    // the launch and their chat page asks for its agent right away.
+    onSandbox: (sandboxId) => {
+      update(id, { sandboxId });
+      if (rec.roster?.length) registerRoster(rec.workspaceId ?? id, id, sandboxId, rec.roster);
+    },
   };
 
   void launch(req)
     .then((out) => {
       update(id, { sandboxId: out.sandbox.id, state: "ready", phase: undefined, viewsPending: 0, ...(out.vault ? { vault: out.vault } : {}) });
-      if (rec.roster?.length) registerRoster(rec.workspaceId ?? id, id, out.sandbox.id, rec.roster);
       log(`${id} ready (sandbox ${out.sandbox.id.slice(0, 8)})${rec.roster?.length ? `, ${rec.roster.length} agent(s)` : ""}`);
     })
     .catch((e: Error) => {

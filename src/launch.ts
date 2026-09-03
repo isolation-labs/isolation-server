@@ -350,6 +350,9 @@ export interface LaunchRequest {
   metadata?: Record<string, string>;
   // Live progress callback — the session layer mirrors it into the record the web polls.
   onPhase?: (phase: string) => void;
+  // Fires as soon as the sandbox exists — BEFORE clones and views — so the session layer can
+  // register the agent roster before any agent view's first request lands.
+  onSandbox?: (sandboxId: string) => void;
 }
 
 export interface LaunchResult {
@@ -448,6 +451,7 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
     ...(vault ? sidecarCreateSpec() : {}),
   });
   log(`sandbox ${sandbox.id} created (${image}${vault ? ", credential vault" : ""})`);
+  body.onSandbox?.(sandbox.id);
 
   let vaultSummary: VaultSummary | undefined;
   try {
