@@ -484,7 +484,7 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
     if (env.CODEX_SUBSCRIPTION && env.OPENAI_BASE_URL) {
       const { codexLoginFile } = await import("./harness.js");
       const root = env.OPENAI_BASE_URL.replace(/\/v1\/?$/, "");
-      await run(sandbox.id, `${codexLoginFile(env.OPENAI_API_KEY ?? "isolation-vault", env.CODEX_ACCOUNT_ID ?? "")} && printf 'chatgpt_base_url = "%s"\n' ${JSON.stringify(`${root}/backend-api/`)} > ~/.codex/config.toml`).catch((e: Error) => log(`codex login files: ${e.message}`));
+      await run(sandbox.id, `${codexLoginFile(env.OPENAI_API_KEY ?? "isolation-vault", env.CODEX_ACCOUNT_ID ?? "")} && printf 'chatgpt_base_url = "%s"\\npreferred_auth_method = "chatgpt"\\nmodel_provider = "iso"\\n\\n[model_providers.iso]\\nname = "iso"\\nbase_url = "%s"\\nwire_api = "responses"\\nsupports_websockets = false\\nrequires_openai_auth = true\\n' ${JSON.stringify(`${root}/backend-api/`)} ${JSON.stringify(`${root}/backend-api/codex`)} > ~/.codex/config.toml`).catch((e: Error) => log(`codex login files: ${e.message}`));
     }
 
     body.onPhase?.("cloning repositories");

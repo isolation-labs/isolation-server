@@ -139,8 +139,16 @@ const codex: Harness = {
     // dials api.openai.com over a websocket); a ChatGPT subscription keeps codex's own ChatGPT
     // mode but with `chatgpt_base_url` pointed at the gateway slot — codex sends its normal
     // `/backend-api/codex/…` requests there, logged in with a placeholder the gateway swaps.
+    // ChatGPT mode through the gateway: codex's built-in provider speaks a websocket the gateway
+    // cannot carry, so the slot is declared as a provider of our own in ChatGPT-auth mode
+    // (requires_openai_auth) with websockets off — plain HTTPS to <slot>/backend-api/codex.
     const provider = env?.CODEX_SUBSCRIPTION && gatewayRoot
-      ? ["-c", shq(`chatgpt_base_url="${gatewayRoot}/backend-api/"`), "-c", shq(`preferred_auth_method="chatgpt"`)]
+      ? [
+          "-c", shq(`chatgpt_base_url="${gatewayRoot}/backend-api/"`),
+          "-c", shq(`preferred_auth_method="chatgpt"`),
+          "-c", "model_provider=iso",
+          "-c", shq(`model_providers.iso={ name="iso", base_url="${gatewayRoot}/backend-api/codex", wire_api="responses", supports_websockets=false, requires_openai_auth=true }`),
+        ]
       : base
         ? ["-c", "model_provider=iso", "-c", shq(`model_providers.iso={ name="iso", base_url="${base}", wire_api="responses", supports_websockets=false, env_key="OPENAI_API_KEY" }`)]
         : [];
