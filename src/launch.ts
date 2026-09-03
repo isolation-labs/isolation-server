@@ -479,6 +479,14 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
       await run(sandbox.id, `git config --global user.name ${JSON.stringify(gname)} && git config --global user.email ${JSON.stringify(gmail)}`);
     }
 
+    // A ChatGPT subscription as the session's default: `codex` in a terminal must find itself
+    // logged in (placeholder access token — the gateway swaps it) and pointed at the gateway.
+    if (env.CODEX_SUBSCRIPTION && env.OPENAI_BASE_URL) {
+      const { codexLoginFile } = await import("./harness.js");
+      const root = env.OPENAI_BASE_URL.replace(/\/v1\/?$/, "");
+      await run(sandbox.id, `${codexLoginFile(env.OPENAI_API_KEY ?? "isolation-vault", env.CODEX_ACCOUNT_ID ?? "")} && printf 'chatgpt_base_url = "%s"\n' ${JSON.stringify(`${root}/backend-api/`)} > ~/.codex/config.toml`).catch((e: Error) => log(`codex login files: ${e.message}`));
+    }
+
     body.onPhase?.("cloning repositories");
     for (const repo of repos) {
       log(`cloning ${repo.url} → /workspace/${repo.name}`);

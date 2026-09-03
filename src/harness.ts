@@ -62,6 +62,10 @@ const echo: Harness = {
 // gateway slot; the real key never enters the container (the sidecar injects it).
 const CLAUDE_INSTALL = 'command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 || (command -v iso-node >/dev/null 2>&1 && "$(dirname "$(command -v iso-node)")/npm" install -g @anthropic-ai/claude-code >/dev/null 2>&1)';
 const shq = (v: string): string => `'${v.replace(/'/g, `'\\''`)}'`;
+// Codex's login file for a ChatGPT subscription: the (gateway) token as the access token — the
+// gateway resolves the real OAuth — plus the account id the backend keys the plan off.
+export const codexLoginFile = (accessToken: string, accountId: string): string =>
+  `mkdir -p ~/.codex && printf '%s' ${shq(JSON.stringify({ OPENAI_API_KEY: null, tokens: { id_token: "", access_token: accessToken, refresh_token: "", account_id: accountId }, last_refresh: new Date().toISOString() }))} > ~/.codex/auth.json`;
 const claudeCode: Harness = {
   id: "claude-code",
   label: "Claude Code (in the sandbox)",
@@ -113,14 +117,22 @@ const codex: Harness = {
     // so the gateway slot is declared as an explicit HTTP-only provider (Responses wire API,
     // key from OPENAI_API_KEY). Without a base URL in env, codex's own defaults apply.
     const base = env?.OPENAI_BASE_URL;
-    const provider = base
-      ? ["-c", "model_provider=iso", "-c", shq(`model_providers.iso={ name="iso", base_url="${base}", wire_api="responses", supports_websockets=false, env_key="OPENAI_API_KEY" }`)]
-      : [];
+    const gatewayRoot = base?.replace(/\/v1\/?$/, "");
+    // Two ways to the gateway: an API key rides an explicit HTTP-only provider (codex's default
+    // dials api.openai.com over a websocket); a ChatGPT subscription keeps codex's own ChatGPT
+    // mode but with `chatgpt_base_url` pointed at the gateway slot — codex sends its normal
+    // `/backend-api/codex/…` requests there, logged in with a placeholder the gateway swaps.
+    const provider = env?.CODEX_SUBSCRIPTION && gatewayRoot
+      ? ["-c", shq(`chatgpt_base_url="${gatewayRoot}/backend-api/"`)]
+      : base
+        ? ["-c", "model_provider=iso", "-c", shq(`model_providers.iso={ name="iso", base_url="${base}", wire_api="responses", supports_websockets=false, env_key="OPENAI_API_KEY" }`)]
+        : [];
+    const login = env?.CODEX_SUBSCRIPTION ? `${codexLoginFile(env.OPENAI_API_KEY ?? "isolation-vault", env.CODEX_ACCOUNT_ID ?? "")}; ` : "";
     const common = ["--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", ...provider, "-C", "/workspace", ...(agent.model ? ["-m", shq(agent.model)] : [])];
     const cmd = harnessSession
       ? ["codex", "exec", "resume", ...common, shq(harnessSession), shq(prompt)]
       : ["codex", "exec", ...common, shq(prompt)];
-    const r = await run(sandboxId, cmd.join(" "), { cwd: "/workspace", envs: env, timeoutMs: 15 * 60_000 });
+    const r = await run(sandboxId, `${login}${cmd.join(" ")}`, { cwd: "/workspace", envs: env, timeoutMs: 15 * 60_000 });
     // JSONL: thread.started {thread_id}; item.completed {item:{type:"agent_message", text}} — the
     // last agent message is the reply.
     let threadId: string | undefined;
