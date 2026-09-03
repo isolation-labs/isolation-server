@@ -15,7 +15,7 @@ import { deleteSandbox } from "./opensandbox.js";
 import { run } from "./execd.js";
 import { dropSink, sinkFor } from "./persistence.js";
 import { dropViewsForSandbox, viewsForSandbox, type View, type ViewType } from "./views.js";
-import { dropSessionAgents, parseRoster, registerRoster, type AgentDef } from "./agents.js";
+import { dropSessionAgents, parseAgentSecrets, parseRoster, registerRoster, setAgentCredentials, type AgentDef } from "./agents.js";
 import { installVault, parseVaultManifest, vaultPresent, type VaultSummary } from "./vault.js";
 import { forgetThreads } from "./threads.js";
 import { sealedOrInline } from "./envelope.js";
@@ -97,6 +97,7 @@ export interface DaemonLaunchBody {
   name?: string;
   origin?: string;
   agents?: unknown; // the workspace's agent roster (PLAN O5); parsed via parseRoster
+  agentSecrets?: unknown; // per-agent credentials, sealed to this server ({credentials:[{key, credential}]})
 }
 
 const VIEW_TYPES = new Set(["terminal", "code", "directory", "web", "agent", "git"]);
@@ -157,6 +158,9 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
     onSandbox: (sandboxId) => {
       update(id, { sandboxId });
       if (rec.roster?.length) registerRoster(rec.workspaceId ?? id, id, sandboxId, rec.roster);
+      // The agents' own credentials (each its gateway slot) — honored now (PLAN §5 P1).
+      const secrets = parseAgentSecrets(sealedOrInline(body.agentSecrets));
+      if (secrets.length) setAgentCredentials(id, secrets);
     },
   };
 

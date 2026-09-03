@@ -52,6 +52,40 @@ interface AgentRecord {
 // per workspace; the runtime id is this instance in this session.
 const live = new Map<string, AgentRecord>();
 
+// The launch's per-agent credentials (the cloud's sealed `agentSecrets`, opened by the session
+// layer): agent definition id → the env its harness runs with. With the Credential Vault the
+// token is a placeholder the sidecar overwrites; the base URL is the agent's own gateway slot.
+export interface AgentCredential {
+  kind: string;
+  provider: string;
+  token: string;
+  baseUrl?: string;
+}
+const credentials = new Map<string, AgentCredential>(); // `${sessionId}:${agentDefId}`
+export function setAgentCredentials(sessionId: string, list: { key: string; credential: AgentCredential }[]): void {
+  for (const { key, credential } of list) credentials.set(`${sessionId}:${key}`, credential);
+}
+export function parseAgentSecrets(raw: unknown): { key: string; credential: AgentCredential }[] {
+  const list = (raw as { credentials?: unknown })?.credentials;
+  if (!Array.isArray(list)) return [];
+  return list.flatMap((e: Record<string, unknown>) => {
+    const c = e?.credential as Record<string, unknown> | undefined;
+    return typeof e?.key === "string" && c && typeof c.token === "string"
+      ? [{ key: e.key, credential: { kind: String(c.kind ?? "apiKey"), provider: String(c.provider ?? "anthropic"), token: c.token, baseUrl: typeof c.baseUrl === "string" ? c.baseUrl : undefined } }]
+      : [];
+  });
+}
+// The env a harness gets for an agent: its own credential, else nothing (the sandbox's own env —
+// the session slot — applies). Anthropic-shaped for claude-code; OpenAI-shaped for the rest.
+function envFor(sessionId: string, agentDefId: string): Record<string, string> | undefined {
+  const c = credentials.get(`${sessionId}:${agentDefId}`);
+  if (!c) return undefined;
+  if (c.kind === "subscription" && c.provider !== "openai") return { ANTHROPIC_API_KEY: c.token, ...(c.baseUrl ? { ANTHROPIC_BASE_URL: c.baseUrl } : {}) };
+  return c.provider === "anthropic"
+    ? { ANTHROPIC_API_KEY: c.token, ...(c.baseUrl ? { ANTHROPIC_BASE_URL: c.baseUrl } : {}) }
+    : { OPENAI_API_KEY: c.token, ...(c.baseUrl ? { OPENAI_BASE_URL: `${c.baseUrl.replace(/\/+$/, "")}/v1` } : {}) };
+}
+
 // (The old per-server conversation files under <HOME>/agents are gone: threads live in the
 // sandbox — threads.ts. STORE stays only for the legacy listing helper below.)
 
@@ -132,6 +166,7 @@ export function stopAgent(agentId: string): boolean {
 
 export function dropSessionAgents(sessionId: string): void {
   for (const [k, r] of live) if (r.sessionId === sessionId) live.delete(k);
+  for (const k of [...credentials.keys()]) if (k.startsWith(`${sessionId}:`)) credentials.delete(k);
 }
 
 // --- the conversation turn ------------------------------------------------------
@@ -150,14 +185,17 @@ export async function sendMessage(view: View, text: string, from = "view"): Prom
   try {
     const harness = getHarness(rec.def.harness);
     const memory = await loadMemory(rec.sandboxId, rec.def.id);
-    const replyText = await harness.runTurn({
+    const out = await harness.runTurn({
       systemPrompt: `${effectiveSystemPrompt(rec.def)}${memory ? `\n\nYour memory for this workspace:\n${memory}` : ""}`,
       history: thread.messages.slice(0, -1),
       userText: text,
       agent: { id: rec.def.id, name: rec.def.name, model: rec.def.model ?? undefined },
       sandboxId: rec.sandboxId,
+      harnessSession: thread.harnessSession,
+      env: envFor(rec.sessionId, rec.def.id),
     });
-    const reply: Message = { role: "assistant", text: replyText, ts: Date.now() };
+    const reply: Message = { role: "assistant", text: out.text, ts: Date.now() };
+    if (out.harnessSession) thread.harnessSession = out.harnessSession;
     thread.messages.push(reply);
     await saveThread(rec.sandboxId, thread);
     return { reply };

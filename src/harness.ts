@@ -12,13 +12,24 @@ export interface TurnInput {
   userText: string;
   agent: { id: string; name: string; model?: string };
   sandboxId?: string; // where the agent's tools execute (real harnesses use this)
+  // The harness's own resumable session for THIS thread (claude-code's session id), if it has
+  // one from an earlier turn — a real harness keeps its context there, not in `history`.
+  harnessSession?: string;
+  // The agent's credential as ENV (PLAN §5b): the gateway base URL for its slot + a placeholder
+  // key the sidecar overwrites. Provided by the supervisor from the launch's sealed credentials.
+  env?: Record<string, string>;
+}
+
+export interface TurnOutput {
+  text: string;
+  harnessSession?: string; // what to store on the thread for the next turn
 }
 
 export interface Harness {
   id: HarnessId;
   label: string;
   installed: boolean;
-  runTurn(input: TurnInput): Promise<string>;
+  runTurn(input: TurnInput): Promise<TurnOutput>;
 }
 
 // Built-in echo harness: proves the whole pipeline with no model credentials. It
@@ -33,16 +44,60 @@ const echo: Harness = {
   async runTurn({ systemPrompt, history, userText, agent }) {
     const persona = (systemPrompt.split("\n\n").slice(1).join(" ").trim() || "(no user instructions)").slice(0, 120);
     const priorUser = history.filter((m) => m.role === "user").length;
-    return [
-      `[${agent.name}] `,
-      `you said: "${userText}". `,
-      `I'm running as persona: ${persona}. `,
-      `this is turn ${priorUser + 1} of MY conversation${agent.model ? ` (model ${agent.model})` : ""}.`,
-    ].join("");
+    return {
+      text: [
+        `[${agent.name}] `,
+        `you said: "${userText}". `,
+        `I'm running as persona: ${persona}. `,
+        `this is turn ${priorUser + 1} of MY conversation${agent.model ? ` (model ${agent.model})` : ""}.`,
+      ].join(""),
+    };
   },
 };
 
-const registry = new Map<HarnessId, Harness>([[echo.id, echo]]);
+// Claude Code IN the sandbox (PLAN §5 P1): each turn is one `claude -p` run over execd, resumed
+// from the thread's own claude session so the context lives in the sandbox with the code. The
+// CLI is installed on first use (npm, cached in the image later — TOOLING_VERSION). Permissions
+// are skipped: the sandbox IS the permission boundary. Credentials arrive as env — the agent's
+// gateway slot; the real key never enters the container (the sidecar injects it).
+const CLAUDE_INSTALL = 'command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 || (command -v iso-node >/dev/null 2>&1 && "$(dirname "$(command -v iso-node)")/npm" install -g @anthropic-ai/claude-code >/dev/null 2>&1)';
+const shq = (v: string): string => `'${v.replace(/'/g, `'\\''`)}'`;
+const claudeCode: Harness = {
+  id: "claude-code",
+  label: "Claude Code (in the sandbox)",
+  installed: true,
+  async runTurn({ systemPrompt, userText, agent, sandboxId, harnessSession, env }) {
+    if (!sandboxId) throw new Error("claude-code needs a running sandbox");
+    const { run } = await import("./execd.js");
+    const args = [
+      "claude",
+      "-p",
+      shq(userText),
+      "--output-format",
+      "json",
+      "--dangerously-skip-permissions",
+      ...(harnessSession ? ["--resume", shq(harnessSession)] : ["--append-system-prompt", shq(systemPrompt)]),
+      ...(agent.model ? ["--model", shq(agent.model)] : []),
+    ];
+    const r = await run(sandboxId, `${CLAUDE_INSTALL}; ${args.join(" ")}`, { cwd: "/workspace", envs: env, timeoutMs: 15 * 60_000 });
+    // `--output-format json` prints ONE object: { type: "result", result, session_id, is_error … }.
+    const line = r.stdout.split("\n").reverse().find((l) => l.trim().startsWith("{"));
+    let parsed: { result?: string; session_id?: string; is_error?: boolean; subtype?: string } | undefined;
+    try {
+      parsed = line ? JSON.parse(line) : undefined;
+    } catch {
+      parsed = undefined;
+    }
+    if (!parsed) throw new Error((r.stderr || r.stdout).trim().split("\n").slice(-3).join(" / ").slice(0, 400) || "claude produced no result");
+    if (parsed.is_error) throw new Error(parsed.result?.slice(0, 400) || `claude: ${parsed.subtype ?? "error"}`);
+    return { text: parsed.result ?? "", harnessSession: parsed.session_id ?? harnessSession };
+  },
+};
+
+const registry = new Map<HarnessId, Harness>([
+  [echo.id, echo],
+  [claudeCode.id, claudeCode],
+]);
 
 // Register a real adapter (claude-code/codex/…) — called from wherever they're wired.
 export function registerHarness(h: Harness): void {
