@@ -99,7 +99,10 @@ export function imageExists(tag: string): boolean {
 
 // The tooling layer every session gets, whatever its base: git/tmux (clones, terminal
 // mirror), a static Node bundled as `iso-node` (the web-view forwarder — exposed as
-// node/npm only when the base has none), ttyd, filebrowser. Every fetch is
+// node/npm only when the base has none), ttyd, filebrowser, and the native agent CLIs —
+// `claude` (Claude Code) and `codex` — installed under the bundled Node so a subscription
+// credential always has its harness whatever the base image is (PLAN §5: subscriptions run
+// their native harness; API keys run goose). Every fetch is
 // arch-matched and the optional ones are guarded so an exotic base degrades a view
 // instead of failing the build. (The code view is doorman-served Monaco — nothing to
 // install in the image; PLAN V1 dropped code-server.)
@@ -117,6 +120,8 @@ RUN set -eux; ARCH="$(uname -m)"; case "$ARCH" in x86_64) T=x86_64;; aarch64|arm
 RUN (set -eux; ARCH="$(uname -m)"; case "$ARCH" in x86_64) F=amd64;; aarch64|arm64) F=arm64;; *) F="$ARCH";; esac; \\
     curl -fsSL "https://github.com/filebrowser/filebrowser/releases/download/v${FILEBROWSER_VERSION}/linux-$F-filebrowser.tar.gz" | tar -xz -C /usr/local/bin filebrowser \\
     && chmod +x /usr/local/bin/filebrowser) || true
+RUN set -eux; /opt/iso/bin/npm install -g --no-fund --no-audit @anthropic-ai/claude-code @openai/codex; \\
+    ln -sf /opt/iso/bin/claude /usr/local/bin/claude; ln -sf /opt/iso/bin/codex /usr/local/bin/codex
 RUN mkdir -p /workspace
 WORKDIR /workspace
 `;
