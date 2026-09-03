@@ -58,8 +58,9 @@ const live = new Map<string, AgentRecord>();
 export interface AgentCredential {
   kind: string;
   provider: string;
-  token: string;
+  token: string; // a gateway token (api keys) or a placeholder (subscriptions — the sidecar holds the real one)
   baseUrl?: string;
+  accountId?: string; // ChatGPT subscriptions: what Codex's auth file needs beside the (placeholder) token
 }
 const credentials = new Map<string, AgentCredential>(); // `${sessionId}:${agentDefId}`
 export function setAgentCredentials(sessionId: string, list: { key: string; credential: AgentCredential }[]): void {
@@ -71,7 +72,7 @@ export function parseAgentSecrets(raw: unknown): { key: string; credential: Agen
   return list.flatMap((e: Record<string, unknown>) => {
     const c = e?.credential as Record<string, unknown> | undefined;
     return typeof e?.key === "string" && c && typeof c.token === "string"
-      ? [{ key: e.key, credential: { kind: String(c.kind ?? "apiKey"), provider: String(c.provider ?? "anthropic"), token: c.token, baseUrl: typeof c.baseUrl === "string" ? c.baseUrl : undefined } }]
+      ? [{ key: e.key, credential: { kind: String(c.kind ?? "apiKey"), provider: String(c.provider ?? "anthropic"), token: c.token, baseUrl: typeof c.baseUrl === "string" ? c.baseUrl : undefined, accountId: typeof c.accountId === "string" ? c.accountId : undefined } }]
       : [];
   });
 }
@@ -80,7 +81,11 @@ export function parseAgentSecrets(raw: unknown): { key: string; credential: Agen
 function envFor(sessionId: string, agentDefId: string): Record<string, string> | undefined {
   const c = credentials.get(`${sessionId}:${agentDefId}`);
   if (!c) return undefined;
-  if (c.kind === "subscription" && c.provider !== "openai") return { ANTHROPIC_API_KEY: c.token, ...(c.baseUrl ? { ANTHROPIC_BASE_URL: c.baseUrl } : {}) };
+  // Subscriptions are DIRECT: the sidecar injects the real OAuth Bearer at the vendor's host; the
+  // harness only needs to be "logged in" with a placeholder (Claude Code: the OAuth env var;
+  // Codex: an auth file the adapter writes from these).
+  if (c.kind === "subscription" && c.provider !== "openai") return { CLAUDE_CODE_OAUTH_TOKEN: c.token };
+  if (c.kind === "subscription") return { CODEX_SUBSCRIPTION: "1", ...(c.accountId ? { CODEX_ACCOUNT_ID: c.accountId } : {}) };
   return c.provider === "anthropic"
     ? { ANTHROPIC_API_KEY: c.token, ...(c.baseUrl ? { ANTHROPIC_BASE_URL: c.baseUrl } : {}) }
     : { OPENAI_API_KEY: c.token, ...(c.baseUrl ? { OPENAI_BASE_URL: `${c.baseUrl.replace(/\/+$/, "")}/v1` } : {}) };
