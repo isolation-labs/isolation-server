@@ -79,7 +79,9 @@ const claudeCode: Harness = {
       ...(harnessSession ? ["--resume", shq(harnessSession)] : ["--append-system-prompt", shq(systemPrompt)]),
       ...(agent.model ? ["--model", shq(agent.model)] : []),
     ];
-    const r = await run(sandboxId, `${CLAUDE_INSTALL}; ${args.join(" ")}`, { cwd: "/workspace", envs: env, timeoutMs: 15 * 60_000 });
+    // IS_SANDBOX: Claude Code's own switch for "I am inside a container" — without it, skipping
+    // permissions is refused for root (which the sandbox user is).
+    const r = await run(sandboxId, `${CLAUDE_INSTALL}; ${args.join(" ")}`, { cwd: "/workspace", envs: { IS_SANDBOX: "1", ...(env ?? {}) }, timeoutMs: 15 * 60_000 });
     // `--output-format json` prints ONE object: { type: "result", result, session_id, is_error … }.
     const line = r.stdout.split("\n").reverse().find((l) => l.trim().startsWith("{"));
     let parsed: { result?: string; session_id?: string; is_error?: boolean; subtype?: string } | undefined;

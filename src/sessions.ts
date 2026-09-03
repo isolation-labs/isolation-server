@@ -40,6 +40,7 @@ export interface SessionRecord {
   workspaceName?: string; // display name from the launch body (the record is daemon-shaped for clients)
   viewsPending?: number; // countdown for the daemon's viewsProgress contract (0 = all views live)
   roster?: AgentDef[];
+  agentSecretsSealed?: string; // the launch's per-agent credentials, still sealed to this server — re-opened on boot
   vault?: VaultSummary; // what the sidecar holds (names only — never values); revision 0 = lost, needs re-mint
 }
 
@@ -48,6 +49,16 @@ try {
   sessions = JSON.parse(readFileSync(FILE, "utf8")) as Record<string, SessionRecord>;
 } catch {
   sessions = {};
+}
+
+// The agent registry is in-memory: after a restart, every session that is still up gets its
+// roster (and the agents' sealed credentials) registered again, so a chat never dies with the
+// server process while its sandbox lives on.
+for (const rec of Object.values(sessions)) {
+  if (!rec.sandboxId || rec.state === "error" || !rec.roster?.length) continue;
+  registerRoster(rec.workspaceId ?? rec.id, rec.id, rec.sandboxId, rec.roster);
+  const secrets = rec.agentSecretsSealed ? parseAgentSecrets(sealedOrInline(rec.agentSecretsSealed)) : [];
+  if (secrets.length) setAgentCredentials(rec.id, secrets);
 }
 
 function persist(): void {
@@ -134,6 +145,7 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
     workspaceName: body.workspace?.name,
     viewsPending: viewSpecsFrom(body).length,
     roster: parseRoster(body.agents),
+    ...(typeof body.agentSecrets === "string" ? { agentSecretsSealed: body.agentSecrets } : {}),
   };
   sessions[id] = rec;
   persist();
