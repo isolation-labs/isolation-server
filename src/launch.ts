@@ -479,13 +479,6 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
       await run(sandbox.id, `git config --global user.name ${JSON.stringify(gname)} && git config --global user.email ${JSON.stringify(gmail)}`);
     }
 
-    // A ChatGPT subscription as the session's default: Codex in a terminal must find itself
-    // logged in — a placeholder auth file (the sidecar swaps the Bearer at chatgpt.com).
-    if (env.CODEX_SUBSCRIPTION) {
-      const auth = JSON.stringify({ OPENAI_API_KEY: null, tokens: { id_token: "", access_token: "isolation-vault", refresh_token: "", account_id: env.CODEX_ACCOUNT_ID ?? "" }, last_refresh: new Date().toISOString() });
-      await writeFile(sandbox.id, "/root/.codex/auth.json", auth, 0o600).catch((e: Error) => log(`codex auth file: ${e.message}`));
-    }
-
     body.onPhase?.("cloning repositories");
     for (const repo of repos) {
       log(`cloning ${repo.url} → /workspace/${repo.name}`);
