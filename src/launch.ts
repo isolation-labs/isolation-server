@@ -42,7 +42,7 @@ function parseWorkspaceSink(body: LaunchRequest): WorkspaceSink | undefined {
 
 const log = (...a: unknown[]) => console.log("[launch]", ...a);
 
-export const TOOLING_IMAGE = "isolation-server/tooling:0.5";
+export const TOOLING_IMAGE = "isolation-server/tooling:0.6"; // 0.6: claude + codex CLIs
 const TERMINAL_PORT = 7681;
 const DIRECTORY_PORT = 8055;
 const WEB_SHADOW_BASE = 42000;

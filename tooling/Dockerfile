@@ -22,4 +22,7 @@ RUN arch="$([ "$TARGETARCH" = "arm64" ] && echo arm64 || echo x64)" \
     && apt-get update && apt-get install -y --no-install-recommends python3 python3-pip python3-venv build-essential \
     && rm -rf /var/lib/apt/lists/* \
     && curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+# The native agent CLIs (PLAN §5): a subscription runs its own harness — claude (Claude Code)
+# and codex — so they are always here, whatever the workspace's language stack.
+RUN npm install -g --no-fund --no-audit @anthropic-ai/claude-code @openai/codex
 WORKDIR /workspace
