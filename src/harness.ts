@@ -96,9 +96,49 @@ const claudeCode: Harness = {
   },
 };
 
+// Codex IN the sandbox — the ChatGPT/OpenAI counterpart of claude-code: one `codex exec --json`
+// per turn, resumed from the thread's own codex thread (`codex exec resume <id>`), the agent's
+// instructions folded into the first prompt (codex exec has no system-prompt flag). Approvals
+// and codex's own sandbox are bypassed: ours is the boundary. Credentials arrive as env — the
+// OpenAI-shaped pair for the agent's gateway slot.
+const codex: Harness = {
+  id: "codex",
+  label: "Codex (in the sandbox)",
+  installed: true,
+  async runTurn({ systemPrompt, userText, agent, sandboxId, harnessSession, env }) {
+    if (!sandboxId) throw new Error("codex needs a running sandbox");
+    const { run } = await import("./execd.js");
+    const prompt = harnessSession ? userText : `${systemPrompt}\n\n${userText}`;
+    const common = ["--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", "/workspace", ...(agent.model ? ["-m", shq(agent.model)] : [])];
+    const cmd = harnessSession
+      ? ["codex", "exec", "resume", ...common, shq(harnessSession), shq(prompt)]
+      : ["codex", "exec", ...common, shq(prompt)];
+    const r = await run(sandboxId, cmd.join(" "), { cwd: "/workspace", envs: env, timeoutMs: 15 * 60_000 });
+    // JSONL: thread.started {thread_id}; item.completed {item:{type:"agent_message", text}} — the
+    // last agent message is the reply.
+    let threadId: string | undefined;
+    let text: string | undefined;
+    for (const line of r.stdout.split("\n")) {
+      const t = line.trim();
+      if (!t.startsWith("{")) continue;
+      try {
+        const ev = JSON.parse(t) as { type?: string; thread_id?: string; item?: { type?: string; text?: string }; error?: { message?: string } };
+        if (ev.thread_id) threadId = ev.thread_id;
+        if (ev.type === "item.completed" && ev.item?.type === "agent_message" && typeof ev.item.text === "string") text = ev.item.text;
+        if (ev.type === "error" && ev.error?.message && !text) throw new Error(ev.error.message.slice(0, 400));
+      } catch (e) {
+        if ((e as Error).message && !(e instanceof SyntaxError)) throw e;
+      }
+    }
+    if (text === undefined) throw new Error((r.stderr || r.stdout).trim().split("\n").slice(-3).join(" / ").slice(0, 400) || "codex produced no reply");
+    return { text, harnessSession: threadId ?? harnessSession };
+  },
+};
+
 const registry = new Map<HarnessId, Harness>([
   [echo.id, echo],
   [claudeCode.id, claudeCode],
+  [codex.id, codex],
 ]);
 
 // Register a real adapter (claude-code/codex/…) — called from wherever they're wired.
