@@ -154,8 +154,9 @@ const codex: Harness = {
         : [];
     const login = env?.CODEX_SUBSCRIPTION ? `${codexLoginFile(env.OPENAI_API_KEY ?? "isolation-vault", env.CODEX_ACCOUNT_ID ?? "")}; ` : "";
     const common = ["--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", ...provider, "-C", "/workspace", ...(agent.model ? ["-m", shq(agent.model)] : [])];
+    // `resume` is a subcommand that only takes -c overrides: every exec-level flag goes BEFORE it.
     const cmd = harnessSession
-      ? ["codex", "exec", "resume", ...common, shq(harnessSession), shq(prompt)]
+      ? ["codex", "exec", ...common.filter((a, i, arr) => !(a === "-c" || (i > 0 && arr[i - 1] === "-c"))), "resume", ...common.filter((a, i, arr) => a === "-c" || (i > 0 && arr[i - 1] === "-c")), shq(harnessSession), shq(prompt)]
       : ["codex", "exec", ...common, shq(prompt)];
     // In ChatGPT mode an OPENAI_API_KEY in the environment wins over the login file and flips
     // codex to API-key mode (straight to api.openai.com) — keep the key out of its env.
