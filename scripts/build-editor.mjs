@@ -64,8 +64,8 @@ function stampHtml(srcHtml, dir) {
 }
 stampHtml(join(root, "web/editor/index.html"), out);
 
-// The agent (PLAN V2) and git (PLAN V3) views: small apps, same doorman-served pattern.
-for (const app of ["agent", "git"]) {
+// The agent view (PLAN V2): a small app, same doorman-served pattern.
+for (const app of ["agent"]) {
   const appOut = join(root, "dist", app);
   mkdirSync(appOut, { recursive: true });
   await build({
@@ -78,4 +78,4 @@ for (const app of ["agent", "git"]) {
   });
   stampHtml(join(root, `web/${app}/index.html`), appOut);
 }
-console.log("[build-editor] dist/{editor,agent,git} ready");
+console.log("[build-editor] dist/{editor,agent} ready");

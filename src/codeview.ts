@@ -1,4 +1,5 @@
-// The first-party code view (PLAN V1) — a Monaco editor the doorman serves itself.
+// The first-party code view (PLAN V1, with V3's git folded in) — a Monaco editor the
+// doorman serves itself.
 // No in-sandbox process: the page + assets are bundled into dist/editor at build
 // time, and the file operations ride execd's file/exec APIs. Auth happened in the
 // doorman before we're called (view token / cookie), so every route here is scoped
@@ -8,6 +9,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { downloadFile, run, writeFile } from "./execd.js";
+import { handleGitApi } from "./codegit.js";
 import type { View } from "./views.js";
 
 const EDITOR_DIR = join(dirname(fileURLToPath(import.meta.url)), "editor");
@@ -165,6 +167,8 @@ export async function handleCodeView(req: IncomingMessage, res: ServerResponse, 
 
   if (rest.startsWith("/api/")) {
     try {
+      // Source control: the sidebar's git section, tree decorations, diffs and git ops.
+      if (rest.startsWith("/api/git/")) return await handleGitApi(req, res, view, rest.slice("/api/git".length), q);
       const raw = q.get("path");
       const rel = raw ? safeRelPath(raw) : undefined;
       if (rest === "/api/list" && method === "GET") {

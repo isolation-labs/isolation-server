@@ -111,7 +111,7 @@ export interface DaemonLaunchBody {
   agentSecrets?: unknown; // per-agent credentials, sealed to this server ({credentials:[{key, credential}]})
 }
 
-const VIEW_TYPES = new Set(["terminal", "code", "directory", "web", "agent", "git"]);
+const VIEW_TYPES = new Set(["terminal", "code", "directory", "web", "agent"]);
 
 function viewSpecsFrom(body: DaemonLaunchBody): ViewSpec[] {
   const specs: ViewSpec[] = [];
@@ -120,7 +120,7 @@ function viewSpecsFrom(body: DaemonLaunchBody): ViewSpec[] {
     // An agent view without a roster binding is unsatisfiable — skip rather than
     // minting a dead window (the roster may have been edited under the layout).
     if (v.type === "agent" && !v.agentId) continue;
-    specs.push({ type: v.type as ViewType, label: v.label, specKey: key, url: v.url, port: v.port, agentId: v.agentId, dir: v.dir });
+    specs.push({ type: v.type as ViewType, label: v.label, specKey: key, url: v.url, port: v.port, agentId: v.agentId });
   }
   // A workspace with no declared views still gets a terminal — the daemon's default.
   if (!specs.length) specs.push({ type: "terminal" });
@@ -296,7 +296,7 @@ export function viewJson(v: View, sessionId: string): Record<string, unknown> {
     id: v.id,
     sessionId,
     type: v.type,
-    target: { port: v.port, ...(v.type === "directory" ? { dir: "/" } : {}), ...(v.type === "git" ? { dir: v.dir ?? "" } : {}), ...(v.type === "agent" && v.agentId ? { agentId: v.agentId } : {}), ...(v.type === "web" ? { appPort: v.appPort ?? v.port, ...(v.appPath ? { appPath: v.appPath } : {}), url: webUrl(v) } : {}) },
+    target: { port: v.port, ...(v.type === "directory" ? { dir: "/" } : {}), ...(v.type === "agent" && v.agentId ? { agentId: v.agentId } : {}), ...(v.type === "web" ? { appPort: v.appPort ?? v.port, ...(v.appPath ? { appPath: v.appPath } : {}), url: webUrl(v) } : {}) },
     ...(v.label ? { label: v.label } : {}),
     ...(v.specKey ? { specKey: v.specKey } : {}),
   };

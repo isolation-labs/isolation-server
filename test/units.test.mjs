@@ -120,6 +120,44 @@ test("code view path gate: workspace-relative only, no traversal or control byte
   }
 });
 
+test("code view git: repo + path + branch gates, porcelain parsing", async () => {
+  const g = await import("../dist/codegit.js");
+  // Repos are NESTED only — the workspace root is the session branch (session sync's).
+  assert.equal(g.repoDir("app"), "/workspace/app");
+  assert.equal(g.repoDir("packages/api"), "/workspace/packages/api");
+  for (const bad of ["", "/", "../x", "a/../b", null]) assert.equal(g.repoDir(bad), undefined, JSON.stringify(bad));
+  // Repo-relative paths as git printed them; escapes and newlines (the env-var list separator) refused.
+  assert.deepEqual(g.safeRepoPaths("src/a.ts"), ["src/a.ts"]);
+  assert.deepEqual(g.safeRepoPaths(["a b.txt", "x$(id).js", "."]), ["a b.txt", "x$(id).js", "."]);
+  for (const bad of [[], [""], ["/etc/passwd"], ["a/../b"], ["a\nb"], ["a\u0000b"], [1], "a//b"]) assert.equal(g.safeRepoPaths(bad), undefined, JSON.stringify(bad));
+  assert.equal(g.safeBranch("feat/git-in-code-view"), "feat/git-in-code-view");
+  for (const bad of ["-x", "a..b", "a b", "a.lock", "a/", "a@{1}", "a:b", "", 3]) assert.equal(g.safeBranch(bad), undefined, JSON.stringify(bad));
+  // porcelain v1 -b --ignored: branch/upstream/ahead-behind, XY codes, renames, quoted paths, ignored dirs.
+  const st = g.parseStatus("app", [
+    "## feat/x...origin/feat/x [ahead 2, behind 1]",
+    " M src/a.ts",
+    "A  src/new.ts",
+    "?? notes.md",
+    "R  old.ts -> new.ts",
+    'M  "we\\"ird.txt"',
+    "!! node_modules/",
+    "!! .env",
+    "UU conflict.ts",
+  ].join("\n"));
+  assert.equal(st.branch, "feat/x");
+  assert.equal(st.upstream, true);
+  assert.deepEqual([st.ahead, st.behind, st.detached], [2, 1, false]);
+  assert.deepEqual(st.files.map((f) => [f.index, f.work, f.path, f.renamedFrom]), [
+    [" ", "M", "src/a.ts", undefined], ["A", " ", "src/new.ts", undefined], ["?", "?", "notes.md", undefined],
+    ["R", " ", "new.ts", "old.ts"], ["M", " ", 'we"ird.txt', undefined], ["U", "U", "conflict.ts", undefined],
+  ]);
+  assert.deepEqual(st.ignored, ["node_modules/", ".env"]);
+  assert.equal(g.parseStatus("d", "## HEAD (no branch)").detached, true);
+  assert.equal(g.parseStatus("d", "## No commits yet on main").branch, "main");
+  assert.deepEqual([g.parseStatus("d", "## main").branch, g.parseStatus("d", "## main").upstream], ["main", false]);
+  assert.equal(g.unquotePath('"caf\\303\\251.txt"'), "café.txt");
+});
+
 // --- Credential Vault (PLAN §5b) ---------------------------------------------------
 
 const vault = await import("../dist/vault.js");
