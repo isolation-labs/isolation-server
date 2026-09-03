@@ -109,7 +109,14 @@ const codex: Harness = {
     if (!sandboxId) throw new Error("codex needs a running sandbox");
     const { run } = await import("./execd.js");
     const prompt = harnessSession ? userText : `${systemPrompt}\n\n${userText}`;
-    const common = ["--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", "/workspace", ...(agent.model ? ["-m", shq(agent.model)] : [])];
+    // Codex's default provider dials api.openai.com over a websocket, ignoring OPENAI_BASE_URL —
+    // so the gateway slot is declared as an explicit HTTP-only provider (Responses wire API,
+    // key from OPENAI_API_KEY). Without a base URL in env, codex's own defaults apply.
+    const base = env?.OPENAI_BASE_URL;
+    const provider = base
+      ? ["-c", "model_provider=iso", "-c", shq(`model_providers.iso={ name="iso", base_url="${base}", wire_api="responses", supports_websockets=false, env_key="OPENAI_API_KEY" }`)]
+      : [];
+    const common = ["--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", ...provider, "-C", "/workspace", ...(agent.model ? ["-m", shq(agent.model)] : [])];
     const cmd = harnessSession
       ? ["codex", "exec", "resume", ...common, shq(harnessSession), shq(prompt)]
       : ["codex", "exec", ...common, shq(prompt)];
