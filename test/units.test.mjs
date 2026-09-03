@@ -119,3 +119,73 @@ test("code view path gate: workspace-relative only, no traversal or control byte
     assert.equal(safeRelPath(bad), undefined, JSON.stringify(bad));
   }
 });
+
+// --- Credential Vault (PLAN §5b) ---------------------------------------------------
+
+const vault = await import("../dist/vault.js");
+const runtime = await import("../dist/runtime.js");
+
+test("parseVaultManifest: keeps well-formed credentials + bindings, drops the rest, refuses empties", () => {
+  const m = vault.parseVaultManifest({
+    credentials: [
+      { name: "gh", value: "isogw_1" },
+      { name: "ant", value: "isogw_2" },
+      { name: "bad name!", value: "x" }, // invalid name
+      { name: "empty", value: "" }, // empty value
+      { name: "gh", value: "dup" }, // duplicate
+    ],
+    bindings: [
+      { name: "github", hosts: ["github.com", "*.github.com"], auth: { type: "bearer", credential: "gh" } },
+      { name: "anthropic", hosts: ["cloud.example"], paths: ["/anthropic/*"], methods: ["post"], auth: { type: "apiKey", name: "x-api-key", credential: "ant" } },
+      { name: "sig", hosts: ["cloud.example"], auth: { type: "customHeaders", headers: [{ name: "X-Iso-Server", credential: "ant" }] } },
+      { name: "dangling", hosts: ["h.example"], auth: { type: "bearer", credential: "nope" } }, // unknown credential
+      { name: "nohost", hosts: [], auth: { type: "bearer", credential: "gh" } },
+      { name: "badauth", hosts: ["h.example"], auth: { type: "passthrough" } },
+      { name: "badhost", hosts: ["not a host"], auth: { type: "bearer", credential: "gh" } },
+    ],
+    env: { ANTHROPIC_BASE_URL: "https://cloud.example/anthropic", N: 5 },
+  });
+  assert.deepEqual(m.credentials.map((c) => c.name), ["gh", "ant"]);
+  assert.deepEqual(m.bindings.map((b) => b.name), ["github", "anthropic", "sig"]);
+  assert.deepEqual(m.bindings[1].methods, ["POST"]);
+  assert.deepEqual(m.env, { ANTHROPIC_BASE_URL: "https://cloud.example/anthropic" });
+  // No usable binding (or credential) → no vault at all, never a half one.
+  assert.equal(vault.parseVaultManifest({ credentials: [{ name: "a", value: "v" }], bindings: [] }), undefined);
+  assert.equal(vault.parseVaultManifest({ credentials: [], bindings: [{ name: "b", hosts: ["h.example"], auth: { type: "bearer", credential: "a" } }] }), undefined);
+  assert.equal(vault.parseVaultManifest("sealed-but-undecryptable"), undefined);
+  assert.equal(vault.parseVaultManifest(undefined), undefined);
+});
+
+test("vaultCoversHost: exact + wildcard hosts decide whether a clone needs its own token", () => {
+  const m = vault.parseVaultManifest({
+    credentials: [{ name: "gh", value: "t" }],
+    bindings: [{ name: "gh", hosts: ["github.com", "*.gitlab.example"], auth: { type: "bearer", credential: "gh" } }],
+  });
+  assert.equal(vault.vaultCoversHost(m, "https://github.com/o/r.git"), true);
+  assert.equal(vault.vaultCoversHost(m, "https://GitHub.com/o/r"), true);
+  assert.equal(vault.vaultCoversHost(m, "https://code.gitlab.example/o/r"), true);
+  assert.equal(vault.vaultCoversHost(m, "https://gitlab.example/o/r"), true);
+  assert.equal(vault.vaultCoversHost(m, "https://bitbucket.org/o/r"), false);
+  assert.equal(vault.vaultCoversHost(m, "git@github.com:o/r.git"), false); // not a URL → no
+  assert.equal(vault.vaultCoversHost(undefined, "https://github.com/o/r"), false);
+});
+
+test("ensureEgressConfig: upgrades dns→dns+nft, adds a missing section/image, leaves a tuned config alone", () => {
+  const base = `[server]\nhost = "127.0.0.1"\n\n[runtime]\ntype = "docker"\n`;
+  // Missing section → appended whole.
+  const a = runtime.ensureEgressConfig(base);
+  assert.equal(a.changed, true);
+  assert.match(a.toml, /\[egress\]\nimage = "opensandbox\/egress:v[\d.]+"\nmode = "dns\+nft"\n$/);
+  // The shipped example: dns → dns+nft, image kept as the operator has it.
+  const b = runtime.ensureEgressConfig(`${base}\n[egress]\nimage = "opensandbox/egress:v9.9.9"\nmode = "dns"\n\n[renew_intent]\nenabled = false\n`);
+  assert.equal(b.changed, true);
+  assert.match(b.toml, /\[egress\]\nimage = "opensandbox\/egress:v9.9.9"\nmode = "dns\+nft"\n\n\[renew_intent\]/);
+  // Already right → untouched, byte for byte.
+  const c = runtime.ensureEgressConfig(b.toml);
+  assert.equal(c.changed, false);
+  assert.equal(c.toml, b.toml);
+  // Section with no image/mode lines → both added.
+  const d = runtime.ensureEgressConfig(`${base}\n[egress]\nreadiness_timeout_seconds = 30.0\n`);
+  assert.equal(d.changed, true);
+  assert.match(d.toml, /\[egress\]\nimage = "opensandbox\/egress:v[\d.]+"\nmode = "dns\+nft"\nreadiness_timeout_seconds = 30.0\n/);
+});

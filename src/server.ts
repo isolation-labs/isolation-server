@@ -429,7 +429,9 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         return out ? json(res, 200, sessionJson(out)) : json(res, 409, { error: "session not ready" });
       }
       if (method === "POST" && action === "start") {
-        const out = await resumeSession(id);
+        // Optional `{ vault }` = a fresh sealed manifest to re-install on resume (PLAN §5b).
+        const b = await readBody(req).catch(() => ({}) as Record<string, unknown>);
+        const out = await resumeSession(id, b.vault);
         return out ? json(res, 200, sessionJson(out)) : json(res, 409, { error: "session not ready" });
       }
       // Not implemented on this runtime yet — explicit, not silent.

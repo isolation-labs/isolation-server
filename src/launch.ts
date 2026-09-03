@@ -13,6 +13,7 @@ import { cacheKey, dependencyHash, workspaceHash } from "./hashes.js";
 import { buildDependencyCacheInBackground, cacheImageAvailable, cacheImageTag, reposWithDeps } from "./cache.js";
 import { dockerAvailable, ensureSpecImage, type ImageRegistry } from "./images.js";
 import { addView, mintViewToken, newWebSlug, viewsForSandbox, type View, type ViewType } from "./views.js";
+import { installVault, parseVaultManifest, sidecarCreateSpec, vaultCoversHost, type VaultManifest, type VaultSummary } from "./vault.js";
 
 // The launch's persistence envelope (same shape the web sends the daemon today:
 // `workspaceId` + `persistence.workspace.{endpoint, creds}`).
@@ -170,7 +171,7 @@ export function parseRepos(body: unknown): RepoSpec[] {
 // tokens flow through a generic GIT_ASKPASS script reading $GIT_TOKEN from the
 // command's env; SSH keys are written 0600, referenced via GIT_SSH_COMMAND, and
 // deleted right after. Public repos clone tokenless.
-async function cloneRepo(sandboxId: string, repo: RepoSpec, creds: GitCreds): Promise<void> {
+async function cloneRepo(sandboxId: string, repo: RepoSpec, creds: GitCreds, vault?: VaultManifest): Promise<void> {
   const override = creds.repoTokens.find((t) => t.url === repo.url)?.token;
   const sshKey = creds.repoSshKeys.find((k) => k.url === repo.url)?.key;
   const isSsh = /^(git@|ssh:\/\/)/.test(repo.url);
@@ -184,6 +185,10 @@ async function cloneRepo(sandboxId: string, repo: RepoSpec, creds: GitCreds): Pr
     await writeFile(sandboxId, keyPath, sshKey.endsWith("\n") ? sshKey : `${sshKey}\n`, 0o600);
     envs.GIT_SSH_COMMAND = `ssh -i ${keyPath} -o StrictHostKeyChecking=accept-new`;
     cleanup = `; rm -f ${keyPath}`;
+  } else if (!isSsh && vaultCoversHost(vault, repo.url)) {
+    // The vault fronts this host (PLAN §5b): the sidecar injects the credential on every
+    // request, so git sees an already-authenticated remote — no token, no askpass, and
+    // `git push` from a terminal later works the same way.
   } else if (!isSsh) {
     const token = override ?? creds.githubOauth;
     if (token) {
@@ -333,6 +338,7 @@ export interface LaunchRequest {
   envConfig?: unknown; // sealed string or inline {files, vars}
   repoTokens?: unknown; // sealed string or inline GitCreds
   claude?: unknown; // sealed string or inline AiCred — the session-wide AI credential
+  vault?: unknown; // sealed string or inline VaultManifest (PLAN §5b) — EVERY credential, via the sidecar
   git?: { name?: string; email?: string };
   env?: Record<string, string>;
   metadata?: Record<string, string>;
@@ -343,6 +349,7 @@ export interface LaunchRequest {
 export interface LaunchResult {
   sandbox: Sandbox;
   views: (View & { path: string; token: string })[];
+  vault?: VaultSummary;
 }
 
 export async function launch(body: LaunchRequest): Promise<LaunchResult> {
@@ -361,6 +368,13 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
   // written to disk; the value lives only in the sandbox's env for the sandbox's lifetime.
   const aiCred = parseAiCred(sealedOrInline(body.claude));
   if (aiCred) applyAiCred(env, aiCred);
+  // The Credential Vault manifest (PLAN §5b). Its `env` is NON-secret routing (gateway base
+  // URLs, placeholder keys) and rides the container env under the same validation as any
+  // launch var; the values themselves go to the sidecar after the sandbox is up.
+  const vault = parseVaultManifest(sealedOrInline(body.vault));
+  if (vault?.env) {
+    for (const v of parseEnvConfig({ vars: Object.entries(vault.env).map(([name, value]) => ({ name, value })) }).vars) env[v.name] = v.value;
+  }
 
   // The image (PLAN O4): analyze the repos' detection files host-side, hash them, and
   // build/reuse `isolation-server-spec:<wsHash>` — a repo's own .devcontainer (image / Dockerfile /
@@ -420,11 +434,20 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
     env: Object.keys(env).length ? env : undefined,
     // Metadata values must be label-safe for the runtime (alphanum/-/_/. only, ≤63).
     metadata: { managedBy: "isolation-server", ...(body.name ? { name: labelSafe(body.name) } : {}), ...(body.metadata ?? {}) },
+    // A manifest attaches the egress sidecar (the vault lives there); no manifest = no sidecar.
+    ...(vault ? sidecarCreateSpec() : {}),
   });
-  log(`sandbox ${sandbox.id} created (${image})`);
+  log(`sandbox ${sandbox.id} created (${image}${vault ? ", credential vault" : ""})`);
 
+  let vaultSummary: VaultSummary | undefined;
   try {
     await waitReady(sandbox.id);
+
+    // Credentials BEFORE anything that needs the network authenticated (clones, hooks).
+    if (vault) {
+      body.onPhase?.("installing credentials");
+      vaultSummary = await installVault(sandbox.id, vault);
+    }
 
     // Git author identity (non-secret) before clones, so hooks/commits attribute right.
     const gname = body.git?.name?.trim();
@@ -436,7 +459,7 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
     body.onPhase?.("cloning repositories");
     for (const repo of repos) {
       log(`cloning ${repo.url} → /workspace/${repo.name}`);
-      await cloneRepo(sandbox.id, repo, gitCreds);
+      await cloneRepo(sandbox.id, repo, gitCreds, vault);
     }
     // Cache hit: copy the baked deps (node_modules, .venv, vendor, …) into each fresh
     // clone where missing — cp -a, since /iso and /workspace may be different mounts.
@@ -482,7 +505,7 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
       if (v) views.push({ ...v, path: `/v/${v.id}/`, token: mintViewToken(v.id) });
     }
 
-    return { sandbox, views };
+    return { sandbox, views, ...(vaultSummary ? { vault: vaultSummary } : {}) };
   } catch (e) {
     // A failed launch must not leak a half-provisioned sandbox — the caller sees
     // the error; the sandbox is gone.

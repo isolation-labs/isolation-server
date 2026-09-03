@@ -16,6 +16,8 @@ import { run } from "./execd.js";
 import { dropSink, sinkFor } from "./persistence.js";
 import { dropViewsForSandbox, viewsForSandbox, type View, type ViewType } from "./views.js";
 import { dropSessionAgents, parseRoster, registerRoster, type AgentDef } from "./agents.js";
+import { installVault, parseVaultManifest, vaultPresent, type VaultSummary } from "./vault.js";
+import { sealedOrInline } from "./envelope.js";
 
 const log = (...a: unknown[]) => console.log("[sessions]", ...a);
 const FILE = join(DATA, "sessions.json");
@@ -37,6 +39,7 @@ export interface SessionRecord {
   workspaceName?: string; // display name from the launch body (the record is daemon-shaped for clients)
   viewsPending?: number; // countdown for the daemon's viewsProgress contract (0 = all views live)
   roster?: AgentDef[];
+  vault?: VaultSummary; // what the sidecar holds (names only — never values); revision 0 = lost, needs re-mint
 }
 
 let sessions: Record<string, SessionRecord> = {};
@@ -88,6 +91,7 @@ export interface DaemonLaunchBody {
   repoTokens?: unknown;
   claudeBlob?: unknown; // the session-wide AI credential, sealed to this server (the usual path)
   claude?: unknown; // inline pair — only ever a scoped gateway token (a raw key is never sent plain)
+  vault?: unknown; // the Credential Vault manifest, sealed to this server (PLAN §5b)
   git?: { name?: string; email?: string };
   name?: string;
   origin?: string;
@@ -141,6 +145,7 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
     envConfig: body.envConfig,
     repoTokens: body.repoTokens,
     claude: body.claudeBlob ?? body.claude,
+    vault: body.vault,
     git: body.git ?? (body.workspace?.gitIdentity?.name && body.workspace?.gitIdentity?.email ? { name: body.workspace.gitIdentity.name, email: body.workspace.gitIdentity.email } : undefined),
     metadata: { sessionId: id },
     // Build logs ride the phase string — strip control chars and cap it so the record
@@ -150,7 +155,7 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
 
   void launch(req)
     .then((out) => {
-      update(id, { sandboxId: out.sandbox.id, state: "ready", phase: undefined, viewsPending: 0 });
+      update(id, { sandboxId: out.sandbox.id, state: "ready", phase: undefined, viewsPending: 0, ...(out.vault ? { vault: out.vault } : {}) });
       if (rec.roster?.length) registerRoster(rec.workspaceId ?? id, id, out.sandbox.id, rec.roster);
       log(`${id} ready (sandbox ${out.sandbox.id.slice(0, 8)})${rec.roster?.length ? `, ${rec.roster.length} agent(s)` : ""}`);
     })
@@ -212,13 +217,25 @@ export async function pauseSession(id: string): Promise<SessionRecord | undefine
   }
   return sessions[id];
 }
-export async function resumeSession(id: string): Promise<SessionRecord | undefined> {
+// `vaultBlob` (optional, sealed) = a FRESH manifest minted for this resume. Docker
+// pause/resume keeps the sidecar's vault, but a sidecar restart or snapshot-restore loses
+// it — so with a manifest we always re-install (new scoped tokens, the old ones are the
+// minter's to revoke); without one we only report whether the vault is still there
+// (revision 0 = gone; the caller can re-mint and call again).
+export async function resumeSession(id: string, vaultBlob?: unknown): Promise<SessionRecord | undefined> {
   const s = sessions[id];
   if (!s?.sandboxId) return undefined;
   if (s.state === "stopped") {
     const { resumeSandbox } = await import("./opensandbox.js");
     await resumeSandbox(s.sandboxId);
     update(id, { state: "ready" });
+  }
+  const manifest = vaultBlob !== undefined ? parseVaultManifest(sealedOrInline(vaultBlob)) : undefined;
+  if (manifest) {
+    update(id, { vault: await installVault(s.sandboxId, manifest) });
+  } else if (s.vault && s.vault.revision > 0 && !(await vaultPresent(s.sandboxId))) {
+    log(`${id}: credential vault lost across resume — needs a fresh manifest`);
+    update(id, { vault: { ...s.vault, revision: 0 } });
   }
   return sessions[id];
 }
