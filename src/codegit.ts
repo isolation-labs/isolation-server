@@ -172,14 +172,28 @@ export async function statusAll(sandboxId: string): Promise<{ repos: RepoStatus[
 // The content of a file at HEAD or in the index, byte-exact via base64 (execd's stdout
 // is line-oriented; raw text would gain or lose a trailing newline). `content: null`
 // = no such blob (untracked at HEAD, deleted from the index).
+// git's repo discovery walks UP from the directory it's handed: `git -C /workspace/notarepo`
+// would silently operate on the WORKSPACE ROOT repo — the session branch that session
+// sync owns, which this API must never touch (a stray `repo=` could otherwise commit to
+// it, reset its index or switch its HEAD). Every command is gated on the named directory
+// being a repo root itself, which is exactly what statusAll lists (`.git` dir or gitfile).
+const REPO_GUARD = `[ -e "$ISO_REPO/.git" ] || { echo "not a git repository" >&2; exit 1; }`;
+const NO_REPO = "not a git repository";
+
 export async function showBlob(sandboxId: string, repoAbs: string, file: string, rev: "head" | "index"): Promise<{ content: string | null; binary?: boolean } | { error: string }> {
   const spec = rev === "head" ? `HEAD:$ISO_F` : `:0:$ISO_F`;
   // A missing blob (untracked at HEAD, deleted from the index) prints nothing; an EMPTY
   // blob prints the "yes" marker alone — the probe separates the two.
-  const r = await run(sandboxId, `git -C "$ISO_REPO" cat-file -e "${spec}" 2>/dev/null && { echo yes; git -C "$ISO_REPO" show "${spec}" | base64; }`, {
+  // Bounded in the SANDBOX (`head -c`), not just on the way out: a runaway blob must
+  // never buffer whole into the server (the readFile lesson). One byte over the cap is
+  // enough to detect the overflow.
+  const r = await run(sandboxId, `${REPO_GUARD}; git -C "$ISO_REPO" cat-file -e "${spec}" 2>/dev/null && { echo yes; git -C "$ISO_REPO" show "${spec}" | head -c ${MAX_SHOW_BYTES + 1} | base64; }`, {
     envs: { ISO_REPO: repoAbs, ISO_F: file },
     timeoutMs: 60_000,
   });
+  // A missing blob and a missing REPO both print nothing — separate them, or a diff
+  // against a bogus repo would render as "the file is entirely new".
+  if (r.stderr.includes(NO_REPO)) return { error: NO_REPO };
   const out = r.stdout.replace(/^\s+/, "");
   if (!out.startsWith("yes")) return { content: null };
   const bytes = Buffer.from(out.slice(3).replace(/\s+/g, ""), "base64");
@@ -189,7 +203,7 @@ export async function showBlob(sandboxId: string, repoAbs: string, file: string,
 }
 
 export async function branches(sandboxId: string, repoAbs: string): Promise<{ current: string; local: string[]; remote: string[] } | { error: string }> {
-  const r = await run(sandboxId, `git -C "$ISO_REPO" for-each-ref --format='%(HEAD)%09%(refname)' refs/heads refs/remotes`, { envs: { ISO_REPO: repoAbs }, timeoutMs: 20_000 });
+  const r = await run(sandboxId, `${REPO_GUARD}; git -C "$ISO_REPO" for-each-ref --format='%(HEAD)%09%(refname)' refs/heads refs/remotes`, { envs: { ISO_REPO: repoAbs }, timeoutMs: 20_000 });
   if (!r.ok) return { error: r.stderr.trim().slice(0, 200) || "not a git repository" };
   let current = "";
   const local: string[] = [];
@@ -212,7 +226,9 @@ export async function branches(sandboxId: string, repoAbs: string): Promise<{ cu
 
 // A shell loop over the newline-separated ISO_PATHS env var, running `$cmd` per path
 // as "$f". Per-path git invocations keep every path in an env var — `--pathspec-from-
-// file` would need stdin execd can't feed — and stop at the first failure.
+// file` would need stdin execd can't feed — and stop at the first failure. Every git
+// pathspec carries `:(literal)` magic: git globs pathspecs by default, so a file
+// literally named `a*.ts` would otherwise stage — or DISCARD — its siblings too.
 const perPath = (cmd: string): string => `cd "$ISO_REPO" && printf '%s\\n' "$ISO_PATHS" | while IFS= read -r f; do [ -n "$f" ] || continue; ${cmd} || exit 1; done`;
 
 // eslint-disable-next-line complexity
@@ -225,14 +241,17 @@ export async function gitOp(sandboxId: string, repoAbs: string, body: Record<str
     const paths = safeRepoPaths(body.paths ?? body.path);
     if (!paths) return { error: "bad path" };
     envs.ISO_PATHS = paths.join("\n");
-    if (op === "stage") cmd = perPath(`git add -A -- "$f"`);
-    else if (op === "unstage") cmd = perPath(`git reset -q HEAD -- "$f"`);
+    if (op === "stage") cmd = perPath(`git add -A -- ":(literal)$f"`);
+    else if (op === "unstage") cmd = perPath(`git reset -q HEAD -- ":(literal)$f"`);
     // Discard = worktree back to the index (VS Code semantics); an untracked file is
     // simply removed. A tracked path that's a directory (folder row) checks out whole.
-    else cmd = perPath(`if git ls-files --error-unmatch -- "$f" >/dev/null 2>&1; then git checkout -q -- "$f" && git clean -qfd -- "$f"; else rm -rf -- "$f"; fi`);
+    else cmd = perPath(`if git ls-files --error-unmatch -- ":(literal)$f" >/dev/null 2>&1; then git checkout -q -- ":(literal)$f" && git clean -qfd -- ":(literal)$f"; else rm -rf -- "$f"; fi`);
   } else if (op === "stageAll") cmd = `git -C "$ISO_REPO" add -A`;
   else if (op === "unstageAll") cmd = `git -C "$ISO_REPO" reset -q`;
-  else if (op === "discardAll") cmd = `git -C "$ISO_REPO" checkout -q -- . && git -C "$ISO_REPO" clean -qfd`;
+  // `checkout -- .` is fatal when nothing is tracked (a repo with no commits), which
+  // would strand the clean and discard nothing — so restore only when the index has
+  // something to restore from.
+  else if (op === "discardAll") cmd = `cd "$ISO_REPO" && if git ls-files --error-unmatch -- . >/dev/null 2>&1; then git checkout -q -- . || exit 1; fi; git clean -qfd`;
   else if (op === "commit") {
     const message = typeof body.message === "string" ? body.message.trim() : "";
     if (!message) return { error: "commit message required" };
@@ -260,7 +279,7 @@ export async function gitOp(sandboxId: string, repoAbs: string, body: Record<str
     envs.ISO_BRANCH = branch;
     cmd = `git -C "$ISO_REPO" switch -c "$ISO_BRANCH"`;
   } else return { error: "unknown op" };
-  const r = await run(sandboxId, cmd, { envs, timeoutMs });
+  const r = await run(sandboxId, `${REPO_GUARD}; ${cmd}`, { envs, timeoutMs });
   if (!r.ok) return { error: (r.stderr || r.stdout).trim().slice(0, 400) || `${op} failed` };
   return { ok: true, output: (r.stdout + r.stderr).trim().slice(0, 400) };
 }

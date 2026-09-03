@@ -1301,7 +1301,10 @@ wireDropTarget(treeEl, ""); // the tree background = the workspace root
 
 // --- diffs ----------------------------------------------------------------------
 
-const gitUri = (rev: string, path: string): monaco.Uri => monaco.Uri.from({ scheme: "isolation-git", path: `/${rev}/${path}` });
+// Model URIs must be unique across every LIVE model: the staged tab's modified side and
+// the worktree tab's original side are both "the index", so the tab kind qualifies the
+// URI — otherwise opening both diffs of one file throws ("model already exists").
+const gitUri = (rev: string, staged: boolean, path: string): monaco.Uri => monaco.Uri.from({ scheme: "isolation-git", path: `/${staged ? "s" : "w"}/${rev}/${path}` });
 
 // Open (or focus) the diff tab for a repo file. Worktree diffs: index → the live
 // buffer (editable, Ctrl+S saves). Staged diffs: HEAD → index, read-only.
@@ -1315,18 +1318,20 @@ async function openDiff(repo: string, rel: string, staged: boolean): Promise<voi
   }
   const st = fileGit.get(path);
   const deleted = staged ? st?.index === "D" : st?.work === "D";
+  // Models created before a later step fails must be disposed — a leaked model keeps its
+  // URI registered, so every retry of this diff would fail from then on.
+  let original: monaco.editor.ITextModel | undefined;
+  let modifiedRO: monaco.editor.ITextModel | undefined;
   try {
     const orig = await apiGitShow(repo, rel, staged ? "head" : "index");
     if (orig.binary) return flash(`${basename(path)} is binary — no text diff`, true);
-    const original = monaco.editor.createModel(orig.content ?? "", undefined, gitUri(staged ? "head" : "index", path));
+    original = monaco.editor.createModel(orig.content ?? "", undefined, gitUri(staged ? "head" : "index", staged, path));
     const t: Tab = { key, path, kind: "diff", original, diff: { repo, rel, staged, deleted: !!deleted }, viewState: null };
     if (staged || deleted) {
       const mod = staged ? await apiGitShow(repo, rel, "index") : { content: "" };
-      if (mod.binary) {
-        original.dispose();
-        return flash(`${basename(path)} is binary — no text diff`, true);
-      }
-      t.modifiedRO = monaco.editor.createModel(mod.content ?? "", undefined, gitUri(staged ? "index" : "deleted", path));
+      if (mod.binary) return flash(`${basename(path)} is binary — no text diff`, true);
+      modifiedRO = monaco.editor.createModel(mod.content ?? "", undefined, gitUri(staged ? "index" : "deleted", staged, path));
+      t.modifiedRO = modifiedRO;
     } else {
       t.doc = await loadDoc(path);
     }
@@ -1334,6 +1339,11 @@ async function openDiff(repo: string, rel: string, staged: boolean): Promise<voi
     activate(t);
   } catch (e) {
     flash(`diff failed: ${(e as Error).message}`, true);
+  } finally {
+    if (!tabs.has(key)) {
+      original?.dispose();
+      modifiedRO?.dispose();
+    }
   }
 }
 
