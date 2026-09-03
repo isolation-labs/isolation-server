@@ -67,6 +67,22 @@ async function mtimeOf(sandboxId: string, rel: string): Promise<number | undefin
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
+// mtimes for a batch of workspace files (the editor's "did this change under me" probe;
+// 0 = gone). Paths ride ONE env var newline-separated — safeRelPath refused newlines.
+async function statMany(sandboxId: string, rels: string[], res: ServerResponse): Promise<void> {
+  const r = await run(sandboxId, `cd "$ISO_WS" && printf '%s\n' "$ISO_PATHS" | while IFS= read -r f; do [ -n "$f" ] || continue; m=$(stat -c %Y "$f" 2>/dev/null); printf '%s\t%s\n' "\${m:-0}" "$f"; done`, {
+    envs: { ISO_WS: WORKSPACE, ISO_PATHS: rels.join("\n") },
+    timeoutMs: 20_000,
+  });
+  const mtimes: Record<string, number> = {};
+  for (const line of r.stdout.split("\n")) {
+    const tab = line.indexOf("\t");
+    if (tab < 0) continue;
+    mtimes[line.slice(tab + 1)] = Number(line.slice(0, tab)) || 0;
+  }
+  json(res, 200, { mtimes });
+}
+
 // Tree file operations, one endpoint: create/mkdir/rename/copy/delete. Both paths ride
 // env vars (the listDir lesson — safeRelPath blocks traversal, not shell metacharacters)
 // and destination-taking ops refuse to clobber an existing target.
@@ -175,6 +191,11 @@ export async function handleCodeView(req: IncomingMessage, res: ServerResponse, 
         // Empty/absent path = the workspace root.
         if (raw && rel === undefined) return json(res, 400, { error: "bad path" });
         return await listDir(view.sandboxId, rel ?? "", res);
+      }
+      if (rest === "/api/stat" && method === "GET") {
+        const rels = q.getAll("path").map(safeRelPath);
+        if (!rels.length || rels.length > 200 || rels.some((p) => !p)) return json(res, 400, { error: "bad path" });
+        return await statMany(view.sandboxId, rels as string[], res);
       }
       if (rest === "/api/file" && (method === "GET" || method === "PUT")) {
         if (!rel) return json(res, 400, { error: "bad path" });

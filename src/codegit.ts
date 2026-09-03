@@ -64,6 +64,7 @@ export interface RepoStatus {
   behind: number;
   files: StatusFile[];
   ignored: string[]; // repo-relative; directories carry a trailing slash
+  remote?: string; // origin's URL as git has it (the page derives the browse link)
   error?: string;
 }
 
@@ -144,6 +145,7 @@ export async function statusAll(sandboxId: string): Promise<{ repos: RepoStatus[
   const cmd =
     `find ${WORKSPACE} -mindepth 2 -maxdepth 4 -name .git \\( -type d -o -type f \\) -not -path '*/node_modules/*' 2>/dev/null | head -50 | sort | ` +
     `while IFS= read -r g; do d="\${g%/.git}"; printf '=== %s\\n' "\${d#${WORKSPACE}/}"; ` +
+    `git -C "$d" remote get-url origin 2>/dev/null | head -1 | sed 's/^/@@@ /'; ` +
     // Two passes: -uall lists untracked files one by one (the tree badges them), but
     // makes --ignored enumerate every file under an ignored directory — so the ignored
     // listing comes from a plain pass, which folds node_modules/ into one entry.
@@ -156,6 +158,8 @@ export async function statusAll(sandboxId: string): Promise<{ repos: RepoStatus[
     if (!cur) return;
     const text = cur.lines.join("\n");
     const st = parseStatus(cur.dir, text);
+    const remote = cur.lines.find((l) => l.startsWith("@@@ "))?.slice(4).trim();
+    if (remote) st.remote = remote;
     if (cur.lines.some((l) => l.startsWith("!!! ") || l.startsWith("fatal:"))) st.error = cur.lines.find((l) => l.startsWith("fatal:"))?.slice(0, 200) ?? "status failed";
     repos.push(st);
   };

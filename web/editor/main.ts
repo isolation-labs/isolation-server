@@ -77,6 +77,13 @@ async function apiSave(path: string, content: string | Blob, expectMtime?: numbe
   return { mtime: body.mtime };
 }
 
+// mtimes for a batch of workspace files; 0 = gone. The "did it change under me" probe.
+async function apiStat(paths: string[]): Promise<Record<string, number>> {
+  const r = await fetch(`api/stat?${paths.map((p) => `path=${encodeURIComponent(p)}`).join("&")}`);
+  if (!r.ok) throw new Error(await errorOf(r));
+  return ((await r.json()) as { mtimes: Record<string, number> }).mtimes;
+}
+
 async function apiOp(op: string, path: string, to?: string): Promise<void> {
   const r = await fetch("api/op", {
     method: "POST",
@@ -104,6 +111,7 @@ interface RepoStatus {
   behind: number;
   files: StatusFile[];
   ignored: string[];
+  remote?: string;
   error?: string;
 }
 
@@ -423,6 +431,7 @@ async function save(): Promise<void> {
     const out = await apiSave(d.path, d.model.getValue(), d.mtime);
     d.savedVersion = version;
     d.mtime = out.mtime;
+    warnedStale.delete(d.path);
     renderTabs();
     flash("Saved");
     void refreshGit(true);
@@ -462,27 +471,47 @@ window.addEventListener("beforeunload", (e) => {
   if ([...tabs.values()].some(isDirty)) e.preventDefault();
 });
 
-// After git rewrote the worktree (discard, checkout, pull): clean buffers follow the
-// disk; dirty ones keep the user's edits (the stale-save gate still guards them).
-async function reloadCleanDocs(): Promise<void> {
-  await Promise.all(
-    [...docs.values()].map(async (d) => {
-      if (d.model.getAlternativeVersionId() !== d.savedVersion) return;
-      try {
-        const read = await apiRead(d.path);
-        if (read.mtime && read.mtime === d.mtime) return;
+// Open buffers follow the sandbox: agents, terminals and git rewrite files behind the
+// editor's back, and the tab must show what's on disk. Clean buffers reload in place
+// (an edit, not setValue — cursor, scroll and undo survive); a dirty buffer keeps the
+// user's edits and says so once — the stale-save gate decides at save time.
+let syncingDocs = false;
+const warnedStale = new Set<string>();
+async function syncDocs(): Promise<void> {
+  if (syncingDocs || !docs.size) return;
+  syncingDocs = true;
+  try {
+    const paths = [...docs.keys()].slice(0, 200);
+    const mtimes = await apiStat(paths);
+    await Promise.all(
+      paths.map(async (path) => {
+        const d = docs.get(path);
+        const m = mtimes[path];
+        if (!d || !m || !d.mtime || m === d.mtime) return;
+        if (d.model.getAlternativeVersionId() !== d.savedVersion) {
+          if (!warnedStale.has(path)) {
+            warnedStale.add(path);
+            flash(`${basename(path)} changed in the sandbox — your unsaved edits are kept`, true);
+          }
+          return;
+        }
+        const read = await apiRead(path);
         const text = new TextDecoder().decode(read.bytes);
         if (text !== d.model.getValue()) {
-          d.model.setValue(text);
-          d.savedVersion = d.model.getAlternativeVersionId();
+          d.model.applyEdits([{ range: d.model.getFullModelRange(), text }]);
+          if (active?.doc === d) flash(`${basename(path)} reloaded from the sandbox`);
         }
-        d.mtime = read.mtime;
-      } catch {
-        /* deleted underneath — the tab stays; a save recreates it */
-      }
-    }),
-  );
-  renderTabs();
+        d.savedVersion = d.model.getAlternativeVersionId();
+        d.mtime = read.mtime ?? m;
+        warnedStale.delete(path);
+      }),
+    );
+    renderTabs();
+  } catch {
+    /* next tick retries */
+  } finally {
+    syncingDocs = false;
+  }
 }
 
 // Tab bookkeeping when tree operations move things underneath the editor. A Monaco
@@ -888,6 +917,7 @@ window.addEventListener("focus", () => {
   if (Date.now() - lastFocusRefresh < 5000) return;
   lastFocusRefresh = Date.now();
   void reloadTree();
+  void syncDocs();
 });
 
 // Keyboard navigation over the visible rows.
@@ -1594,6 +1624,7 @@ function renderRepo(r: RepoStatus): void {
     repoUis.set(r.dir, ui);
   }
   ui.name.textContent = r.dir;
+  ui.name.title = r.remote ? `/workspace/${r.dir} — ${r.remote}` : `/workspace/${r.dir}`;
   ui.branchLabel.textContent = r.detached ? "detached" : r.branch || "no branch";
   ui.ab.textContent = [r.ahead ? `↑${r.ahead}` : "", r.behind ? `↓${r.behind}` : ""].filter(Boolean).join(" ");
   ui.ab.title = r.upstream ? `${r.ahead} to push · ${r.behind} to pull` : "no upstream — Push publishes the branch";
@@ -1700,7 +1731,7 @@ async function gitAction(repo: string, body: Record<string, unknown>, label: str
     }
     if (/discard|checkout|createBranch|pull/.test(verb)) {
       await reloadTree();
-      await reloadCleanDocs();
+      await syncDocs();
     }
     await refreshGit(true);
   }
@@ -1742,10 +1773,50 @@ async function commit(repo: string, o: { amend?: boolean; all?: boolean; push?: 
   }
 }
 
+// The web page for a remote, from whatever form git holds it in: scp-like ssh
+// (git@host:o/r.git), ssh://, https with credentials, and the Credential Vault's
+// gateway rewrite (https://<gateway>/git/<host>/<o>/<r>) all resolve to https://host/o/r.
+function browseUrl(remote: string | undefined): string | undefined {
+  if (!remote) return undefined;
+  let u: URL | undefined;
+  const scp = /^(?:[\w.-]+@)?([\w.-]+):(?!\/\/)(.+)$/.exec(remote);
+  if (scp) u = new URL(`https://${scp[1]}/${scp[2]}`);
+  else {
+    try {
+      u = new URL(remote);
+    } catch {
+      return undefined;
+    }
+    if (u.protocol === "ssh:" || u.protocol === "git:") u = new URL(`https://${u.hostname}${u.pathname}`);
+    else if (u.protocol !== "https:" && u.protocol !== "http:") return undefined;
+    const gw = /^\/git\/([\w.-]+)\/(.+)$/.exec(u.pathname);
+    if (gw) u = new URL(`https://${gw[1]}/${gw[2]}`);
+  }
+  u.username = "";
+  u.password = "";
+  u.search = "";
+  u.hash = "";
+  u.pathname = u.pathname.replace(/\.git\/?$/, "").replace(/\/$/, "");
+  return u.pathname.length > 1 ? u.toString() : undefined;
+}
+
+function openExternal(url: string): void {
+  // An anchor click, not window.open: works from inside the SPA's iframe and never
+  // hands the opener to the remote host.
+  const a = document.createElement("a");
+  a.href = url;
+  a.target = "_blank";
+  a.rel = "noopener noreferrer";
+  a.click();
+}
+
 function repoMoreMenu(dir: string): MenuEntry[] {
   const r = repos.find((x) => x.dir === dir);
   const any = !!r?.files.length;
+  const link = browseUrl(r?.remote);
   return [
+    { label: "Open Repository ↗", disabled: !link, onAct: () => link && openExternal(link) },
+    "sep",
     { label: "Pull", onAct: () => void gitAction(dir, { op: "pull" }, "pulled").catch(() => undefined) },
     { label: r?.upstream ? "Push" : "Publish Branch", onAct: () => void gitAction(dir, { op: "push" }, r?.upstream ? "pushed" : "published").catch(() => undefined) },
     { label: "Fetch", onAct: () => void gitAction(dir, { op: "fetch" }, "fetched").catch(() => undefined) },
@@ -1840,7 +1911,9 @@ resizeEl.addEventListener("pointerdown", (e) => {
 
 // Poll while visible: agents and terminals change the working tree behind our back.
 setInterval(() => {
-  if (!document.hidden) void refreshGit();
+  if (document.hidden) return;
+  void refreshGit();
+  void syncDocs();
 }, 4000);
 
 // --- deep links + navigation ----------------------------------------------------
