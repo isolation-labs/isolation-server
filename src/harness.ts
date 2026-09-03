@@ -64,8 +64,25 @@ const CLAUDE_INSTALL = 'command -v claude >/dev/null 2>&1 || npm install -g @ant
 const shq = (v: string): string => `'${v.replace(/'/g, `'\\''`)}'`;
 // Codex's login file for a ChatGPT subscription: the (gateway) token as the access token — the
 // gateway resolves the real OAuth — plus the account id the backend keys the plan off.
+// Codex decides "logged in" by DECODING the id token's claims (it cannot verify a signature and
+// does not try): a locally minted JWT with the account id is enough. The access token is the
+// gateway token — the gateway swaps in the real OAuth Bearer.
+const b64u = (v: string): string => Buffer.from(v, "utf8").toString("base64url");
+export const codexIdToken = (accountId: string): string => {
+  const now = Math.floor(Date.now() / 1000);
+  const claims = { iss: "isolation", sub: accountId, exp: now + 365 * 86400, iat: now, email: "", "https://api.openai.com/auth": { chatgpt_account_id: accountId, chatgpt_plan_type: "pro", chatgpt_user_id: accountId } };
+  return `${b64u(JSON.stringify({ alg: "HS256", typ: "JWT" }))}.${b64u(JSON.stringify(claims))}.${b64u("isolation")}`;
+};
+// The access token must ALSO decode as a JWT (codex reads `exp` from it; an opaque token makes it
+// "refresh" with the empty refresh token and fail) — so the gateway token rides inside one, as the
+// `isogw` claim; the gateway unwraps it.
+export const codexAccessToken = (gatewayToken: string, accountId: string): string => {
+  const now = Math.floor(Date.now() / 1000);
+  const claims = { iss: "isolation", sub: accountId, exp: now + 365 * 86400, iat: now, isogw: gatewayToken, "https://api.openai.com/auth": { chatgpt_account_id: accountId, chatgpt_plan_type: "pro" } };
+  return `${b64u(JSON.stringify({ alg: "HS256", typ: "JWT" }))}.${b64u(JSON.stringify(claims))}.${b64u("isolation")}`;
+};
 export const codexLoginFile = (accessToken: string, accountId: string): string =>
-  `mkdir -p ~/.codex && printf '%s' ${shq(JSON.stringify({ OPENAI_API_KEY: null, tokens: { id_token: "", access_token: accessToken, refresh_token: "", account_id: accountId }, last_refresh: new Date().toISOString() }))} > ~/.codex/auth.json`;
+  `mkdir -p ~/.codex && printf '%s' ${shq(JSON.stringify({ OPENAI_API_KEY: null, tokens: { id_token: codexIdToken(accountId), access_token: codexAccessToken(accessToken, accountId), refresh_token: "", account_id: accountId }, last_refresh: new Date().toISOString() }))} > ~/.codex/auth.json`;
 const claudeCode: Harness = {
   id: "claude-code",
   label: "Claude Code (in the sandbox)",
@@ -123,7 +140,7 @@ const codex: Harness = {
     // mode but with `chatgpt_base_url` pointed at the gateway slot — codex sends its normal
     // `/backend-api/codex/…` requests there, logged in with a placeholder the gateway swaps.
     const provider = env?.CODEX_SUBSCRIPTION && gatewayRoot
-      ? ["-c", shq(`chatgpt_base_url="${gatewayRoot}/backend-api/"`)]
+      ? ["-c", shq(`chatgpt_base_url="${gatewayRoot}/backend-api/"`), "-c", shq(`preferred_auth_method="chatgpt"`)]
       : base
         ? ["-c", "model_provider=iso", "-c", shq(`model_providers.iso={ name="iso", base_url="${base}", wire_api="responses", supports_websockets=false, env_key="OPENAI_API_KEY" }`)]
         : [];
@@ -132,7 +149,12 @@ const codex: Harness = {
     const cmd = harnessSession
       ? ["codex", "exec", "resume", ...common, shq(harnessSession), shq(prompt)]
       : ["codex", "exec", ...common, shq(prompt)];
-    const r = await run(sandboxId, `${login}${cmd.join(" ")}`, { cwd: "/workspace", envs: env, timeoutMs: 15 * 60_000 });
+    // In ChatGPT mode an OPENAI_API_KEY in the environment wins over the login file and flips
+    // codex to API-key mode (straight to api.openai.com) — keep the key out of its env.
+    // The container env may carry the session slot's key too — unset both in the command itself.
+    const envs = env?.CODEX_SUBSCRIPTION ? Object.fromEntries(Object.entries(env).filter(([k]) => k !== "OPENAI_API_KEY" && k !== "OPENAI_BASE_URL")) : env;
+    const exe = env?.CODEX_SUBSCRIPTION ? ["env", "-u", "OPENAI_API_KEY", "-u", "OPENAI_BASE_URL", ...cmd] : cmd;
+    const r = await run(sandboxId, `${login}${exe.join(" ")}`, { cwd: "/workspace", envs, timeoutMs: 15 * 60_000 });
     // JSONL: thread.started {thread_id}; item.completed {item:{type:"agent_message", text}} — the
     // last agent message is the reply.
     let threadId: string | undefined;
