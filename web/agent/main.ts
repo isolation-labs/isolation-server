@@ -1,7 +1,8 @@
-// The Isolation agent view (PLAN V2) — one chat window onto ONE agent, served by the
-// doorman at /v/<viewId>/. The agent has a single conversation; every window onto it
-// (this view in N tabs, other views of the same agent) polls the same thread and
-// converges. Sending boots a lazy/stopped agent — a message is an implicit start.
+// The Isolation agent view (PLAN §5c) — one chat window onto ONE agent, served by the
+// doorman at /v/<viewId>/. A VIEW IS THE THREAD: this view's transcript lives in the
+// sandbox under its key; the same view opened in N tabs polls that thread and converges,
+// while another view of the same agent is a separate conversation. Sending boots a
+// lazy/stopped agent — a message is an implicit start.
 import "./agent.css";
 
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
