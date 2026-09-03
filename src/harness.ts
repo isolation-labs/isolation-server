@@ -97,7 +97,11 @@ const claudeCode: Harness = {
       "--output-format",
       "json",
       "--dangerously-skip-permissions",
-      ...(harnessSession ? ["--resume", shq(harnessSession)] : ["--append-system-prompt", shq(systemPrompt)]),
+      // The persona rides EVERY turn: a resumed claude session does not remember flags from the
+      // turn that created it.
+      "--append-system-prompt",
+      shq(systemPrompt),
+      ...(harnessSession ? ["--resume", shq(harnessSession)] : []),
       ...(agent.model ? ["--model", shq(agent.model)] : []),
     ];
     // IS_SANDBOX: Claude Code's own switch for "I am inside a container" — without it, skipping
@@ -129,7 +133,9 @@ const codex: Harness = {
   async runTurn({ systemPrompt, userText, agent, sandboxId, harnessSession, env }) {
     if (!sandboxId) throw new Error("codex needs a running sandbox");
     const { run } = await import("./execd.js");
-    const prompt = harnessSession ? userText : `${systemPrompt}\n\n${userText}`;
+    // codex exec has no system-prompt flag and a resumed thread only sees the new prompt, so the
+    // persona is restated on every turn as a leading instructions block.
+    const prompt = `[Instructions for this session — follow them, they are not from the user]\n${systemPrompt}\n[End of instructions]\n\n${userText}`;
     // Codex's default provider dials api.openai.com over a websocket, ignoring OPENAI_BASE_URL —
     // so the gateway slot is declared as an explicit HTTP-only provider (Responses wire API,
     // key from OPENAI_API_KEY). Without a base URL in env, codex's own defaults apply.
