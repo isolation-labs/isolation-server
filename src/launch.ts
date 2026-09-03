@@ -13,7 +13,7 @@ import { cacheKey, dependencyHash, workspaceHash } from "./hashes.js";
 import { buildDependencyCacheInBackground, cacheImageAvailable, cacheImageTag, reposWithDeps } from "./cache.js";
 import { dockerAvailable, ensureSpecImage, type ImageRegistry } from "./images.js";
 import { addView, mintViewToken, newWebSlug, viewsForSandbox, type View, type ViewType } from "./views.js";
-import { installVault, parseVaultManifest, sidecarCreateSpec, vaultCoversHost, type VaultManifest, type VaultSummary } from "./vault.js";
+import { cloneTarget, installVault, parseVaultManifest, sidecarCreateSpec, vaultCoversHost, type VaultManifest, type VaultSummary } from "./vault.js";
 
 // The launch's persistence envelope (same shape the web sends the daemon today:
 // `workspaceId` + `persistence.workspace.{endpoint, creds}`).
@@ -179,13 +179,15 @@ async function cloneRepo(sandboxId: string, repo: RepoSpec, creds: GitCreds, vau
   const branchArg = repo.branch ? ` --branch ${JSON.stringify(repo.branch)}` : "";
   const envs: Record<string, string> = {};
   let cleanup = "";
+  // Gateway-delivered git (PLAN §5b): the remote IS the gateway route; the sidecar authenticates it.
+  const cloneUrl = cloneTarget(vault, repo.url).url;
 
   if (isSsh && sshKey) {
     const keyPath = `/tmp/.iso-key-${randomBytes(4).toString("hex")}`;
     await writeFile(sandboxId, keyPath, sshKey.endsWith("\n") ? sshKey : `${sshKey}\n`, 0o600);
     envs.GIT_SSH_COMMAND = `ssh -i ${keyPath} -o StrictHostKeyChecking=accept-new`;
     cleanup = `; rm -f ${keyPath}`;
-  } else if (!isSsh && vaultCoversHost(vault, repo.url)) {
+  } else if (!isSsh && vaultCoversHost(vault, cloneUrl)) {
     // The vault fronts this host (PLAN §5b): the sidecar injects the credential on every
     // request, so git sees an already-authenticated remote — no token, no askpass, and
     // `git push` from a terminal later works the same way.
@@ -200,7 +202,7 @@ async function cloneRepo(sandboxId: string, repo: RepoSpec, creds: GitCreds, vau
     }
   }
 
-  const r = await run(sandboxId, `git clone${branchArg} ${JSON.stringify(repo.url)} ${JSON.stringify(dest)}${cleanup}`, {
+  const r = await run(sandboxId, `git clone${branchArg} ${JSON.stringify(cloneUrl)} ${JSON.stringify(dest)}${cleanup}`, {
     envs,
     timeoutMs: 300_000,
   });
@@ -383,12 +385,16 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
   // tooling image, so a launch never dies on image prep.
   let image = body.image?.trim() || "";
   let spec: LaunchSpec | undefined;
-  const analysisRepos: AnalysisRepo[] = repos.map((r) => ({
-    url: r.url,
-    dir: r.name,
-    branch: r.branch,
-    token: gitCreds.repoTokens.find((t) => t.url === r.url)?.token ?? (/github\.com/.test(r.url) ? gitCreds.githubOauth : undefined),
-  }));
+  const analysisRepos: AnalysisRepo[] = repos.map((r) => {
+    // A gateway-delivered repo is fetched host-side from the gateway remote with its scoped token.
+    const via = cloneTarget(vault, r.url);
+    return {
+      url: via.url,
+      dir: r.name,
+      branch: r.branch,
+      token: via.token ?? gitCreds.repoTokens.find((t) => t.url === r.url)?.token ?? (/github\.com/.test(r.url) ? gitCreds.githubOauth : undefined),
+    };
+  });
   // Dependency cache: when a cache image for this exact (workspace, dependencies) pair
   // exists, launch FROM it and restore the baked deps post-clone; otherwise launch from
   // the spec image and build the cache in the background for next time.

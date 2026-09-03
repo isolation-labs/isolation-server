@@ -49,6 +49,9 @@ export interface VaultManifest {
   // nothing worth stealing. The sidecar REPLACES an existing auth header, so a
   // placeholder never reaches the upstream.
   env?: Record<string, string>;
+  // `gateway`-delivered git: the repo's ORIGINAL url → the remote the sandbox must actually use
+  // (the gateway's /git route). The sidecar injects headers only; it never rewrites hosts.
+  rewrites?: Record<string, string>;
 }
 
 // Non-secret summary the session record keeps (what's installed, never the values).
@@ -138,9 +141,51 @@ export function parseVaultManifest(raw: unknown): VaultManifest | undefined {
   if (m.env && typeof m.env === "object") {
     for (const [k, v] of Object.entries(m.env as Record<string, unknown>)) if (typeof v === "string") env[k] = v;
   }
+  const rewrites: Record<string, string> = {};
+  if (m.rewrites && typeof m.rewrites === "object") {
+    for (const [k, v] of Object.entries(m.rewrites as Record<string, unknown>)) {
+      if (typeof v !== "string" || !/^https?:\/\//.test(v) || !/^https?:\/\//.test(k)) continue;
+      rewrites[k] = v;
+    }
+  }
   if (!credentials.length || !bindings.length) return undefined;
-  return { credentials, bindings, ...(Object.keys(env).length ? { env } : {}) };
+  return { credentials, bindings, ...(Object.keys(env).length ? { env } : {}), ...(Object.keys(rewrites).length ? { rewrites } : {}) };
 }
+
+// Where to clone a repo from, and with what (host-side detection fetches need the token too):
+// a rewritten repo clones from the gateway remote with the scoped token the vault holds for it
+// (decoded from the Basic value); anything else clones from its own url with no vault auth
+// (the sidecar authenticates in-sandbox; host-side the caller falls back to its own creds).
+export function cloneTarget(vault: VaultManifest | undefined, url: string): { url: string; token?: string } {
+  // `o/r` and `o/r.git` are the same repo — match rewrites on the normalized form.
+  const norm = (u: string) => u.replace(/\/+$/, "").replace(/\.git$/, "").toLowerCase();
+  const target = vault?.rewrites ? Object.entries(vault.rewrites).find(([k]) => norm(k) === norm(url))?.[1] : undefined;
+  if (!target || !vault) return { url };
+  let host: string;
+  try {
+    host = new URL(target).hostname.toLowerCase();
+  } catch {
+    return { url };
+  }
+  const path = new URL(target).pathname;
+  const binding = vault.bindings.find((b) => b.hosts.some((h) => h.toLowerCase() === host) && (b.paths ?? ["/*"]).some((p) => globMatch(p, path) || globMatch(p, `${path}/x`)));
+  const credName = binding && "credential" in binding.auth ? binding.auth.credential : undefined;
+  const value = vault.credentials.find((c) => c.name === credName)?.value;
+  if (!value) return { url: target };
+  let token: string | undefined;
+  try {
+    const decoded = Buffer.from(value, "base64").toString("utf8");
+    token = decoded.includes(":") ? decoded.slice(decoded.indexOf(":") + 1) : decoded;
+  } catch {
+    token = undefined;
+  }
+  return { url: target, token };
+}
+
+const globMatch = (pattern: string, path: string): boolean => {
+  const re = new RegExp(`^${pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`);
+  return re.test(path);
+};
 
 // Does any binding cover this URL's host? Used by the clone path: a host the vault
 // fronts gets NO askpass/token of its own — the sidecar authenticates the request.

@@ -157,6 +157,21 @@ test("parseVaultManifest: keeps well-formed credentials + bindings, drops the re
   assert.equal(vault.parseVaultManifest(undefined), undefined);
 });
 
+test("cloneTarget: a rewritten repo clones from the gateway remote with its scoped token; others untouched", () => {
+  const basic = Buffer.from("x-access-token:isogw_git").toString("base64");
+  const m = vault.parseVaultManifest({
+    credentials: [{ name: "git-1", value: basic }],
+    bindings: [{ name: "git-1", hosts: ["app.example"], paths: ["/git/github.com/o/b/*", "/git/github.com/o/b.git/*"], auth: { type: "basic", credential: "git-1" } }],
+    rewrites: { "https://github.com/o/b.git": "https://app.example/git/github.com/o/b", "ftp://bad": "nope", "https://x": "not-a-url" },
+  });
+  assert.deepEqual(m.rewrites, { "https://github.com/o/b.git": "https://app.example/git/github.com/o/b" });
+  assert.deepEqual(vault.cloneTarget(m, "https://github.com/o/b.git"), { url: "https://app.example/git/github.com/o/b", token: "isogw_git" });
+  assert.deepEqual(vault.cloneTarget(m, "https://github.com/o/b"), { url: "https://app.example/git/github.com/o/b", token: "isogw_git" });
+  assert.deepEqual(vault.cloneTarget(m, "https://github.com/o/a"), { url: "https://github.com/o/a" });
+  assert.deepEqual(vault.cloneTarget(undefined, "https://github.com/o/a"), { url: "https://github.com/o/a" });
+  assert.equal(vault.vaultCoversHost(m, "https://app.example/git/github.com/o/b"), true);
+});
+
 test("vaultCoversHost: exact + wildcard hosts decide whether a clone needs its own token", () => {
   const m = vault.parseVaultManifest({
     credentials: [{ name: "gh", value: "t" }],
