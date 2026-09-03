@@ -8,11 +8,11 @@
 // Harness is pluggable + agnostic (echo built-in for credential-free runs; claude-code/codex/
 // goose adapters plug in the same interface).
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import { HOME } from "./config.js";
 import { getHarness, type HarnessId } from "./harness.js";
-import { loadMemory, loadThread, saveThread } from "./threads.js";
+import { loadMemory, loadThread, saveThread, type Thread } from "./threads.js";
 import type { View } from "./views.js";
 
 const log = (...a: unknown[]) => console.log("[agents]", ...a);
@@ -184,8 +184,17 @@ export async function sendMessage(view: View, text: string, from = "view"): Prom
   const rec = agentForView(view);
   if (!rec) return { error: "this view has no agent" };
   if (!rec.sandboxId) return { error: "session has no sandbox yet" };
-  if (rec.status !== "running") rec.status = "running"; // a message starts a lazy/stopped agent
-  const thread = await loadThread(rec.sandboxId, threadKeyOf(view), rec.def.id);
+  // A message starts a lazy/stopped agent — through the LIVE record: agentForView hands back a
+  // copy, so assigning to `rec.status` would leave the roster reading "idle" forever.
+  if (rec.status !== "running") startAgent(rec.runtimeId);
+  // A thread that cannot be read (sandbox unreachable) must fail the turn, never run it against
+  // an empty transcript — saving that would replace the real one.
+  let thread: Thread;
+  try {
+    thread = await loadThread(rec.sandboxId, threadKeyOf(view), rec.def.id);
+  } catch (e) {
+    return { error: String((e as Error)?.message ?? e) };
+  }
   const user: Message = { role: "user", text, ts: Date.now(), from };
   thread.messages.push(user);
   try {

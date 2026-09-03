@@ -37,17 +37,31 @@ const cacheKey = (sandboxId: string, key: string) => `${sandboxId}:${safeKey(key
 export async function loadThread(sandboxId: string, key: string, agentId: string): Promise<Thread> {
   const hit = cache.get(cacheKey(sandboxId, key));
   if (hit) return hit;
-  let t: Thread | undefined;
+  // A transport failure is NOT "no thread yet": starting empty here would cache the empty
+  // thread and have the next save overwrite a real transcript with a single turn. Only a
+  // reachable sandbox that has no (or an unreadable) thread file starts one.
+  let r: Response;
   try {
-    const r = await downloadFile(sandboxId, threadPath(key));
-    if (r.ok) {
+    r = await downloadFile(sandboxId, threadPath(key));
+  } catch (e) {
+    throw new Error(`thread ${safeKey(key)}: sandbox unreachable — ${String((e as Error)?.message ?? e)}`);
+  }
+  let t: Thread | undefined;
+  if (r.ok) {
+    try {
       const parsed = JSON.parse(await r.text()) as Partial<Thread>;
       if (Array.isArray(parsed.messages)) {
         t = { key: safeKey(key), agentId: parsed.agentId ?? agentId, messages: parsed.messages as Message[], harnessSession: parsed.harnessSession, createdAt: parsed.createdAt ?? Date.now(), updatedAt: parsed.updatedAt ?? Date.now() };
       }
+    } catch {
+      /* unreadable transcript — start a fresh one rather than wedging the chat */
     }
-  } catch {
-    /* no thread yet, or the sandbox isn't reachable — start empty */
+  } else {
+    // Only "the file isn't there" (execd's 404) means "no thread yet". ANY other status is a
+    // transport/server failure — starting empty on a 5xx would cache an empty thread and have
+    // the next save overwrite the real transcript with a single turn.
+    const body = await r.text().catch(() => "");
+    if (r.status !== 404) throw new Error(`thread ${safeKey(key)}: read failed (HTTP ${r.status}) ${body.slice(0, 200)}`.trim());
   }
   if (!t) t = { key: safeKey(key), agentId, messages: [], createdAt: Date.now(), updatedAt: Date.now() };
   cache.set(cacheKey(sandboxId, key), t);

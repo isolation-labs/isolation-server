@@ -82,14 +82,14 @@ test("effectiveSystemPrompt layers the base under the user prompt", () => {
 
 test("echo harness proves persona + per-agent history", async () => {
   const h = harness.getHarness("echo");
-  const reply = await h.runTurn({
+  const out = await h.runTurn({
     systemPrompt: "base\n\npersona text",
     history: [{ role: "user", text: "one" }, { role: "assistant", text: "r" }],
     userText: "two",
     agent: { id: "a", name: "A" },
   });
-  assert.ok(reply.includes("persona text"));
-  assert.ok(reply.includes("turn 2"));
+  assert.ok(out.text.includes("persona text"));
+  assert.ok(out.text.includes("turn 2"));
 });
 
 test("unknown harness reports itself instead of crashing", async () => {
@@ -170,6 +170,14 @@ test("cloneTarget: a rewritten repo clones from the gateway remote with its scop
   assert.deepEqual(vault.cloneTarget(m, "https://github.com/o/a"), { url: "https://github.com/o/a" });
   assert.deepEqual(vault.cloneTarget(undefined, "https://github.com/o/a"), { url: "https://github.com/o/a" });
   assert.equal(vault.vaultCoversHost(m, "https://app.example/git/github.com/o/b"), true);
+  // Only `basic` values are base64("user:token") — any other scheme holds the token verbatim
+  // and must never be "decoded" (Buffer.from(…, "base64") silently yields garbage instead).
+  const bearer = vault.parseVaultManifest({
+    credentials: [{ name: "g", value: "isogw_raw" }],
+    bindings: [{ name: "g", hosts: ["app.example"], auth: { type: "bearer", credential: "g" } }],
+    rewrites: { "https://github.com/o/b": "https://app.example/git/github.com/o/b" },
+  });
+  assert.deepEqual(vault.cloneTarget(bearer, "https://github.com/o/b"), { url: "https://app.example/git/github.com/o/b", token: "isogw_raw" });
 });
 
 test("vaultCoversHost: exact + wildcard hosts decide whether a clone needs its own token", () => {

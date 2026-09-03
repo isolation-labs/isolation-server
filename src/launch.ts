@@ -382,7 +382,13 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
   // launch var; the values themselves go to the sidecar after the sandbox is up.
   const vault = parseVaultManifest(sealedOrInline(body.vault));
   if (vault?.env) {
-    for (const v of parseEnvConfig({ vars: Object.entries(vault.env).map(([name, value]) => ({ name, value })) }).vars) env[v.name] = v.value;
+    const vars = parseEnvConfig({ vars: Object.entries(vault.env).map(([name, value]) => ({ name, value })) }).vars;
+    // Same whole-pair discipline as applyAiCred: if the manifest routes the Anthropic pair at
+    // all, it owns ALL of it. Otherwise a manifest that sets only ANTHROPIC_BASE_URL would
+    // leave the session's CLAUDE_CODE_OAUTH_TOKEN in place and ship that RAW subscription
+    // token to the gateway slot — the exact redirection applyAiCred exists to prevent.
+    if (vars.some((v) => AI_ENV_KEYS.includes(v.name))) for (const k of AI_ENV_KEYS) delete env[k];
+    for (const v of vars) env[v.name] = v.value;
   }
 
   // The image (PLAN O4): analyze the repos' detection files host-side, hash them, and
@@ -482,9 +488,9 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
     // A ChatGPT subscription as the session's default: `codex` in a terminal must find itself
     // logged in (placeholder access token — the gateway swaps it) and pointed at the gateway.
     if (env.CODEX_SUBSCRIPTION && env.OPENAI_BASE_URL) {
-      const { codexLoginFile } = await import("./harness.js");
+      const { codexLoginFile, shq } = await import("./harness.js");
       const root = env.OPENAI_BASE_URL.replace(/\/v1\/?$/, "");
-      await run(sandbox.id, `${codexLoginFile(env.OPENAI_API_KEY ?? "isolation-vault", env.CODEX_ACCOUNT_ID ?? "")} && printf 'chatgpt_base_url = "%s"\\npreferred_auth_method = "chatgpt"\\nmodel_provider = "iso"\\n\\n[model_providers.iso]\\nname = "iso"\\nbase_url = "%s"\\nwire_api = "responses"\\nsupports_websockets = false\\nrequires_openai_auth = true\\n' ${JSON.stringify(`${root}/backend-api/`)} ${JSON.stringify(`${root}/backend-api/codex`)} > ~/.codex/config.toml`).catch((e: Error) => log(`codex login files: ${e.message}`));
+      await run(sandbox.id, `${codexLoginFile(env.OPENAI_API_KEY ?? "isolation-vault", env.CODEX_ACCOUNT_ID ?? "")} && printf 'chatgpt_base_url = "%s"\\npreferred_auth_method = "chatgpt"\\nmodel_provider = "iso"\\n\\n[model_providers.iso]\\nname = "iso"\\nbase_url = "%s"\\nwire_api = "responses"\\nsupports_websockets = false\\nrequires_openai_auth = true\\n' ${shq(`${root}/backend-api/`)} ${shq(`${root}/backend-api/codex`)} > ~/.codex/config.toml`).catch((e: Error) => log(`codex login files: ${e.message}`));
     }
 
     body.onPhase?.("cloning repositories");

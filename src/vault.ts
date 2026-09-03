@@ -172,14 +172,12 @@ export function cloneTarget(vault: VaultManifest | undefined, url: string): { ur
   const credName = binding && "credential" in binding.auth ? binding.auth.credential : undefined;
   const value = vault.credentials.find((c) => c.name === credName)?.value;
   if (!value) return { url: target };
-  let token: string | undefined;
-  try {
-    const decoded = Buffer.from(value, "base64").toString("utf8");
-    token = decoded.includes(":") ? decoded.slice(decoded.indexOf(":") + 1) : decoded;
-  } catch {
-    token = undefined;
-  }
-  return { url: target, token };
+  // hostClone feeds the token to git as the Basic PASSWORD (user `x-access-token`). A `basic`
+  // binding's value is already base64("user:token"), so unwrap it; any other scheme holds the
+  // token verbatim — decoding it would hand git silent garbage (Buffer never throws on bad b64).
+  if (binding?.auth.type !== "basic") return { url: target, token: value };
+  const decoded = Buffer.from(value, "base64").toString("utf8");
+  return { url: target, token: decoded.includes(":") ? decoded.slice(decoded.indexOf(":") + 1) : decoded };
 }
 
 const globMatch = (pattern: string, path: string): boolean => {
@@ -234,6 +232,11 @@ const summarize = (m: VaultManifest, revision: number): VaultSummary => ({
   bindings: m.bindings.map((b) => `${b.name}→${b.hosts.join(",")}`),
 });
 
+// Never let a credential VALUE ride an error message: the sidecar echoes request fragments,
+// and install failures are logged and persisted on the session record.
+const redact = (m: VaultManifest, text: string): string =>
+  m.credentials.reduce((t, c) => (c.value.length >= 8 ? t.split(c.value).join(`<${c.name}>`) : t), text);
+
 // Install (or replace) the sandbox's vault. Idempotent: a vault already present is
 // deleted first, so a resume/re-mint lands cleanly. The sidecar answers with its sanitized
 // state (names + revision, never values).
@@ -246,7 +249,9 @@ export async function installVault(sandboxId: string, manifest: VaultManifest): 
     await fetch(url, { method: "DELETE", headers });
     r = await post();
   }
-  if (!r.ok) throw new Error(`credential vault install → HTTP ${r.status}: ${(await r.text().catch(() => "")).slice(0, 200)}`);
+  // The sidecar's error body can quote the offending credential back at us, and this message
+  // is logged AND stored on the session record — scrub every value out of it first.
+  if (!r.ok) throw new Error(`credential vault install → HTTP ${r.status}: ${redact(manifest, await r.text().catch(() => "")).slice(0, 200)}`);
   const state = (await r.json().catch(() => ({}))) as { revision?: number };
   const out = summarize(manifest, Number(state.revision) || 1);
   log(`${sandboxId.slice(0, 8)}: ${out.credentials.length} credential(s), ${out.bindings.length} binding(s) (rev ${out.revision})`);

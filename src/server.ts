@@ -298,8 +298,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const vm = /^\/views\/([a-zA-Z0-9-]+)(\/(view-token|messages))?$/.exec(url);
     if (vm) {
       const [, vid, , action] = vm;
-      const tokenAction = action === "view-token";
-      if (method === "POST" && tokenAction) {
+      if (method === "POST" && action === "view-token") {
         if (!getView(vid)) return json(res, 404, { error: "unknown view" });
         return json(res, 200, { token: mintViewToken(vid) });
       }
@@ -317,7 +316,9 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
           return "error" in out ? json(res, 502, out) : json(res, 200, out);
         }
       }
-      if (method === "DELETE" && !tokenAction) {
+      // DELETE means "drop the view" and only ever applies to the bare /views/<id> —
+      // a sub-path (…/view-token, …/messages) must never fall through into it.
+      if (method === "DELETE" && !action) {
         const v = dropView(vid);
         // Best-effort: stop the view's in-sandbox server so the port frees up.
         if (v) {
@@ -355,10 +356,14 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       const text = typeof b.text === "string" ? b.text : "";
       if (!text.trim()) return json(res, 400, { error: "text required" });
       if (!v) {
-        const agentId = typeof b.agentId === "string" ? b.agentId : "";
-        if (!agentId) return json(res, 404, { error: "no such thread in this session (send agentId to start one)" });
+        const wanted = typeof b.agentId === "string" ? b.agentId.trim() : "";
+        if (!wanted) return json(res, 404, { error: "no such thread in this session (send agentId to start one)" });
+        // Resolve against THIS session's roster before scaffolding: an unknown agent would
+        // otherwise leave a dangling view (and its process) behind on every failed call.
+        const rec = listAgents(sid).find((a) => a.def.id === wanted || a.runtimeId === wanted);
+        if (!rec) return json(res, 404, { error: "no such agent in this session" });
         const { scaffoldView } = await import("./launch.js");
-        v = await scaffoldView(s.sandboxId, { type: "agent", specKey: key, agentId, label: typeof b.label === "string" ? b.label : undefined });
+        v = await scaffoldView(s.sandboxId, { type: "agent", specKey: key, agentId: rec.def.id, label: typeof b.label === "string" ? b.label : rec.def.name });
         if (!v) return json(res, 502, { error: "could not create the thread's view" });
       }
       const out = await sendMessage(v, text, typeof b.from === "string" ? b.from : "channel");

@@ -4,6 +4,8 @@
 // path); real adapters (claude-code / codex / gemini over ACP, or a CLI in the sandbox)
 // implement the SAME interface and register here. An unknown/uninstalled harness reports
 // itself rather than vanishing — the same "(not installed)" honesty as the catalog.
+import { AI_ENV_KEYS } from "./launch.js";
+
 export type HarnessId = string;
 
 export interface TurnInput {
@@ -61,7 +63,7 @@ const echo: Harness = {
 // are skipped: the sandbox IS the permission boundary. Credentials arrive as env — the agent's
 // gateway slot; the real key never enters the container (the sidecar injects it).
 const CLAUDE_INSTALL = 'command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 || (command -v iso-node >/dev/null 2>&1 && "$(dirname "$(command -v iso-node)")/npm" install -g @anthropic-ai/claude-code >/dev/null 2>&1)';
-const shq = (v: string): string => `'${v.replace(/'/g, `'\\''`)}'`;
+export const shq = (v: string): string => `'${v.replace(/'/g, `'\\''`)}'`;
 // Codex's login file for a ChatGPT subscription: the (gateway) token as the access token — the
 // gateway resolves the real OAuth — plus the account id the backend keys the plan off.
 // Codex decides "logged in" by DECODING the id token's claims (it cannot verify a signature and
@@ -82,7 +84,7 @@ export const codexAccessToken = (gatewayToken: string, accountId: string): strin
   return `${b64u(JSON.stringify({ alg: "HS256", typ: "JWT" }))}.${b64u(JSON.stringify(claims))}.${b64u("isolation")}`;
 };
 export const codexLoginFile = (accessToken: string, accountId: string): string =>
-  `mkdir -p ~/.codex && printf '%s' ${shq(JSON.stringify({ OPENAI_API_KEY: null, tokens: { id_token: codexIdToken(accountId), access_token: codexAccessToken(accessToken, accountId), refresh_token: "", account_id: accountId }, last_refresh: new Date().toISOString() }))} > ~/.codex/auth.json`;
+  `mkdir -p ~/.codex && printf '%s' ${shq(JSON.stringify({ OPENAI_API_KEY: null, tokens: { id_token: codexIdToken(accountId), access_token: codexAccessToken(accessToken, accountId), refresh_token: "", account_id: accountId }, last_refresh: new Date().toISOString() }))} > ~/.codex/auth.json && chmod 600 ~/.codex/auth.json`;
 const claudeCode: Harness = {
   id: "claude-code",
   label: "Claude Code (in the sandbox)",
@@ -104,9 +106,16 @@ const claudeCode: Harness = {
       ...(harnessSession ? ["--resume", shq(harnessSession)] : []),
       ...(agent.model ? ["--model", shq(agent.model)] : []),
     ];
+    // An agent's credential replaces the WHOLE Anthropic pair (launch.ts AI_ENV_KEYS), exactly as
+    // applyAiCred does host-side: the container already carries the SESSION's credential, and
+    // `envs` can only ADD names. A leftover CLAUDE_CODE_OAUTH_TOKEN out-ranks the agent's key while
+    // the agent's ANTHROPIC_BASE_URL redirects it — the session's raw OAuth token to the agent's
+    // gateway slot. Clear every key of the pair the agent does not set itself.
+    const unset = env && AI_ENV_KEYS.some((k) => k in env) ? AI_ENV_KEYS.filter((k) => !(k in env)).flatMap((k) => ["-u", k]) : [];
+    const exe = unset.length ? ["env", ...unset, ...args] : args;
     // IS_SANDBOX: Claude Code's own switch for "I am inside a container" — without it, skipping
     // permissions is refused for root (which the sandbox user is).
-    const r = await run(sandboxId, `${CLAUDE_INSTALL}; ${args.join(" ")}`, { cwd: "/workspace", envs: { IS_SANDBOX: "1", ...(env ?? {}) }, timeoutMs: 15 * 60_000 });
+    const r = await run(sandboxId, `${CLAUDE_INSTALL}; ${exe.join(" ")}`, { cwd: "/workspace", envs: { IS_SANDBOX: "1", ...(env ?? {}) }, timeoutMs: 15 * 60_000 });
     // `--output-format json` prints ONE object: { type: "result", result, session_id, is_error … }.
     const line = r.stdout.split("\n").reverse().find((l) => l.trim().startsWith("{"));
     let parsed: { result?: string; session_id?: string; is_error?: boolean; subtype?: string } | undefined;

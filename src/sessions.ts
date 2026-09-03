@@ -182,7 +182,20 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
       log(`${id} ready (sandbox ${out.sandbox.id.slice(0, 8)})${rec.roster?.length ? `, ${rec.roster.length} agent(s)` : ""}`);
     })
     .catch((e: Error) => {
+      // The record carries a sandboxId from onSandbox, so the failure path owes the same
+      // cleanup finishSession does: views scaffolded before the failure would otherwise stay
+      // addressable (and listed to the web) pointing at a sandbox the launch already deleted.
+      const dead = sessions[id]?.sandboxId;
       update(id, { state: "error", error: e.message, phase: undefined, viewsPending: 0 });
+      if (dead) {
+        dropViewsForSandbox(dead);
+        dropSink(dead);
+        forgetThreads(dead);
+      }
+      // The roster is registered as soon as the sandbox exists (onSandbox), so a launch that
+      // dies later must un-register it — otherwise the agents (and their credentials) stay
+      // live in memory pointing at a sandbox the launch already tore down.
+      dropSessionAgents(id);
       log(`${id} failed: ${e.message}`);
     });
   return rec;
@@ -225,6 +238,10 @@ export function sessionJson(s: SessionRecord): Record<string, unknown> {
     ...(s.origin ? { origin: s.origin } : {}),
     ...(s.workspaceName ? { workspace: { name: s.workspaceName } } : {}),
     viewsProgress: { pending: s.viewsPending ?? 0, skipped: [] },
+    // What the sidecar holds (names + revision, never values) — the caller re-mints a manifest
+    // and calls `start` again when it reads revision 0 (PLAN §5b). Without it here that
+    // contract is unreachable: nothing else surfaces the record's vault summary.
+    ...(s.vault ? { vault: s.vault } : {}),
   };
 }
 
@@ -255,7 +272,16 @@ export async function resumeSession(id: string, vaultBlob?: unknown): Promise<Se
   }
   const manifest = vaultBlob !== undefined ? parseVaultManifest(sealedOrInline(vaultBlob)) : undefined;
   if (manifest) {
-    update(id, { vault: await installVault(s.sandboxId, manifest) });
+    // Same policy as the launch (launch.ts): a manifest the sidecar won't take degrades the
+    // resume instead of killing it — but the record must then say the vault is GONE (revision
+    // 0), never keep reporting the revision of an install that no longer exists.
+    try {
+      update(id, { vault: await installVault(s.sandboxId, manifest) });
+    } catch (e) {
+      const msg = String((e as Error)?.message ?? e);
+      log(`${id}: credential vault re-install failed — continuing without it: ${msg}`);
+      update(id, { vault: { revision: 0, credentials: manifest.credentials.map((c) => c.name), bindings: [`install failed: ${msg.slice(0, 200)}`] } });
+    }
   } else if (s.vault && s.vault.revision > 0 && !(await vaultPresent(s.sandboxId))) {
     log(`${id}: credential vault lost across resume — needs a fresh manifest`);
     update(id, { vault: { ...s.vault, revision: 0 } });

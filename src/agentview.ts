@@ -1,14 +1,14 @@
 // The agent view (PLAN V2) — a doorman-served chat window onto ONE agent, the same
 // first-party pattern as the code view: the page + assets ship in dist/agent, and the
-// API bridges to the agent supervisor. An agent has ONE conversation; every view of it
-// (and the same view in N tabs) is a window onto that conversation — the page polls,
-// so windows converge. Auth (view token / cookie) happened in the doorman.
+// API bridges to the agent supervisor. A VIEW IS THE THREAD: this view's transcript lives
+// in the sandbox under its key (threads.ts), so the same view in N tabs polls one thread and
+// converges, while another view of the same agent is a separate conversation. Auth (view
+// token / cookie) happened in the doorman.
 import { readFileSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { agentForView, agentJson, sendMessage, startAgent, stopAgent, threadMessages } from "./agents.js";
-import { sessionForSandbox } from "./sessions.js";
 import type { View } from "./views.js";
 
 const AGENT_DIR = join(dirname(fileURLToPath(import.meta.url)), "agent");
