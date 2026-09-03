@@ -116,16 +116,11 @@ const codex: Harness = {
     const provider = base
       ? ["-c", "model_provider=iso", "-c", shq(`model_providers.iso={ name="iso", base_url="${base}", wire_api="responses", supports_websockets=false, env_key="OPENAI_API_KEY" }`)]
       : [];
-    // A ChatGPT subscription (direct): Codex must believe it is logged in — its auth file carries
-    // a placeholder token (the sidecar swaps the Bearer at chatgpt.com) and the real account id.
-    const login = env?.CODEX_SUBSCRIPTION
-      ? `mkdir -p ~/.codex && printf '%s' ${shq(JSON.stringify({ OPENAI_API_KEY: null, tokens: { id_token: "", access_token: "isolation-vault", refresh_token: "", account_id: env.CODEX_ACCOUNT_ID ?? "" }, last_refresh: new Date().toISOString() }))} > ~/.codex/auth.json; `
-      : "";
     const common = ["--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", ...provider, "-C", "/workspace", ...(agent.model ? ["-m", shq(agent.model)] : [])];
     const cmd = harnessSession
       ? ["codex", "exec", "resume", ...common, shq(harnessSession), shq(prompt)]
       : ["codex", "exec", ...common, shq(prompt)];
-    const r = await run(sandboxId, `${login}${cmd.join(" ")}`, { cwd: "/workspace", envs: env, timeoutMs: 15 * 60_000 });
+    const r = await run(sandboxId, cmd.join(" "), { cwd: "/workspace", envs: env, timeoutMs: 15 * 60_000 });
     // JSONL: thread.started {thread_id}; item.completed {item:{type:"agent_message", text}} — the
     // last agent message is the reply.
     let threadId: string | undefined;
