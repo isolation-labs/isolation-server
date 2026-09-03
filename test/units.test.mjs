@@ -142,6 +142,7 @@ test("parseVaultManifest: keeps well-formed credentials + bindings, drops the re
       { name: "nohost", hosts: [], auth: { type: "bearer", credential: "gh" } },
       { name: "badauth", hosts: ["h.example"], auth: { type: "passthrough" } },
       { name: "badhost", hosts: ["not a host"], auth: { type: "bearer", credential: "gh" } },
+      { name: "dotless", hosts: ["localhost"], auth: { type: "bearer", credential: "gh" } }, // the sidecar wants an FQDN
     ],
     env: { ANTHROPIC_BASE_URL: "https://cloud.example/anthropic", N: 5 },
   });

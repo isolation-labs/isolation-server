@@ -446,7 +446,16 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
     // Credentials BEFORE anything that needs the network authenticated (clones, hooks).
     if (vault) {
       body.onPhase?.("installing credentials");
-      vaultSummary = await installVault(sandbox.id, vault);
+      try {
+        vaultSummary = await installVault(sandbox.id, vault);
+      } catch (e) {
+        // A credential the sidecar won't take must not kill the launch: the session comes up
+        // without a vault (private clones and AI calls then fail visibly, on their own), and the
+        // record says so (revision 0) instead of a dead sandbox saying nothing.
+        const msg = String((e as Error)?.message ?? e);
+        log(`credential vault install failed — continuing without it: ${msg}`);
+        vaultSummary = { revision: 0, credentials: vault.credentials.map((c) => c.name), bindings: [`install failed: ${msg.slice(0, 200)}`] };
+      }
     }
 
     // Git author identity (non-secret) before clones, so hooks/commits attribute right.

@@ -60,7 +60,9 @@ export interface VaultSummary {
 
 const NAME_RE = /^[A-Za-z0-9._-]{1,128}$/;
 const HEADER_RE = /^[A-Za-z0-9!#$%&'*+\-.^_`|~]{1,128}$/;
-const HOST_RE = /^(\*\.)?[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$/;
+// The sidecar refuses anything that is not an FQDN (a bare "localhost" fails the WHOLE install),
+// so a dotless host is dropped here rather than sinking every other binding with it.
+const HOST_RE = /^(\*\.)?[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/;
 const MAX_CREDENTIALS = 64;
 const MAX_BINDINGS = 128;
 
