@@ -279,7 +279,11 @@ export async function scaffoldView(sandboxId: string, w: ViewSpec): Promise<View
   } else if (!port) {
     port = nextFree(w.type === "terminal" ? TERMINAL_PORT : DIRECTORY_PORT);
   }
-  const v = addView(sandboxId, w.type, port, { label: w.label, specKey: w.specKey, appPath, appPort, ...(w.type === "agent" && w.agentId ? { agentId: w.agentId } : {}), ...(w.type === "git" && w.dir ? { dir: w.dir } : {}), ...(w.type === "web" ? { slug: newWebSlug() } : {}) });
+  // An agent view IS a thread (threads.ts): its key names the transcript in the workspace tree, so
+  // a view created in-session without a workspace key mints one — saving the view into the
+  // workspace later keeps the same chat.
+  const specKey = w.specKey ?? (w.type === "agent" ? `agent-${randomBytes(4).toString("hex")}` : undefined);
+  const v = addView(sandboxId, w.type, port, { label: w.label, specKey, appPath, appPort, ...(w.type === "agent" && w.agentId ? { agentId: w.agentId } : {}), ...(w.type === "git" && w.dir ? { dir: w.dir } : {}), ...(w.type === "web" ? { slug: newWebSlug() } : {}) });
   await startViewProcess(sandboxId, v);
   return v;
 }

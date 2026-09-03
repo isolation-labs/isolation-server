@@ -7,7 +7,7 @@ import { readFileSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { agentJson, getAgent, listAgents, sendMessage, startAgent, stopAgent } from "./agents.js";
+import { agentForView, agentJson, sendMessage, startAgent, stopAgent, threadMessages } from "./agents.js";
 import { sessionForSandbox } from "./sessions.js";
 import type { View } from "./views.js";
 
@@ -27,26 +27,22 @@ const json = (res: ServerResponse, status: number, body: unknown): void => {
 // The view stores the roster DEFINITION id; the live record is resolved per request
 // and SCOPED TO THE VIEW'S SESSION — def ids repeat across sessions of the same
 // workspace, and a view must never read another session's conversation.
-function resolveAgent(view: View): ReturnType<typeof getAgent> {
-  const session = sessionForSandbox(view.sandboxId);
-  if (!session || !view.agentId) return undefined;
-  const rec = listAgents(session.id).find((a) => a.def.id === view.agentId || a.runtimeId === view.agentId);
-  return rec;
-}
+// (agentForView scopes by the view's SANDBOX: def ids repeat across sessions of the same
+// workspace, and a view must never read another session's agent.)
 
 export async function handleAgentView(req: IncomingMessage, res: ServerResponse, view: View, rest: string): Promise<void> {
   const method = req.method ?? "GET";
 
   if (rest.startsWith("/api/")) {
-    const rec = resolveAgent(view);
+    const rec = agentForView(view);
     if (!rec) return json(res, 404, { error: "agent not running in this session (session restarted?)" });
     try {
       if (rest === "/api/agent" && method === "GET") {
         return json(res, 200, agentJson(rec));
       }
       if (rest === "/api/messages" && method === "GET") {
-        // Full conversation + status; the page renders the tail it hasn't seen.
-        return json(res, 200, { status: rec.status, messages: rec.conversation });
+        // The THREAD this view is (threads.ts) + the agent's status; the page renders the tail it hasn't seen.
+        return json(res, 200, { status: rec.status, messages: await threadMessages(view) });
       }
       if (rest === "/api/messages" && method === "POST") {
         const chunks: Buffer[] = [];
@@ -61,7 +57,7 @@ export async function handleAgentView(req: IncomingMessage, res: ServerResponse,
           return json(res, 400, { error: "bad json" });
         }
         if (!text.trim()) return json(res, 400, { error: "text required" });
-        const out = await sendMessage(rec.runtimeId, text, "view");
+        const out = await sendMessage(view, text, "view");
         return "error" in out ? json(res, 502, out) : json(res, 200, out);
       }
       if (rest === "/api/start" && method === "POST") return json(res, 200, { ok: startAgent(rec.runtimeId) });

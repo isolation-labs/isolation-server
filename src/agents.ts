@@ -1,19 +1,19 @@
-// The agent supervisor (PLAN O5a — design in docs/O5-agents.md). A session runs N
-// independent agents; each is its OWN conversation (a Claude-session-in-Cursor), with
-// its own identity, harness, and memory. No shared room, no coordinator. Coordination +
-// management is the control plane here (list/start/stop/message/spawn) — the operations
-// the web sidebar drives and, later, the iso-mcp tools an external orchestrator calls.
+// The agent supervisor (PLAN O5a, reshaped 2026-09-03: A VIEW IS THE THREAD). A session runs N
+// independent agents — personas with a harness and a credential. A CONVERSATION is a THREAD,
+// and a thread is an agent VIEW: its stable key names the transcript, which lives in the sandbox
+// under the workspace tree (threads.ts) — many threads per agent, each one window. No shared
+// room, no coordinator. Coordination + management is the control plane here (list/start/stop/
+// spawn); talking happens per view (agentview.ts, the /views/:id/messages route).
 //
-// Memory is AGNOSTIC: each agent's conversation persists per (workspace, agent) behind a
-// store interface (local per-server file now; the workspace persistence layer — R2 /
-// workspace file / injected sink — is the multi-server backing, O5 follow-up). Stable per
-// (workspace, agent) across sessions. Harness is pluggable + agnostic (echo built-in for
-// credential-free runs; claude-code/codex/gemini adapters plug in the same interface).
+// Harness is pluggable + agnostic (echo built-in for credential-free runs; claude-code/codex/
+// goose adapters plug in the same interface).
 import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { HOME } from "./config.js";
 import { getHarness, type HarnessId } from "./harness.js";
+import { loadMemory, loadThread, saveThread } from "./threads.js";
+import type { View } from "./views.js";
 
 const log = (...a: unknown[]) => console.log("[agents]", ...a);
 const STORE = join(HOME, "agents"); // <STORE>/<workspaceId>/<agentId>.json — stable per (workspace, agent)
@@ -46,35 +46,14 @@ interface AgentRecord {
   sessionId: string;
   sandboxId?: string;
   status: AgentStatus;
-  conversation: Message[];
 }
 
 // Live agents, keyed by a session-scoped runtime id (`a-…`). The DEFINITION id is stable
 // per workspace; the runtime id is this instance in this session.
 const live = new Map<string, AgentRecord>();
 
-// --- agnostic conversation memory (per workspace, per agent) -------------------
-
-function convPath(workspaceId: string, agentDefId: string): string {
-  const dir = join(STORE, safe(workspaceId));
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  return join(dir, `${safe(agentDefId)}.json`);
-}
-const safe = (s: string): string => s.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 128) || "x";
-
-function loadConversation(workspaceId: string, agentDefId: string): Message[] {
-  try {
-    return JSON.parse(readFileSync(convPath(workspaceId, agentDefId), "utf8")) as Message[];
-  } catch {
-    return [];
-  }
-}
-function saveConversation(rec: AgentRecord): void {
-  const p = convPath(rec.workspaceId, rec.def.id);
-  const tmp = `${p}.tmp`;
-  writeFileSync(tmp, JSON.stringify(rec.conversation), { mode: 0o600 });
-  renameSync(tmp, p);
-}
+// (The old per-server conversation files under <HOME>/agents are gone: threads live in the
+// sandbox — threads.ts. STORE stays only for the legacy listing helper below.)
 
 // --- the base Isolation system prompt (framework layer) ------------------------
 
@@ -84,7 +63,7 @@ function saveConversation(rec: AgentRecord): void {
 function basePrompt(def: AgentDef): string {
   return [
     `You are "${def.name}", an autonomous agent working inside an Isolation session — an isolated container with a project checked out at /workspace.`,
-    `You are one of several independent agents on this workspace; each has its own separate conversation. You do NOT share a chat with the others.`,
+    `You are one of several independent agents on this workspace; each conversation (thread) is separate. You do NOT share a chat with the others.`,
     `You coordinate ONLY through the shared files at /workspace (git) and through the structured control plane (never by chatting at another agent).`,
     `Your own instructions follow.`,
   ].join(" ");
@@ -101,7 +80,6 @@ function newAgent(workspaceId: string, sessionId: string, sandboxId: string | un
     sessionId,
     sandboxId,
     status,
-    conversation: loadConversation(workspaceId, def.id), // re-hydrate stable memory
   };
   const runtimeId = `a-${randomBytes(5).toString("hex")}`;
   live.set(runtimeId, rec);
@@ -158,32 +136,52 @@ export function dropSessionAgents(sessionId: string): void {
 
 // --- the conversation turn ------------------------------------------------------
 
-// Send a message to ONE agent and get its reply. Boots a lazy/stopped agent (a message is
-// an implicit start). Persists the thread (agnostic memory). Independent per agent.
-export async function sendMessage(agentId: string, text: string, from = "sidebar"): Promise<{ reply: Message } | { error: string }> {
-  const id = findRuntimeId(agentId);
-  if (!id) return { error: "unknown agent" };
-  const rec = live.get(id) as AgentRecord;
+// One turn on ONE thread — the view names it. Boots a lazy/stopped agent (a message is an
+// implicit start). The transcript is read from and written to the sandbox (threads.ts); the
+// agent's memory note is prepended to its prompt. Independent per thread.
+export async function sendMessage(view: View, text: string, from = "view"): Promise<{ reply: Message } | { error: string }> {
+  const rec = agentForView(view);
+  if (!rec) return { error: "this view has no agent" };
+  if (!rec.sandboxId) return { error: "session has no sandbox yet" };
   if (rec.status !== "running") rec.status = "running"; // a message starts a lazy/stopped agent
+  const thread = await loadThread(rec.sandboxId, threadKeyOf(view), rec.def.id);
   const user: Message = { role: "user", text, ts: Date.now(), from };
-  rec.conversation.push(user);
+  thread.messages.push(user);
   try {
     const harness = getHarness(rec.def.harness);
+    const memory = await loadMemory(rec.sandboxId, rec.def.id);
     const replyText = await harness.runTurn({
-      systemPrompt: effectiveSystemPrompt(rec.def),
-      history: rec.conversation.slice(0, -1),
+      systemPrompt: `${effectiveSystemPrompt(rec.def)}${memory ? `\n\nYour memory for this workspace:\n${memory}` : ""}`,
+      history: thread.messages.slice(0, -1),
       userText: text,
       agent: { id: rec.def.id, name: rec.def.name, model: rec.def.model ?? undefined },
       sandboxId: rec.sandboxId,
     });
     const reply: Message = { role: "assistant", text: replyText, ts: Date.now() };
-    rec.conversation.push(reply);
-    saveConversation(rec);
+    thread.messages.push(reply);
+    await saveThread(rec.sandboxId, thread);
     return { reply };
   } catch (e) {
-    rec.conversation.pop(); // don't persist a user turn that errored with no reply
+    thread.messages.pop(); // don't persist a user turn that errored with no reply
     return { error: String((e as Error)?.message ?? e) };
   }
+}
+
+// The thread a view names: its workspace-level key when it has one (the same window in the next
+// session is the same chat), else the session-local view id (a chat that dies with the session).
+export const threadKeyOf = (view: View): string => view.specKey || view.id;
+
+// The agent a view is a window onto — by roster definition id or runtime id, in the view's session.
+export function agentForView(view: View): (AgentRecord & { runtimeId: string }) | undefined {
+  if (!view.agentId) return undefined;
+  return [...live.entries()].filter(([, r]) => r.sandboxId === view.sandboxId).map(([runtimeId, r]) => ({ ...r, runtimeId })).find((a) => a.def.id === view.agentId || a.runtimeId === view.agentId);
+}
+
+// A thread's transcript for the API.
+export async function threadMessages(view: View): Promise<Message[]> {
+  const rec = agentForView(view);
+  if (!rec?.sandboxId) return [];
+  return (await loadThread(rec.sandboxId, threadKeyOf(view), rec.def.id)).messages;
 }
 
 // JSON projections for the API.
@@ -196,7 +194,6 @@ export const agentJson = (r: AgentRecord & { runtimeId: string }) => ({
   npub: r.def.npub ?? null,
   lifecycle: r.def.lifecycle ?? "always",
   status: r.status,
-  messages: r.conversation.length,
 });
 
 export { STORE as AGENTS_STORE };

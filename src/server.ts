@@ -12,7 +12,7 @@ import { launch, type LaunchRequest } from "./launch.js";
 import { sinkFor, abortMerge, dropSink, saveWorkspace, syncWorkspace } from "./persistence.js";
 import { dropView, dropViewsForSandbox, getView, mintViewToken, viewsForSandbox } from "./views.js";
 import { forgetExecd, run } from "./execd.js";
-import { agentJson, getAgent, listAgents, parseRoster, sendMessage, spawnAgent, startAgent, stopAgent } from "./agents.js";
+import { agentJson, getAgent, listAgents, parseRoster, sendMessage, spawnAgent, startAgent, stopAgent, threadMessages } from "./agents.js";
 import { listHarnesses } from "./harness.js";
 import { pauseSession, resumeSession,
   createSessionView,
@@ -287,26 +287,35 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const [, agentId, , act] = ag;
     const rec = getAgent(agentId);
     if (!rec) return json(res, 404, { error: "unknown agent" });
-    if (method === "GET" && !act) return json(res, 200, { ...agentJson(rec), conversation: rec.conversation });
-    if (method === "GET" && act === "messages") return json(res, 200, { messages: rec.conversation });
-    if (method === "POST" && act === "messages") {
-      const b = await readBody(req);
-      const text = typeof b.text === "string" ? b.text : "";
-      if (!text.trim()) return json(res, 400, { error: "text required" });
-      const out = await sendMessage(agentId, text, typeof b.from === "string" ? b.from : "sidebar");
-      return "error" in out ? json(res, 502, out) : json(res, 200, out);
-    }
+    if (method === "GET" && !act) return json(res, 200, agentJson(rec));
+    // Conversations are per VIEW now (a view is the thread) — talk through /views/:id/messages.
+    if (act === "messages") return json(res, 410, { error: "conversations are per view now — use /views/<viewId>/messages" });
     if (method === "POST" && act === "start") return json(res, 200, { ok: startAgent(agentId) });
     if (method === "DELETE" && !act) return json(res, 200, { ok: stopAgent(agentId) });
   }
 
   if (url.startsWith("/views/")) {
-    const vm = /^\/views\/([a-zA-Z0-9-]+)(\/view-token)?$/.exec(url);
+    const vm = /^\/views\/([a-zA-Z0-9-]+)(\/(view-token|messages))?$/.exec(url);
     if (vm) {
-      const [, vid, tokenAction] = vm;
+      const [, vid, , action] = vm;
+      const tokenAction = action === "view-token";
       if (method === "POST" && tokenAction) {
         if (!getView(vid)) return json(res, 404, { error: "unknown view" });
         return json(res, 200, { token: mintViewToken(vid) });
+      }
+      // THE thread API (PLAN §12 v3): an agent view is a conversation. The control plane talks
+      // to it here — the cloud's channel connectors (Slack, Buzz) route a channel to ONE view.
+      if (action === "messages") {
+        const v = getView(vid);
+        if (!v || v.type !== "agent") return json(res, 404, { error: "unknown agent view" });
+        if (method === "GET") return json(res, 200, { messages: await threadMessages(v) });
+        if (method === "POST") {
+          const b = await readBody(req);
+          const text = typeof b.text === "string" ? b.text : "";
+          if (!text.trim()) return json(res, 400, { error: "text required" });
+          const out = await sendMessage(v, text, typeof b.from === "string" ? b.from : "control-plane");
+          return "error" in out ? json(res, 502, out) : json(res, 200, out);
+        }
       }
       if (method === "DELETE" && !tokenAction) {
         const v = dropView(vid);

@@ -17,6 +17,7 @@ import { dropSink, sinkFor } from "./persistence.js";
 import { dropViewsForSandbox, viewsForSandbox, type View, type ViewType } from "./views.js";
 import { dropSessionAgents, parseRoster, registerRoster, type AgentDef } from "./agents.js";
 import { installVault, parseVaultManifest, vaultPresent, type VaultSummary } from "./vault.js";
+import { forgetThreads } from "./threads.js";
 import { sealedOrInline } from "./envelope.js";
 
 const log = (...a: unknown[]) => console.log("[sessions]", ...a);
@@ -173,6 +174,7 @@ export async function finishSession(id: string): Promise<void> {
     await deleteSandbox(s.sandboxId).catch(() => undefined);
     dropViewsForSandbox(s.sandboxId);
     dropSink(s.sandboxId);
+    forgetThreads(s.sandboxId);
   }
   dropSessionAgents(id);
   delete sessions[id];
