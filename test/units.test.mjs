@@ -300,3 +300,23 @@ test("ensureEgressConfig: upgrades dns→dns+nft, adds a missing section/image, 
   assert.equal(d.changed, true);
   assert.match(d.toml, /\[egress\]\nimage = "opensandbox\/egress:v[\d.]+"\nmode = "dns\+nft"\nreadiness_timeout_seconds = 30.0\n/);
 });
+
+test("safeViewDir: a view's dir is a clean relative subtree under /workspace, never a path escape", () => {
+  assert.equal(launch.safeViewDir("api"), "api");
+  assert.equal(launch.safeViewDir("/apps/web/"), "apps/web");
+  assert.equal(launch.safeViewDir("my app/v2"), "my app/v2");
+  assert.equal(launch.safeViewDir(""), undefined);
+  assert.equal(launch.safeViewDir("/"), undefined);
+  assert.equal(launch.safeViewDir(undefined), undefined);
+  assert.equal(launch.safeViewDir("../etc"), undefined);
+  assert.equal(launch.safeViewDir("a/../b"), undefined);
+  assert.equal(launch.safeViewDir('x"; rm -rf /'), undefined);
+  assert.equal(launch.safeViewDir("$(id)"), undefined);
+});
+
+test("sanitizeStyle: theme keys/values are whitelisted and bounded; garbage yields nothing", () => {
+  const s = launch.sanitizeStyle({ theme: { background: "#0b0d10", bogus: "x", foreground: 'a"b' }, fontSize: 500, fontFamily: "JetBrains Mono, monospace", extra: 1 });
+  assert.deepEqual(s, { theme: { background: "#0b0d10" }, fontSize: 64, fontFamily: "JetBrains Mono, monospace" });
+  assert.equal(launch.sanitizeStyle("nope"), undefined);
+  assert.equal(launch.sanitizeStyle({ theme: { bogus: "x" } }), undefined);
+});

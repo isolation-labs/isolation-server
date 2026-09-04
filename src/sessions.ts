@@ -92,7 +92,7 @@ export interface DaemonLaunchBody {
   workspace?: {
     name?: string;
     repos?: { url?: string; dir?: string; branch?: string }[];
-    defaultViews?: Record<string, { type?: string; label?: string; dir?: string; url?: string; port?: number; agentId?: string }>;
+    defaultViews?: Record<string, { type?: string; label?: string; dir?: string; command?: string; url?: string; port?: number; agentId?: string }>;
     gitIdentity?: { name?: string; email?: string };
   };
   workspaceId?: string;
@@ -120,7 +120,7 @@ function viewSpecsFrom(body: DaemonLaunchBody): ViewSpec[] {
     // An agent view without a roster binding is unsatisfiable — skip rather than
     // minting a dead window (the roster may have been edited under the layout).
     if (v.type === "agent" && !v.agentId) continue;
-    specs.push({ type: v.type as ViewType, label: v.label, specKey: key, url: v.url, port: v.port, agentId: v.agentId });
+    specs.push({ type: v.type as ViewType, label: v.label, specKey: key, url: v.url, port: v.port, agentId: v.agentId, dir: v.dir, command: v.command });
   }
   // A workspace with no declared views still gets a terminal — the daemon's default.
   if (!specs.length) specs.push({ type: "terminal" });
@@ -296,9 +296,10 @@ export function viewJson(v: View, sessionId: string): Record<string, unknown> {
     id: v.id,
     sessionId,
     type: v.type,
-    target: { port: v.port, ...(v.type === "directory" ? { dir: "/" } : {}), ...(v.type === "agent" && v.agentId ? { agentId: v.agentId } : {}), ...(v.type === "web" ? { appPort: v.appPort ?? v.port, ...(v.appPath ? { appPath: v.appPath } : {}), url: webUrl(v) } : {}) },
+    target: { port: v.port, ...(v.dir ? { dir: v.dir } : v.type === "directory" ? { dir: "/" } : {}), ...(v.command ? { command: v.command } : {}), ...(v.type === "agent" && v.agentId ? { agentId: v.agentId } : {}), ...(v.type === "web" ? { appPort: v.appPort ?? v.port, ...(v.appPath ? { appPath: v.appPath } : {}), url: webUrl(v) } : {}) },
     ...(v.label ? { label: v.label } : {}),
     ...(v.specKey ? { specKey: v.specKey } : {}),
+    ...(v.style ? { style: v.style } : {}),
   };
 }
 

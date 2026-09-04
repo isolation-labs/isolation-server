@@ -8,9 +8,9 @@ import { HOST, PORT, getName, getPairing, getToken, isLoopbackOrigin, originAllo
 import { beatOffline, detach, pairingStatus, startHeartbeat } from "./heartbeat.js";
 import { deleteSandbox, getSandbox, listSandboxes, osbHealthy, pauseSandbox, resumeSandbox, sandboxLogs } from "./opensandbox.js";
 import { handlePublicWebRequest, handlePublicWebUpgrade, handleViewRequest, handleViewUpgrade, invalidateEndpoints } from "./doorman.js";
-import { launch, type LaunchRequest } from "./launch.js";
+import { launch, restartTerminal, sanitizeStyle, type LaunchRequest } from "./launch.js";
 import { sinkFor, abortMerge, dropSink, saveWorkspace, syncWorkspace } from "./persistence.js";
-import { dropView, dropViewsForSandbox, getView, mintViewToken, viewsForSandbox } from "./views.js";
+import { dropView, dropViewsForSandbox, getView, mintViewToken, updateView, viewsForSandbox, type View } from "./views.js";
 import { forgetExecd, run } from "./execd.js";
 import { agentJson, getAgent, listAgents, parseRoster, spawnAgent, startAgent, stopAgent } from "./agents.js";
 import { bridgePattern, connectorTurn, syncViewsFile } from "./acpview.js";
@@ -415,6 +415,9 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
           url: typeof b.url === "string" ? b.url : undefined,
           label: typeof b.label === "string" ? b.label : undefined,
           specKey: typeof b.specKey === "string" ? b.specKey : undefined,
+          dir: typeof b.dir === "string" ? b.dir : undefined,
+          command: typeof b.command === "string" ? b.command : undefined,
+          style: b.style,
           agentId,
         });
         if (!v) return json(res, 400, { error: "view spec not satisfiable" });
@@ -484,6 +487,32 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     }
   }
   // Nested session paths (/sessions/:id/agents/approvals, /files/…, /views/:vid/…).
+  // PATCH a live view in place (the daemon contract the web speaks): `label` renames (any type,
+  // nothing restarts); `style` re-themes a terminal — ttyd restarts over the same tmux session,
+  // so id/port/URL are unchanged and the caller just reloads the iframe.
+  const pv = /^\/sessions\/(s-[a-z0-9]+)\/views\/([a-zA-Z0-9-]+)$/.exec(url);
+  if (pv && method === "PATCH") {
+    const [, id, vid] = pv;
+    const s = getSessionRecord(id);
+    const v = getView(vid);
+    if (!s || !v || v.sandboxId !== s.sandboxId) return json(res, 404, { error: "unknown view" });
+    const b = await readBody(req);
+    const restyling = "style" in b;
+    if (restyling && v.type !== "terminal") return json(res, 400, { error: "only terminal views can be restyled" });
+    const patch: Partial<Pick<View, "label" | "style">> = {};
+    if (typeof b.label === "string") patch.label = b.label.trim() || undefined;
+    if (restyling) patch.style = sanitizeStyle(b.style);
+    const nv = updateView(vid, patch) ?? v;
+    if (restyling) {
+      try {
+        await restartTerminal(nv);
+      } catch (e) {
+        return json(res, 500, { error: `failed to restyle terminal: ${(e as Error).message}` });
+      }
+    }
+    return json(res, 200, viewJson(nv, id));
+  }
+
   const nested = /^\/sessions\/(s-[a-z0-9]+)\/(.+)$/.exec(url);
   if (nested) {
     const sub = nested[2];

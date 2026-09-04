@@ -12,7 +12,7 @@ import { analyzeLaunch, cleanScratch, fetchDetectionFiles, type AnalysisRepo, ty
 import { cacheKey, dependencyHash, workspaceHash } from "./hashes.js";
 import { buildDependencyCacheInBackground, cacheImageAvailable, cacheImageTag, reposWithDeps } from "./cache.js";
 import { dockerAvailable, ensureSpecImage, type ImageRegistry } from "./images.js";
-import { addView, mintViewToken, newWebSlug, viewsForSandbox, type View, type ViewType } from "./views.js";
+import { addView, type TerminalStyle, mintViewToken, newWebSlug, viewsForSandbox, type View, type ViewType } from "./views.js";
 import { cloneTarget, installVault, parseVaultManifest, sidecarCreateSpec, vaultCoversHost, type VaultManifest, type VaultSummary } from "./vault.js";
 import { startAgentBridge, syncViewsFile } from "./acpview.js";
 
@@ -240,6 +240,59 @@ export interface ViewSpec {
   label?: string;
   specKey?: string;
   agentId?: string; // agent views: the roster definition id
+  dir?: string; // terminal/directory: subtree under /workspace (cwd / browse root)
+  command?: string; // terminal: run this on creation (the workspace's "npm run dev")
+  style?: unknown; // terminal: the user's terminal appearance (TerminalStyle, whitelisted here)
+}
+
+// The xterm.js theme keys we forward (the standard palette). `style` arrives from a request
+// body, so every field is type-checked and bounded — nothing outside this set reaches ttyd.
+const THEME_KEYS = new Set([
+  "background", "foreground", "cursor", "cursorAccent", "selectionBackground",
+  "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+  "brightBlack", "brightRed", "brightGreen", "brightYellow",
+  "brightBlue", "brightMagenta", "brightCyan", "brightWhite",
+]);
+
+export function sanitizeStyle(style: unknown): TerminalStyle | undefined {
+  if (!style || typeof style !== "object") return undefined;
+  const s = style as Record<string, unknown>;
+  const out: TerminalStyle = {};
+  if (s.theme && typeof s.theme === "object") {
+    const theme: Record<string, string> = {};
+    for (const [k, v] of Object.entries(s.theme as Record<string, unknown>)) {
+      if (THEME_KEYS.has(k) && typeof v === "string" && v.length <= 64 && !/[\x00-\x1f"\\]/.test(v)) theme[k] = v;
+    }
+    if (Object.keys(theme).length) out.theme = theme;
+  }
+  if (typeof s.fontSize === "number" && Number.isFinite(s.fontSize)) out.fontSize = Math.min(64, Math.max(6, Math.round(s.fontSize)));
+  if (typeof s.fontFamily === "string" && s.fontFamily.length > 0 && s.fontFamily.length <= 200 && !/[\x00-\x1f]/.test(s.fontFamily)) out.fontFamily = s.fontFamily;
+  return Object.keys(out).length ? out : undefined;
+}
+
+// ttyd `-t KEY=VALUE` client options for a style. The values ride the process env and are
+// expanded inside double quotes — never spliced into the command line — so a theme's JSON
+// (quotes, braces, `#`) needs no shell escaping and can't smuggle extra flags.
+function ttydStyleArgs(style: TerminalStyle | undefined): { args: string; envs: Record<string, string> } {
+  if (!style) return { args: "", envs: {} };
+  const parts: string[] = [];
+  const envs: Record<string, string> = {};
+  if (style.theme) { parts.push('-t "theme=$ISO_TT_THEME"'); envs.ISO_TT_THEME = JSON.stringify(style.theme); }
+  if (style.fontSize) parts.push(`-t fontSize=${style.fontSize}`);
+  if (style.fontFamily) { parts.push('-t "fontFamily=$ISO_TT_FONT"'); envs.ISO_TT_FONT = style.fontFamily; }
+  return { args: parts.length ? ` ${parts.join(" ")}` : "", envs };
+}
+
+// A view's `dir` is a RELATIVE subtree under /workspace, spliced into shell command lines
+// (ttyd's cwd, filebrowser's root) — so it is whitelisted to a plain path charset and can never
+// climb out of the workspace. Anything else is treated as "no dir" (the workspace root).
+export function safeViewDir(dir: unknown): string | undefined {
+  if (typeof dir !== "string") return undefined;
+  const d = dir.trim().replace(/^\/+|\/+$/g, "");
+  if (!d || d === "/" ) return undefined;
+  if (!/^[A-Za-z0-9._@+ -]+(\/[A-Za-z0-9._@+ -]+)*$/.test(d)) return undefined;
+  if (d.split("/").some((seg) => seg === "." || seg === "..")) return undefined;
+  return d;
 }
 
 // Create one view (registry entry + in-sandbox process). Shared by launch scaffolding
@@ -287,7 +340,20 @@ export async function scaffoldView(sandboxId: string, w: ViewSpec): Promise<View
   // a view created in-session without a workspace key mints one — saving the view into the
   // workspace later keeps the same chat.
   const specKey = w.specKey ?? (w.type === "agent" ? `agent-${randomBytes(4).toString("hex")}` : undefined);
-  const v = addView(sandboxId, w.type, port, { label: w.label, specKey, appPath, appPort, ...(w.type === "agent" && w.agentId ? { agentId: w.agentId } : {}), ...(w.type === "web" ? { slug: newWebSlug() } : {}) });
+  const dir = w.type === "terminal" || w.type === "directory" ? safeViewDir(w.dir) : undefined;
+  const command = w.type === "terminal" && typeof w.command === "string" && w.command.trim() ? w.command.trim() : undefined;
+  const style = w.type === "terminal" ? sanitizeStyle(w.style) : undefined;
+  const v = addView(sandboxId, w.type, port, {
+    label: w.label,
+    specKey,
+    appPath,
+    appPort,
+    ...(dir ? { dir } : {}),
+    ...(command ? { command } : {}),
+    ...(style ? { style } : {}),
+    ...(w.type === "agent" && w.agentId ? { agentId: w.agentId } : {}),
+    ...(w.type === "web" ? { slug: newWebSlug() } : {}),
+  });
   await startViewProcess(sandboxId, v);
   await syncViewsFile(sandboxId);
   return v;
@@ -302,8 +368,24 @@ async function startViewProcess(sandboxId: string, view: View): Promise<void> {
   // execd's background mode owns each process's lifetime — no nohup/& wrappers (a
   // shell that exits immediately takes its children with it).
   if (view.type === "terminal") {
-    await run(sandboxId, `ttyd --writable -p ${view.port} tmux new -A -s iso-view-${view.id}`, {
+    // The tmux session is created HERE, at view creation — in the view's `dir` and with its
+    // `command` typed in — not lazily by the first browser tab: a declared dev server must
+    // come up whether or not a human ever opens the terminal (the web view depends on it).
+    // `window-size latest` re-fits the detached 80×24 pane to the first client that attaches.
+    // The command rides the env (never spliced into the line) and is typed literally (`-l`).
+    // ttyd then attaches every tab to that one session; its own cwd is the dir too, so a
+    // `new -A` fallback (tmux server gone) still lands in the right place.
+    const s = `iso-view-${view.id}`;
+    const dir = view.dir ? `/workspace/${view.dir}` : "/workspace";
+    const tt = ttydStyleArgs(view.style);
+    const script =
+      `c="$ISO_VIEW_CMD"; unset ISO_VIEW_CMD; cd "${dir}" 2>/dev/null || cd /workspace; ` +
+      `if ! tmux has-session -t ${s} 2>/dev/null; then tmux new-session -d -s ${s} -c "$PWD"; tmux set-option -t ${s} window-size latest; ` +
+      `if [ -n "$c" ]; then tmux send-keys -t ${s} -l "$c"; tmux send-keys -t ${s} Enter; fi; fi; ` +
+      `exec ttyd --writable -p ${view.port}${tt.args} tmux new -A -s ${s}`;
+    await run(sandboxId, script, {
       cwd: "/workspace",
+      envs: { ISO_VIEW_CMD: view.command ?? "", ...tt.envs },
       background: true,
     });
   } else if (view.type === "web" && view.appPort) {
@@ -317,10 +399,19 @@ async function startViewProcess(sandboxId: string, view: View): Promise<void> {
     // the doorman forwards the UNSTRIPPED path for directory views to match.
     await run(
       sandboxId,
-      `filebrowser --noauth -r /workspace -a 0.0.0.0 -p ${view.port} -b /v/${view.id} -d /tmp/.iso-fb-${view.id}.db`,
+      `filebrowser --noauth -r "${view.dir ? `/workspace/${view.dir}` : "/workspace"}" -a 0.0.0.0 -p ${view.port} -b /v/${view.id} -d /tmp/.iso-fb-${view.id}.db`,
       { cwd: "/workspace", background: true },
     );
   }
+}
+
+// Restart a terminal's ttyd over its existing tmux session (restyle): the shell, its
+// scrollback and any running process survive — only the front changes. The kill is AWAITED
+// so the new ttyd doesn't race the old one for the port.
+export async function restartTerminal(view: View): Promise<void> {
+  if (view.type !== "terminal") return;
+  await run(view.sandboxId, `pkill -f ${JSON.stringify(`ttyd .*-p ${view.port} `)} || true`).catch(() => undefined);
+  await startViewProcess(view.sandboxId, view);
 }
 
 // Dual-stack loopback forwarder: 0.0.0.0:<shadow> → 127.0.0.1 or [::1]:<appPort>, whichever
