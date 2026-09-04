@@ -82,6 +82,9 @@ export async function startAgentBridge(view: View): Promise<void> {
     command: m.command,
     args: m.args,
     env: m.env,
+    // The container env carries the SESSION's credential; an agent with its own must not
+    // inherit the other half of the pair (harness.ts `unsetFor`).
+    unsetEnv: m.unsetEnv ?? [],
     cwd: WORKSPACE,
     home,
     sessionId,
@@ -94,6 +97,11 @@ export async function startAgentBridge(view: View): Promise<void> {
   await writeFile(view.sandboxId, BRIDGE_PATH, BRIDGE_SRC, 0o644);
   await writeFile(view.sandboxId, MCP_PATH, MCP_SRC, 0o644);
   await writeFile(view.sandboxId, MCP_WRAPPER, MCP_WRAPPER_SRC, 0o755);
+  // The agent's HOME is under the workspace tree so the conversation persists — and that tree is
+  // committed and bundled to R2. Credential material must never ride it, so the HOME carries its
+  // own .gitignore, written BEFORE the harness's files: git honours a nested .gitignore whether
+  // or not it is tracked, and `git add -A`/`git clean -fd` both respect it.
+  await writeFile(view.sandboxId, `${home}/.gitignore`, `${["# isolation: harness credential material — never persisted (secrets never in bundles/git)", ...(m.secretPaths ?? []).map((p) => `/${p.replace(/^\/+/, "")}`)].join("\n")}\n`, 0o600);
   for (const f of m.files) await writeFile(view.sandboxId, f.path, f.content, f.mode ?? 0o600);
   await writeFile(view.sandboxId, cfgPath, JSON.stringify(config), 0o600);
   await run(view.sandboxId, `mkdir -p ${JSON.stringify(home)} ${JSON.stringify(dirname(threadPath(key)))}; pkill -f ${JSON.stringify(bridgePattern(view))} || true`).catch(() => undefined);
@@ -109,18 +117,37 @@ export async function stopAgentBridge(view: View): Promise<void> {
 // The bridge's own health endpoint, through execd's proxy — what the doorman checks before it
 // upgrades a page's WebSocket (execd answers a dead port with a 502 RESPONSE, which the proxy
 // relays silently; without this the page would retry forever against nothing).
+// The port alone is NOT identity: view ports are recycled (nextFree only avoids LIVE views), so a
+// bridge left behind by a deleted view can still hold this one's port. It answers /health quite
+// happily — and proxying to it would front another agent's thread. Health means "the bridge for
+// THIS view", so the answer must name the view; anything else is treated as dead and replaced.
 export async function bridgeHealthy(view: View): Promise<boolean> {
   try {
     const ep = await endpointFor(view.sandboxId, view.port);
     const r = await fetch(`http://${ep.host}${ep.basePath}/health`, { signal: AbortSignal.timeout(3_000) });
-    return r.ok;
+    if (!r.ok) return false;
+    const body = (await r.json().catch(() => ({}))) as { viewId?: unknown };
+    return body.viewId === view.id;
   } catch {
     return false;
   }
 }
 
 // Make sure a bridge answers: restart it when it doesn't, and wait (briefly) for it to bind.
-export async function ensureBridge(view: View): Promise<boolean> {
+// ONE heal in flight per view (the doorman's reconnects and a connector turn can arrive
+// together) — concurrent callers share the attempt instead of racing pkill/start against
+// each other and killing the bridge the other just started.
+const heals = new Map<string, Promise<boolean>>();
+export function ensureBridge(view: View): Promise<boolean> {
+  let p = heals.get(view.id);
+  if (!p) {
+    p = healBridge(view).finally(() => heals.delete(view.id));
+    heals.set(view.id, p);
+  }
+  return p;
+}
+
+async function healBridge(view: View): Promise<boolean> {
   if (await bridgeHealthy(view)) return true;
   log(`${view.id}: bridge not answering — restarting`);
   await startAgentBridge(view);
@@ -153,6 +180,10 @@ export async function syncViewsFile(sandboxId: string): Promise<void> {
 // text back — the same shape the old per-turn runner returned, so the routes stay.
 export async function connectorTurn(view: View, text: string, from = "control-plane"): Promise<{ reply: Message } | { error: string }> {
   if (!view.port) return { error: "this agent view has no bridge" };
+  // Same pre-flight as the doorman's WebSocket upgrade: a bridge that was just scaffolded has
+  // not necessarily bound yet, and one lost to a crash/restart would answer with execd's 502.
+  // A connector turn has no page to retry for it, so heal (and wait) before prompting.
+  if (!(await ensureBridge(view))) return { error: "the agent's bridge is not running" };
   let ep: { host: string; basePath: string };
   try {
     ep = await endpointFor(view.sandboxId, view.port);

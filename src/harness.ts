@@ -21,8 +21,17 @@ export interface Materialized {
   command: string;
   args: string[];
   env: Record<string, string>;
+  // Env names the adapter must NOT inherit from the container (see `unsetFor` below). The
+  // bridge deletes these from the inherited environment before applying `env`.
+  unsetEnv?: string[];
   files: { path: string; content: string; mode?: number }[];
   initialModeId?: string; // an ACP session mode to select right after session/new, when offered
+  // HOME-relative paths holding CREDENTIAL material — ours or the harness's own (it may write
+  // its login file at runtime). The agent's HOME lives under the workspace tree so the
+  // conversation persists, and that tree is committed + bundled to R2: these must never ride
+  // it (the invariant — secrets never in bundles/git). acpview.ts turns them into a
+  // `.gitignore` inside the HOME before any of them can exist.
+  secretPaths?: string[];
 }
 
 export interface Harness {
@@ -50,6 +59,18 @@ const instructions = (persona: string): string =>
   ].join("\n");
 
 const envList = (env: Record<string, string>): { name: string; value: string }[] => Object.entries(env).map(([name, value]) => ({ name, value }));
+
+// The container's env already carries the SESSION's credential (launch.ts applyAiCred + the
+// vault's routing env). An agent with its OWN credential replaces the WHOLE pair, exactly as
+// applyAiCred does host-side: every var of the pair the harness does not set itself must be
+// UNSET for the adapter, or a leftover out-ranks or redirects it. Hard-learned: a leftover
+// CLAUDE_CODE_OAUTH_TOKEN wins over the agent's ANTHROPIC_API_KEY while the agent's
+// ANTHROPIC_BASE_URL still applies — the session's raw OAuth token, shipped to the agent's
+// gateway slot; a leftover OPENAI_API_KEY flips codex out of ChatGPT mode and straight to
+// api.openai.com, past the gateway entirely. Partial application is worse than none.
+const ANTHROPIC_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN"];
+const OPENAI_ENV = ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_HOST", "OPENAI_BASE_PATH", "CODEX_API_KEY", "CODEX_SUBSCRIPTION", "CODEX_ACCOUNT_ID", "CODEX_HOME"];
+const unsetFor = (keys: string[], set: Record<string, string>): string[] => keys.filter((k) => !(k in set));
 
 // --- Codex login/config (a ChatGPT subscription through the gateway) --------------------
 
@@ -112,6 +133,7 @@ const claudeCode: Harness = {
       command: "claude-agent-acp",
       args: [],
       env,
+      unsetEnv: credential ? unsetFor(ANTHROPIC_ENV, env) : [],
       files: [
         { path: `${home}/.claude/CLAUDE.md`, content: instructions(persona), mode: 0o600 },
         { path: `${home}/.claude/settings.json`, content: JSON.stringify({ permissions: { defaultMode: "bypassPermissions" } }, null, 2), mode: 0o600 },
@@ -119,6 +141,8 @@ const claudeCode: Harness = {
         { path: `${home}/.claude.json`, content: JSON.stringify({ hasCompletedOnboarding: true, theme: "dark" }), mode: 0o600 },
       ],
       initialModeId: "bypassPermissions",
+      // The credential rides env here, but the CLI writes its own login file if it ever logs in.
+      secretPaths: [".claude/.credentials.json"],
     };
   },
 };
@@ -148,7 +172,7 @@ const codex: Harness = {
       env.OPENAI_API_KEY = credential.token;
       env.CODEX_API_KEY = credential.token;
     }
-    return { command: "codex-acp", args: [], env, files };
+    return { command: "codex-acp", args: [], env, unsetEnv: credential ? unsetFor(OPENAI_ENV, env) : [], files, secretPaths: [".codex/auth.json"] };
   },
 };
 
@@ -202,10 +226,13 @@ const goose: Harness = {
       command: "goose",
       args: ["acp"],
       env,
+      unsetEnv: credential ? unsetFor(OPENAI_ENV, env) : [],
       files: [
         { path: `${home}/.config/goose/config.yaml`, content: yaml, mode: 0o600 },
         { path: `${home}/.config/goose/.goosehints`, content: instructions(persona), mode: 0o600 },
       ],
+      // No keyring in a container: goose spills whatever it is asked to remember here.
+      secretPaths: [".config/goose/secrets.yaml"],
     };
   },
 };

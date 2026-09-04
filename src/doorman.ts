@@ -157,7 +157,7 @@ export async function handleViewUpgrade(req: IncomingMessage, socket: Duplex, he
     // execd answers a dead port with a 502 RESPONSE the proxy would relay silently — so the
     // bridge is checked (and restarted, one attempt at a time per view) BEFORE the upgrade.
     // The bridge reloads the harness session from the thread file, so nothing is lost.
-    if (view.type === "agent" && !(await healBridge(view))) {
+    if (view.type === "agent" && !(await ensureBridge(view))) {
       socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
       socket.destroy();
       return;
@@ -169,17 +169,6 @@ export async function handleViewUpgrade(req: IncomingMessage, socket: Duplex, he
     targets.delete(`${view.sandboxId}:${view.port}`);
     socket.destroy();
   }
-}
-
-// One heal in flight per view: concurrent reconnects share it instead of racing restarts.
-const bridgeHeals = new Map<string, Promise<boolean>>();
-function healBridge(view: View): Promise<boolean> {
-  let p = bridgeHeals.get(view.id);
-  if (!p) {
-    p = ensureBridge(view).finally(() => bridgeHeals.delete(view.id));
-    bridgeHeals.set(view.id, p);
-  }
-  return p;
 }
 
 // --- The public web plane (sandbox hostnames) -----------------------------------

@@ -113,6 +113,32 @@ test("harness materializers: claude-code / codex / goose shape their HOME + env 
   assert.equal(g.env.GOOSE_DISABLE_KEYRING, "1");
   const yaml = g.files.find((f) => f.path === "/h/.config/goose/config.yaml").content;
   assert.ok(yaml.includes("active_provider: openai") && yaml.includes("  isolation:") && yaml.includes('cmd: "/tmp/.iso-mcp.sh"'));
+
+  // The HOME lives under the workspace tree (the conversation persists to R2) — so every file
+  // holding credential material must be declared, and none of them may be a file the harness
+  // ALSO needs persisted. The invariant: secrets never in bundles/git.
+  for (const [id, m] of [["claude-code", claude], ["codex", codexSub], ["goose", g]]) {
+    assert.ok(m.secretPaths?.length, `${id} declares its credential material`);
+    for (const p of m.secretPaths) assert.ok(!p.startsWith("/") && !p.includes(".."), `${id}: ${p} is HOME-relative`);
+  }
+  assert.ok(codexSub.secretPaths.includes(".codex/auth.json"), "codex's minted login file never rides persistence");
+
+  // An agent's own credential replaces the WHOLE pair: every var of it the harness does not
+  // set itself must be unset for the adapter, or the SESSION's credential (already in the
+  // container env) out-ranks or redirects it.
+  const covers = (m, keys) => {
+    for (const k of keys) assert.ok(k in m.env || m.unsetEnv.includes(k), `${k} is neither set nor unset`);
+  };
+  covers(claude, ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN"]);
+  assert.ok(claude.unsetEnv.includes("CLAUDE_CODE_OAUTH_TOKEN"), "a session OAuth token never rides the agent's slot");
+  covers(codexSub, ["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY"]);
+  assert.ok(codexSub.unsetEnv.includes("OPENAI_API_KEY"), "a leftover key would flip codex out of ChatGPT mode");
+  covers(codexKey, ["OPENAI_API_KEY", "OPENAI_BASE_URL"]);
+  covers(g, ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_HOST"]);
+
+  // No credential = the session's own env is the deliberate fallback: nothing is stripped.
+  const bare = harness.getHarness("claude-code").materialize({ home: "/h", agent: { id: "e", name: "E" }, persona: "p", mcp });
+  assert.deepEqual(bare.unsetEnv, []);
 });
 
 test("unknown harness reports itself instead of crashing", async () => {

@@ -26,6 +26,11 @@ function on(m) {
   if (m.method === "session/set_mode") return send({ jsonrpc: "2.0", id: m.id, result: {} });
   if (m.method === "session/prompt") {
     const text = m.params.prompt.map((b) => b.text).join("");
+    if (text.startsWith("env:")) {
+      const name = text.slice(4);
+      send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "sess-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: name + "=" + (process.env[name] ?? "<unset>") } } } });
+      return send({ jsonrpc: "2.0", id: m.id, result: { stopReason: "end_turn" } });
+    }
     send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "sess-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "echo:" } } } });
     setTimeout(() => { send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "sess-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } } }); send({ jsonrpc: "2.0", id: m.id, result: { stopReason: "end_turn" } }); }, 150);
     return;
@@ -43,7 +48,7 @@ const freePort = () =>
     });
   });
 
-async function startBridge(extra = {}) {
+async function startBridge(extra = {}, procEnv = {}) {
   const dir = mkdtempSync(join(tmpdir(), "iso-bridge-"));
   const agentPath = join(dir, "agent.mjs");
   writeFileSync(agentPath, FAKE_AGENT);
@@ -51,7 +56,7 @@ async function startBridge(extra = {}) {
   const cfg = { viewId: "v-test", threadKey: "t1", agent: { id: "a1", name: "Fake", harness: "fake", model: null }, command: process.execPath, args: [agentPath], env: {}, cwd: dir, home: dir, statePath: join(dir, "thread.json"), mcpServers: [], initialModeId: "yolo", idleMinutes: 5, ...extra };
   const cfgPath = join(dir, "cfg.json");
   writeFileSync(cfgPath, JSON.stringify(cfg));
-  const proc = spawn(process.execPath, [BRIDGE, String(port), cfgPath], { stdio: ["ignore", "ignore", "pipe"] });
+  const proc = spawn(process.execPath, [BRIDGE, String(port), cfgPath], { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, ...procEnv } });
   let logs = "";
   proc.stderr.on("data", (d) => (logs += d));
   for (let i = 0; i < 50; i++) {
@@ -172,6 +177,48 @@ test("bridge: a known session id is reloaded (session/load replay refills the bu
     assert.deepEqual(chunks(h.params.updates.map((u) => ({ method: u.method, params: u.params }))), ["replayed"]);
     a.close();
     late.close();
+  } finally {
+    b.stop();
+  }
+});
+
+// The container's env carries the SESSION's credential; an agent with its own must not inherit
+// the half of the pair its harness does not set, or the leftover out-ranks or redirects it
+// (harness.ts `unsetFor`). The adapter is spawned by the bridge, so the bridge is where it lands.
+test("bridge: unsetEnv strips the session's leftovers from the adapter's environment", async () => {
+  const b = await startBridge({ env: { ANTHROPIC_API_KEY: "agent-key" }, unsetEnv: ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN"] }, { CLAUDE_CODE_OAUTH_TOKEN: "session-oauth", ANTHROPIC_AUTH_TOKEN: "session-auth" });
+  try {
+    const a = client(b.port);
+    await a.open;
+    await a.until((m) => m.method === "_iso/session");
+    const ask = async (name, id) => {
+      a.send({ jsonrpc: "2.0", id, method: "session/prompt", params: { prompt: [{ type: "text", text: `env:${name}` }] } });
+      await a.until((m) => m.id === id);
+      return a.got.filter((m) => m.method === "session/update" && m.params.update.sessionUpdate === "agent_message_chunk").at(-1).params.update.content.text;
+    };
+    assert.equal(await ask("CLAUDE_CODE_OAUTH_TOKEN", 11), "CLAUDE_CODE_OAUTH_TOKEN=<unset>");
+    assert.equal(await ask("ANTHROPIC_AUTH_TOKEN", 12), "ANTHROPIC_AUTH_TOKEN=<unset>");
+    assert.equal(await ask("ANTHROPIC_API_KEY", 13), "ANTHROPIC_API_KEY=agent-key", "the harness's own value still lands");
+    a.close();
+  } finally {
+    b.stop();
+  }
+});
+
+// An adapter that isn't installed in the image: spawn emits 'error' and 'close' but never
+// 'exit', so nothing would reject the `initialize` that gates the start — the window would sit
+// at "starting" for good. The page must be told instead.
+test("bridge: an adapter that cannot spawn fails the start instead of hanging", async () => {
+  const b = await startBridge({ command: "iso-definitely-not-installed", args: [] });
+  try {
+    const a = client(b.port);
+    await a.open;
+    await a.until((m) => m.method === "_iso/hello");
+    const err = await a.until((m) => m.method === "_iso/status" && m.params.phase === "error", 8000);
+    assert.match(err.params.error, /spawn/i);
+    const h = await (await fetch(`http://127.0.0.1:${b.port}/health`)).json();
+    assert.equal(h.alive, false, "the bridge itself stays up so the view can report the failure");
+    a.close();
   } finally {
     b.stop();
   }

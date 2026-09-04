@@ -12,8 +12,8 @@
 //
 //   iso-node iso-acp-bridge.mjs <port> <config.json>
 //
-// config: { viewId, threadKey, agent:{id,name,harness,model}, command, args, env, cwd, home,
-//           sessionId?, statePath, mcpServers, initialModeId?, idleMinutes? }
+// config: { viewId, threadKey, agent:{id,name,harness,model}, command, args, env, unsetEnv?,
+//           cwd, home, sessionId?, statePath, mcpServers, initialModeId?, idleMinutes? }
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -113,7 +113,12 @@ function ensureAgent() {
 async function start() {
   lastError = "";
   setPhase("starting");
-  const env = { ...process.env, ...(cfg.env ?? {}), HOME: cfg.home };
+  // The container's env carries the SESSION's credential. `unsetEnv` names the vars this
+  // agent's own credential replaces but does not set — dropped from the INHERITED env before
+  // the harness's own values land, so a leftover can never out-rank or redirect them.
+  const env = { ...process.env };
+  for (const k of Array.isArray(cfg.unsetEnv) ? cfg.unsetEnv : []) delete env[k];
+  Object.assign(env, cfg.env ?? {}, { HOME: cfg.home });
   log(`spawning ${cfg.command} ${(cfg.args ?? []).join(" ")} (home ${cfg.home})`);
   child = spawn(cfg.command, cfg.args ?? [], { cwd: cfg.cwd ?? "/workspace", env, stdio: ["pipe", "pipe", "pipe"] });
   alive = true;
@@ -132,29 +137,56 @@ async function start() {
       if (line.trim()) onAgentLine(line);
     }
   });
-  child.on("error", (e) => {
-    lastError = `spawn failed: ${e.message}`;
-  });
-  child.on("exit", (code, signal) => {
-    if (child !== me) return;
+  // Everything that has to happen when the adapter is gone, whatever killed it — every
+  // pending request rejected above all, or the `initialize` that gates the whole start
+  // would never settle and every window would sit at "starting" forever.
+  const gone = (code, signal) => {
+    if (child !== me || !alive) return;
     alive = false;
     ready = undefined;
-    for (const p of pending.values()) p.reject(new Error("agent exited"));
+    const why = lastError || `agent exited (${signal ?? code})`;
+    for (const p of pending.values()) p.reject(new Error(why));
     pending.clear();
     agentRequests.clear();
-    if (turn) finishTurn(new Error(`agent exited (${signal ?? code})`));
+    if (turn) finishTurn(new Error(why));
     if (phase !== "error") {
       lastError = code && code !== 0 ? `agent exited with code ${code}` : lastError;
       setPhase("stopped", { code, signal });
     }
     log(`agent exited (code ${code}, signal ${signal})`);
+  };
+  child.on("error", (e) => {
+    lastError = `spawn failed: ${e.message}`;
+    // A spawn failure (the adapter is not installed in this image) emits 'error' and 'close'
+    // but NEVER 'exit' — without this the handshake below would hang for good. `pid` is
+    // undefined exactly when the process never came up, so a later error can't fake a death.
+    if (me.pid === undefined) gone(null, null);
   });
+  child.on("exit", gone);
 
-  initResult = await request("initialize", {
-    protocolVersion: 1,
-    clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-    clientInfo: { name: "isolation", title: "Isolation", version: "1" },
-  });
+  // A started-but-mute adapter would wedge the same way, so the handshake is bounded; the
+  // kill runs the teardown above, which is what fails the start with a message the page shows.
+  let handshook = false;
+  const initTimer = setTimeout(() => {
+    if (handshook || child !== me || !alive) return;
+    lastError = "the agent did not answer `initialize` within 60s";
+    log(lastError);
+    try {
+      me.kill();
+    } catch {
+      /* already gone */
+    }
+  }, 60_000);
+  try {
+    initResult = await request("initialize", {
+      protocolVersion: 1,
+      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+      clientInfo: { name: "isolation", title: "Isolation", version: "1" },
+    });
+  } finally {
+    handshook = true;
+    clearTimeout(initTimer);
+  }
   const mcpServers = Array.isArray(cfg.mcpServers) ? cfg.mcpServers : [];
   const fresh = async () => {
     const r = await request("session/new", { cwd: cfg.cwd ?? "/workspace", mcpServers });

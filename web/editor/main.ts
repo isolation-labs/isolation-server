@@ -496,6 +496,10 @@ async function syncDocs(): Promise<void> {
           return;
         }
         const read = await apiRead(path);
+        // The read is a round trip: the user may have started typing into this (clean) buffer
+        // while it was in flight. Re-check before overwriting — applyEdits replaces the whole
+        // model, and marking it saved afterwards would lose those keystrokes silently.
+        if (d.model.getAlternativeVersionId() !== d.savedVersion) return;
         const text = new TextDecoder().decode(read.bytes);
         if (text !== d.model.getValue()) {
           d.model.applyEdits([{ range: d.model.getFullModelRange(), text }]);
