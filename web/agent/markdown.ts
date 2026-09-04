@@ -28,7 +28,9 @@ function inline(s: string): string {
 // (main.tsx posts `isolation:open-file` to the embedding SPA). Absolute `/workspace/…` paths
 // always link; a relative path links when it has a directory part; a bare `Name.ext:17` links
 // when an absolute path with that basename appeared earlier in the same message.
-const PATH_RE = /(?<![\w/.-])(\/workspace\/[\w.@+-][\w.@+\/-]*|(?:[\w.@+-]+\/)+[\w.@+-]+\.[A-Za-z0-9]{1,8}|[\w.@+-]+\.[A-Za-z0-9]{1,8})(?::(\d+))?(?::\d+)?(?![\w/])/g;
+// The `/workspace/…` arm must not swallow trailing punctuation (`…/App.tsx.` at the end of a
+// sentence would lose its extension and stop linking) — so it ends on a name character.
+const PATH_RE = /(?<![\w/.-])(\/workspace\/[\w.@+-](?:[\w.@+\/-]*[\w@+])?|(?:[\w.@+-]+\/)+[\w.@+-]+\.[A-Za-z0-9]{1,8}|[\w.@+-]+\.[A-Za-z0-9]{1,8})(?::(\d+))?(?::\d+)?(?![\w/])/g;
 
 // Files the conversation has touched (tool-call locations, absolute paths already cited), by
 // basename — so a later bare `App.tsx:17` still resolves to `cv/src/App.tsx`.
@@ -51,7 +53,9 @@ function linkify(html: string, seen: Map<string, string>): string {
         rememberFile(rel);
       } else if (path.includes("/")) rel = path.replace(/^\.\//, "");
       else rel = seen.get(path) ?? knownFiles.get(path);
-      if (!rel || !/\.[A-Za-z0-9]{1,8}$/.test(rel)) return whole;
+      // Nothing outside the workspace root: the code view rejects `..` segments anyway.
+      if (!rel || rel.startsWith("/") || rel.split("/").includes("..")) return whole;
+      if (!/\.[A-Za-z0-9]{1,8}$/.test(rel)) return whole;
       // A span, not an anchor: nothing to navigate to — the click posts to the embedding SPA.
       return `<span class="file-link" role="link" tabindex="0" data-file="${esc(rel)}"${line ? ` data-line="${line}"` : ""} title="Open in the code view">${whole}</span>`;
     });
