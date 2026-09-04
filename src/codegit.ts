@@ -149,8 +149,10 @@ export async function statusAll(sandboxId: string): Promise<{ repos: RepoStatus[
     // Two passes: -uall lists untracked files one by one (the tree badges them), but
     // makes --ignored enumerate every file under an ignored directory — so the ignored
     // listing comes from a plain pass, which folds node_modules/ into one entry.
-    `git -C "$d" -c core.quotePath=false status --porcelain=v1 -b -uall 2>&1 || printf '!!! status failed\\n'; ` +
-    `git -C "$d" -c core.quotePath=false status --porcelain=v1 --ignored=traditional -unormal 2>/dev/null | grep '^!!'; done`;
+    // --no-optional-locks: a status must never WRITE the index (it may refresh cached
+    // stat data otherwise) — that write would trip the change probe and loop forever.
+    `git -C "$d" --no-optional-locks -c core.quotePath=false status --porcelain=v1 -b -uall 2>&1 || printf '!!! status failed\\n'; ` +
+    `git -C "$d" --no-optional-locks -c core.quotePath=false status --porcelain=v1 --ignored=traditional -unormal 2>/dev/null | grep '^!!'; done`;
   const r = await run(sandboxId, cmd, { timeoutMs: 60_000 });
   const repos: RepoStatus[] = [];
   let cur: { dir: string; lines: string[] } | undefined;

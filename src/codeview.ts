@@ -67,20 +67,38 @@ async function mtimeOf(sandboxId: string, rel: string): Promise<number | undefin
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
-// mtimes for a batch of workspace files (the editor's "did this change under me" probe;
-// 0 = gone). Paths ride ONE env var newline-separated — safeRelPath refused newlines.
-async function statMany(sandboxId: string, rels: string[], res: ServerResponse): Promise<void> {
-  const r = await run(sandboxId, `cd "$ISO_WS" && printf '%s\n' "$ISO_PATHS" | while IFS= read -r f; do [ -n "$f" ] || continue; m=$(stat -c %Y "$f" 2>/dev/null); printf '%s\t%s\n' "\${m:-0}" "$f"; done`, {
-    envs: { ISO_WS: WORKSPACE, ISO_PATHS: rels.join("\n") },
+// The editor's once-a-second "did anything move" probe, one round trip: (a) has ANY
+// entry under /workspace changed since the last probe — a `find` against a marker file
+// that stops at the first hit, by ctime (set by the kernel on every write/rename/
+// delete/chmod; no tool can backdate it, unlike mtime), skipping node_modules-class
+// noise and .git/objects — and (b) the mtimes of the files the editor has open (0 =
+// gone). Agents, terminals, git and workspace sync all show up the same way: they
+// touch the filesystem. The page runs the expensive `git status` only when (a) says yes.
+// The marker is per view (many editors on one sandbox must not eat each other's ticks)
+// and is refreshed BEFORE the scan (a write during the scan lands in the next tick).
+async function probe(sandboxId: string, viewId: string, rels: string[], res: ServerResponse): Promise<void> {
+  const cmd =
+    `M="/tmp/.iso-probe-$ISO_VIEW"; if [ -e "$M" ]; then touch "$M.next"; ` +
+    `if find "$M" -cnewer "$M" >/dev/null 2>&1; then P=-cnewer; else P=-newer; fi; ` +
+    `n=$(find "$ISO_WS" -mindepth 1 \\( -name node_modules -o -name .venv -o -name venv -o -name __pycache__ -o -name .cache -o -path '*/.git/objects' -o -path '*/.git/logs' \\) -prune -o "$P" "$M" -print 2>/dev/null | head -1); ` +
+    `mv -f "$M.next" "$M"; [ -n "$n" ] && echo CHANGED; else touch "$M"; echo CHANGED; fi; ` +
+    `cd "$ISO_WS" && printf '%s\\n' "$ISO_PATHS" | while IFS= read -r f; do [ -n "$f" ] || continue; m=$(stat -c %Y "$f" 2>/dev/null); printf '%s\\t%s\\n' "\${m:-0}" "$f"; done`;
+  const r = await run(sandboxId, cmd, {
+    envs: { ISO_WS: WORKSPACE, ISO_VIEW: viewId.replace(/[^A-Za-z0-9_-]/g, ""), ISO_PATHS: rels.join("\n") },
     timeoutMs: 20_000,
   });
   const mtimes: Record<string, number> = {};
+  let changed = false;
   for (const line of r.stdout.split("\n")) {
+    if (line === "CHANGED") {
+      changed = true;
+      continue;
+    }
     const tab = line.indexOf("\t");
     if (tab < 0) continue;
     mtimes[line.slice(tab + 1)] = Number(line.slice(0, tab)) || 0;
   }
-  json(res, 200, { mtimes });
+  json(res, 200, { changed, mtimes });
 }
 
 // Tree file operations, one endpoint: create/mkdir/rename/copy/delete. Both paths ride
@@ -192,10 +210,10 @@ export async function handleCodeView(req: IncomingMessage, res: ServerResponse, 
         if (raw && rel === undefined) return json(res, 400, { error: "bad path" });
         return await listDir(view.sandboxId, rel ?? "", res);
       }
-      if (rest === "/api/stat" && method === "GET") {
+      if (rest === "/api/probe" && method === "GET") {
         const rels = q.getAll("path").map(safeRelPath);
-        if (!rels.length || rels.length > 200 || rels.some((p) => !p)) return json(res, 400, { error: "bad path" });
-        return await statMany(view.sandboxId, rels as string[], res);
+        if (rels.length > 200 || rels.some((p) => !p)) return json(res, 400, { error: "bad path" });
+        return await probe(view.sandboxId, view.id, rels as string[], res);
       }
       if (rest === "/api/file" && (method === "GET" || method === "PUT")) {
         if (!rel) return json(res, 400, { error: "bad path" });

@@ -77,11 +77,12 @@ async function apiSave(path: string, content: string | Blob, expectMtime?: numbe
   return { mtime: body.mtime };
 }
 
-// mtimes for a batch of workspace files; 0 = gone. The "did it change under me" probe.
-async function apiStat(paths: string[]): Promise<Record<string, number>> {
-  const r = await fetch(`api/stat?${paths.map((p) => `path=${encodeURIComponent(p)}`).join("&")}`);
+// The once-a-second probe: did anything under /workspace change since the last call,
+// plus the mtimes of the open files (0 = gone).
+async function apiProbe(paths: string[]): Promise<{ changed: boolean; mtimes: Record<string, number> }> {
+  const r = await fetch(`api/probe${paths.length ? `?${paths.map((p) => `path=${encodeURIComponent(p)}`).join("&")}` : ""}`);
   if (!r.ok) throw new Error(await errorOf(r));
-  return ((await r.json()) as { mtimes: Record<string, number> }).mtimes;
+  return (await r.json()) as { changed: boolean; mtimes: Record<string, number> };
 }
 
 async function apiOp(op: string, path: string, to?: string): Promise<void> {
@@ -477,12 +478,13 @@ window.addEventListener("beforeunload", (e) => {
 // user's edits and says so once — the stale-save gate decides at save time.
 let syncingDocs = false;
 const warnedStale = new Set<string>();
-async function syncDocs(): Promise<void> {
+// `known` = mtimes the tick already fetched; otherwise probe now.
+async function syncDocs(known?: Record<string, number>): Promise<void> {
   if (syncingDocs || !docs.size) return;
   syncingDocs = true;
   try {
     const paths = [...docs.keys()].slice(0, 200);
-    const mtimes = await apiStat(paths);
+    const mtimes = known ?? (await apiProbe(paths)).mtimes;
     await Promise.all(
       paths.map(async (path) => {
         const d = docs.get(path);
@@ -921,7 +923,7 @@ window.addEventListener("focus", () => {
   if (Date.now() - lastFocusRefresh < 5000) return;
   lastFocusRefresh = Date.now();
   void reloadTree();
-  void syncDocs();
+  void tick();
 });
 
 // Keyboard navigation over the visible rows.
@@ -1913,12 +1915,28 @@ resizeEl.addEventListener("pointerdown", (e) => {
   resizeEl.addEventListener("pointerup", up);
 });
 
-// Poll while visible: agents and terminals change the working tree behind our back.
-setInterval(() => {
-  if (document.hidden) return;
-  void refreshGit();
-  void syncDocs();
-}, 4000);
+// The tick: agents, terminals, git and workspace sync all change the working tree
+// behind our back. Once a second (while visible) one cheap probe asks the sandbox
+// whether ANYTHING moved; only then do the tree and `git status` refresh — plus a
+// periodic full refresh as the safety net. The same round trip carries the open
+// files' mtimes, so buffers follow the disk on the same cadence.
+let ticking = false;
+let ticks = 0;
+async function tick(): Promise<void> {
+  if (ticking || document.hidden) return;
+  ticking = true;
+  try {
+    const { changed, mtimes } = await apiProbe([...docs.keys()].slice(0, 200));
+    if (docs.size) void syncDocs(mtimes);
+    if (changed) void reloadTree(); // re-lists expanded dirs, then refreshGit()
+    else if (++ticks % 15 === 0) void refreshGit();
+  } catch {
+    /* next tick retries */
+  } finally {
+    ticking = false;
+  }
+}
+setInterval(() => void tick(), 1000);
 
 // --- deep links + navigation ----------------------------------------------------
 
