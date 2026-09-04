@@ -41,13 +41,16 @@ export function openInEditor(file: string, line?: number): void {
 
 function Markdown({ text, className }: { text: string; className?: string }) {
   const html = useMemo(() => renderMarkdown(text), [text]);
-  const onClick = (e: MouseEvent) => {
-    const a = (e.target as HTMLElement).closest?.("a.file-link") as HTMLAnchorElement | null;
-    if (!a) return;
+  const activate = (e: Event) => {
+    const el = (e.target as HTMLElement).closest?.(".file-link[data-file]") as HTMLElement | null;
+    if (!el) return;
     e.preventDefault();
-    openInEditor(a.dataset.file ?? "", a.dataset.line ? Number(a.dataset.line) : undefined);
+    openInEditor(el.dataset.file ?? "", el.dataset.line ? Number(el.dataset.line) : undefined);
   };
-  return <div class={`md ${className ?? ""}`} onClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />;
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === "Enter" || e.key === " ") activate(e);
+  };
+  return <div class={`md ${className ?? ""}`} onClick={activate} onKeyDown={onKey} dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
 // A small line diff (LCS on lines) for edit tool calls; big files fall back to after-only.
@@ -133,7 +136,9 @@ function ToolCard({ call }: { call: ToolCallState }) {
   const hasBody = call.content.length > 0 || call.rawInput !== undefined || call.rawOutput !== undefined;
   return (
     <div class={`tool ${status}`}>
-      <button class="tool-head" onClick={() => setOpen(!open)} disabled={!hasBody}>
+      {/* Location chips live inside the head; a DISABLED button swallows clicks on its children,
+          so a body-less call with locations must keep the head enabled or the chips go dead. */}
+      <button class="tool-head" onClick={() => setOpen(!open)} disabled={!hasBody && call.locations.length === 0}>
         <span class="tool-icon">{TOOL_ICON[call.kind ?? "other"] ?? "⚙"}</span>
         <span class="tool-title">{call.title}</span>
         {call.locations.length > 0 && (

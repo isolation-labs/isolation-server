@@ -2,6 +2,7 @@
 // `session/update` notifications (live or replayed) and the bridge's `_iso/*` notifications.
 // Framework-agnostic on purpose — the reducer is the one place the ACP surface is interpreted.
 import { createStore } from "zustand/vanilla";
+import { rememberFile } from "./markdown.js";
 import type { AvailableCommand, ContentBlock, PlanEntry, RequestPermissionRequest, RequestPermissionResponse, SessionConfigOption, SessionModeState, SessionNotification, SessionUpdate, ToolCallContent, ToolCallLocation, ToolKind, ToolCallStatus } from "@agentclientprotocol/sdk";
 
 export interface ToolCallState {
@@ -115,6 +116,7 @@ export function applyUpdate(u: SessionUpdate, meta?: { from?: string; ts?: numbe
       return;
     }
     case "tool_call": {
+      for (const l of u.locations ?? []) rememberFile(l.path);
       const idx = items.findIndex((i) => i.kind === "tool" && i.call.toolCallId === u.toolCallId);
       const call: ToolCallState = { toolCallId: u.toolCallId, title: u.title, kind: u.kind ?? null, status: u.status ?? "pending", content: u.content ?? [], locations: u.locations ?? [], rawInput: u.rawInput, rawOutput: u.rawOutput };
       if (idx >= 0) set({ items: items.map((i, k) => (k === idx ? { kind: "tool", id: i.id, call } : i)) });
@@ -122,6 +124,7 @@ export function applyUpdate(u: SessionUpdate, meta?: { from?: string; ts?: numbe
       return;
     }
     case "tool_call_update": {
+      for (const l of u.locations ?? []) rememberFile(l.path);
       let idx = -1;
       for (let k = items.length - 1; k >= 0; k--) {
         const i = items[k];

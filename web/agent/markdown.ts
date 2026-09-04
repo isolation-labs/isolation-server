@@ -30,6 +30,14 @@ function inline(s: string): string {
 // when an absolute path with that basename appeared earlier in the same message.
 const PATH_RE = /(?<![\w/.-])(\/workspace\/[\w.@+-][\w.@+\/-]*|(?:[\w.@+-]+\/)+[\w.@+-]+\.[A-Za-z0-9]{1,8}|[\w.@+-]+\.[A-Za-z0-9]{1,8})(?::(\d+))?(?::\d+)?(?![\w/])/g;
 
+// Files the conversation has touched (tool-call locations, absolute paths already cited), by
+// basename — so a later bare `App.tsx:17` still resolves to `cv/src/App.tsx`.
+const knownFiles = new Map<string, string>();
+export function rememberFile(path: string): void {
+  const rel = path.replace(/^\/workspace\//, "").replace(/^\.\//, "");
+  if (rel && !rel.startsWith("/")) knownFiles.set(rel.split("/").pop() ?? rel, rel);
+}
+
 function linkify(html: string, seen: Map<string, string>): string {
   // Only text nodes and code spans are candidates; anchors/pre blocks stay as they are.
   return html.replace(/(<a\b[^>]*>[\s\S]*?<\/a>|<pre\b[\s\S]*?<\/pre>)|(<code>)([\s\S]*?)(<\/code>)|([^<]+)/g, (m, keep: string | undefined, o: string | undefined, code: string | undefined, c: string | undefined, text: string | undefined) => {
@@ -40,10 +48,12 @@ function linkify(html: string, seen: Map<string, string>): string {
       if (path.startsWith("/workspace/")) {
         rel = path.slice("/workspace/".length);
         seen.set(rel.split("/").pop() ?? rel, rel);
+        rememberFile(rel);
       } else if (path.includes("/")) rel = path.replace(/^\.\//, "");
-      else rel = seen.get(path);
+      else rel = seen.get(path) ?? knownFiles.get(path);
       if (!rel || !/\.[A-Za-z0-9]{1,8}$/.test(rel)) return whole;
-      return `<a class="file-link" href="#" data-file="${esc(rel)}"${line ? ` data-line="${line}"` : ""} title="Open in the code view">${whole}</a>`;
+      // A span, not an anchor: nothing to navigate to — the click posts to the embedding SPA.
+      return `<span class="file-link" role="link" tabindex="0" data-file="${esc(rel)}"${line ? ` data-line="${line}"` : ""} title="Open in the code view">${whole}</span>`;
     });
     return code ? `${o}${out}${c}` : out;
   });
