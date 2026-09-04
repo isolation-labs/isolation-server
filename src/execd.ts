@@ -5,6 +5,7 @@
 import { endpointFor } from "./opensandbox.js";
 
 const EXECD_PORT = 44772;
+const BACKGROUND_TIMEOUT_MS = 10 * 365 * 24 * 3600 * 1000; // "forever" for a view process
 
 // Published host ports are stable while the sandbox runs; re-resolve on failure.
 const hosts = new Map<string, string>();
@@ -44,28 +45,59 @@ export async function run(sandboxId: string, command: string, opts: RunOpts = {}
       ...(opts.cwd ? { cwd: opts.cwd } : {}),
       ...(opts.envs ? { envs: opts.envs } : {}),
       ...(opts.background ? { background: true } : {}),
-      timeout: opts.timeoutMs ?? 120_000,
+      // execd enforces `timeout` on BACKGROUND commands too (the process is killed when it
+      // elapses — hard-learned: every view process died two minutes in), so a background
+      // command gets an effectively unbounded one unless the caller bounds it.
+      timeout: opts.timeoutMs ?? (opts.background ? BACKGROUND_TIMEOUT_MS : 120_000),
     }),
   });
   if (!r.ok) {
     hosts.delete(sandboxId);
     throw new Error(`execd /command → HTTP ${r.status}`);
   }
-  const text = await r.text();
+  // Resolve on the TERMINAL event, not on EOF: execd (v1.0.21, controller/command.go)
+  // `time.Sleep(ApiGracefulShutdownTimeout)`s — a flat 1s — after every command before
+  // it closes the response. Waiting for EOF put that second on every ls, stat, git
+  // status and save the editor makes; the events themselves arrive within ~10ms.
   let stdout = "";
   let stderr = "";
   let sawError = false;
-  for (const line of text.split("\n")) {
-    const t = line.trim();
-    if (!t) continue;
-    try {
-      const ev = JSON.parse(t) as { type?: string; text?: string };
-      if (ev.type === "stdout") stdout += `${ev.text ?? ""}\n`;
-      else if (ev.type === "stderr") stderr += `${ev.text ?? ""}\n`;
-      else if (ev.type === "error") sawError = true;
-    } catch {
-      /* non-JSON noise — ignore */
+  let buf = "";
+  const consume = (chunk: string): boolean => {
+    buf += chunk;
+    let nl: number;
+    while ((nl = buf.indexOf("\n")) !== -1) {
+      const t = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!t) continue;
+      try {
+        const ev = JSON.parse(t) as { type?: string; text?: string };
+        if (ev.type === "stdout") stdout += `${ev.text ?? ""}\n`;
+        else if (ev.type === "stderr") stderr += `${ev.text ?? ""}\n`;
+        // Terminal events: `execution_complete` on success, `error` (exit status /
+        // signal) otherwise — stdout/stderr always precede either.
+        else if (ev.type === "error") {
+          sawError = true;
+          return true;
+        } else if (ev.type === "execution_complete") return true;
+      } catch {
+        /* non-JSON noise — ignore */
+      }
     }
+    return false;
+  };
+  if (r.body) {
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (consume(dec.decode(value, { stream: true }))) {
+        await reader.cancel().catch(() => undefined);
+        break;
+      }
+    }
+    consume(dec.decode());
   }
   return { ok: !sawError, stdout, stderr };
 }

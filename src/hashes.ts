@@ -18,7 +18,7 @@ export const DETECTION_GLOBS = [".devcontainer", ".devcontainer.json", ...WS_HAS
 // instead of silently reusing stale ones. BUMP on any change to the template.
 //   1 — first isolation-server tooling layer: git/tmux/ttyd/code-server/filebrowser + iso-node.
 //   2 — code-server removed (the code view is doorman-served Monaco — PLAN V1).
-export const TOOLING_VERSION = "2";
+export const TOOLING_VERSION = "4"; // 3: claude + codex CLIs baked into the tooling layer; 4: ACP adapters + goose (PLAN §5d)
 
 const SKIP_DIRS = new Set(["node_modules", ".git"]);
 

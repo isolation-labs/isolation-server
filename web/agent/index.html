@@ -2,36 +2,14 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="color-scheme" content="dark" />
   <title>Agent — Isolation</title>
   <link rel="icon" href="data:," />
   <link rel="stylesheet" href="./main.css" />
 </head>
 <body>
-  <div id="app">
-    <header id="head">
-      <span id="status-dot" class="dot"></span>
-      <span id="agent-name">agent</span>
-      <span id="agent-meta"></span>
-      <span class="spacer"></span>
-      <button id="toggle" hidden></button>
-    </header>
-    <main id="scroll">
-      <div id="thread"></div>
-      <div id="empty" hidden>
-        <div class="empty-inner">
-          <div class="empty-mark">◈</div>
-          <div id="empty-line">Send the first message</div>
-          <div class="empty-hint">This agent keeps one conversation — every window shows the same thread.</div>
-        </div>
-      </div>
-    </main>
-    <footer id="composer">
-      <textarea id="input" rows="1" placeholder="Message the agent…"></textarea>
-      <button id="send" title="Send" aria-label="Send">↑</button>
-    </footer>
-  </div>
+  <div id="root"></div>
   <script type="module" src="./main.js"></script>
 </body>
 </html>

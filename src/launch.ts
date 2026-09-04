@@ -12,7 +12,9 @@ import { analyzeLaunch, cleanScratch, fetchDetectionFiles, type AnalysisRepo, ty
 import { cacheKey, dependencyHash, workspaceHash } from "./hashes.js";
 import { buildDependencyCacheInBackground, cacheImageAvailable, cacheImageTag, reposWithDeps } from "./cache.js";
 import { dockerAvailable, ensureSpecImage, type ImageRegistry } from "./images.js";
-import { addView, mintViewToken, newWebSlug, viewsForSandbox, type View, type ViewType } from "./views.js";
+import { addView, type TerminalStyle, mintViewToken, newWebSlug, viewsForSandbox, type View, type ViewType } from "./views.js";
+import { cloneTarget, installVault, parseVaultManifest, sidecarCreateSpec, vaultCoversHost, type VaultManifest, type VaultSummary } from "./vault.js";
+import { startAgentBridge, syncViewsFile } from "./acpview.js";
 
 // The launch's persistence envelope (same shape the web sends the daemon today:
 // `workspaceId` + `persistence.workspace.{endpoint, creds}`).
@@ -41,9 +43,10 @@ function parseWorkspaceSink(body: LaunchRequest): WorkspaceSink | undefined {
 
 const log = (...a: unknown[]) => console.log("[launch]", ...a);
 
-export const TOOLING_IMAGE = "isolation-server/tooling:0.5";
+export const TOOLING_IMAGE = "isolation-server/tooling:0.7"; // 0.6: claude + codex CLIs; 0.7: ACP adapters + goose (PLAN §5d)
 const TERMINAL_PORT = 7681;
 const DIRECTORY_PORT = 8055;
+const AGENT_PORT = 7820; // the in-sandbox ACP bridge behind an agent view (PLAN §5d)
 const WEB_SHADOW_BASE = 42000;
 
 // Runtime metadata values are k8s-style labels: alphanumeric/-/_/. , ≤63 chars,
@@ -83,6 +86,45 @@ export function parseEnvConfig(body: unknown): EnvConfig {
     vars.push({ name: v.name, value: v.value });
   }
   return { files, vars };
+}
+
+// The session-wide AI credential (the cloud's "launch credential" — claude.ts CredPair). Two
+// shapes: an API key (usually a scoped isogw_… gateway token + the metering gateway's base URL;
+// a real key + endpoint for providers the gateway can't front) and a subscription OAuth token
+// (injected raw — Anthropic blocks proxied OAuth). Arrives sealed to this server's pairing
+// secret (`claudeBlob`) or inline for a plain gateway pair (`claude`).
+export interface AiCred {
+  auth: "apiKey" | "subscription";
+  apiKey?: string;
+  oauthToken?: string;
+  baseUrl?: string;
+}
+
+export function parseAiCred(body: unknown): AiCred | undefined {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v.trim() : undefined);
+  if (b.auth === "apiKey" && str(b.apiKey)) return { auth: "apiKey", apiKey: str(b.apiKey), baseUrl: str(b.baseUrl) };
+  if (b.auth === "subscription" && str(b.oauthToken)) return { auth: "subscription", oauthToken: str(b.oauthToken) };
+  return undefined;
+}
+
+// The env the harnesses and the user's own terminal read. Claude Code takes either shape
+// natively; goose and other OpenAI-compatible tooling read the same pair under their own
+// names, exported at the adapter layer from these.
+export function aiCredEnv(cred: AiCred): Record<string, string> {
+  if (cred.auth === "subscription") return { CLAUDE_CODE_OAUTH_TOKEN: cred.oauthToken! };
+  return { ANTHROPIC_API_KEY: cred.apiKey!, ...(cred.baseUrl ? { ANTHROPIC_BASE_URL: cred.baseUrl } : {}) };
+}
+
+// A credential replaces the WHOLE pair, so every var it could own is cleared first: a
+// leftover ANTHROPIC_API_KEY from the environment config would out-rank the chosen
+// subscription token, and a leftover ANTHROPIC_BASE_URL would ship the chosen token to
+// someone else's endpoint. Partial application is worse than none.
+export const AI_ENV_KEYS = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN"];
+
+export function applyAiCred(env: Record<string, string>, cred: AiCred): void {
+  for (const k of AI_ENV_KEYS) delete env[k];
+  Object.assign(env, aiCredEnv(cred));
 }
 
 interface GitCreds {
@@ -131,7 +173,7 @@ export function parseRepos(body: unknown): RepoSpec[] {
 // tokens flow through a generic GIT_ASKPASS script reading $GIT_TOKEN from the
 // command's env; SSH keys are written 0600, referenced via GIT_SSH_COMMAND, and
 // deleted right after. Public repos clone tokenless.
-async function cloneRepo(sandboxId: string, repo: RepoSpec, creds: GitCreds): Promise<void> {
+async function cloneRepo(sandboxId: string, repo: RepoSpec, creds: GitCreds, vault?: VaultManifest): Promise<void> {
   const override = creds.repoTokens.find((t) => t.url === repo.url)?.token;
   const sshKey = creds.repoSshKeys.find((k) => k.url === repo.url)?.key;
   const isSsh = /^(git@|ssh:\/\/)/.test(repo.url);
@@ -139,12 +181,18 @@ async function cloneRepo(sandboxId: string, repo: RepoSpec, creds: GitCreds): Pr
   const branchArg = repo.branch ? ` --branch ${JSON.stringify(repo.branch)}` : "";
   const envs: Record<string, string> = {};
   let cleanup = "";
+  // Gateway-delivered git (PLAN §5b): the remote IS the gateway route; the sidecar authenticates it.
+  const cloneUrl = cloneTarget(vault, repo.url).url;
 
   if (isSsh && sshKey) {
     const keyPath = `/tmp/.iso-key-${randomBytes(4).toString("hex")}`;
     await writeFile(sandboxId, keyPath, sshKey.endsWith("\n") ? sshKey : `${sshKey}\n`, 0o600);
     envs.GIT_SSH_COMMAND = `ssh -i ${keyPath} -o StrictHostKeyChecking=accept-new`;
     cleanup = `; rm -f ${keyPath}`;
+  } else if (!isSsh && vaultCoversHost(vault, cloneUrl)) {
+    // The vault fronts this host (PLAN §5b): the sidecar injects the credential on every
+    // request, so git sees an already-authenticated remote — no token, no askpass, and
+    // `git push` from a terminal later works the same way.
   } else if (!isSsh) {
     const token = override ?? creds.githubOauth;
     if (token) {
@@ -156,7 +204,7 @@ async function cloneRepo(sandboxId: string, repo: RepoSpec, creds: GitCreds): Pr
     }
   }
 
-  const r = await run(sandboxId, `git clone${branchArg} ${JSON.stringify(repo.url)} ${JSON.stringify(dest)}${cleanup}`, {
+  const r = await run(sandboxId, `git clone${branchArg} ${JSON.stringify(cloneUrl)} ${JSON.stringify(dest)}${cleanup}`, {
     envs,
     timeoutMs: 300_000,
   });
@@ -192,7 +240,59 @@ export interface ViewSpec {
   label?: string;
   specKey?: string;
   agentId?: string; // agent views: the roster definition id
-  dir?: string; // git views: the repo directory (workspace-relative)
+  dir?: string; // terminal/directory: subtree under /workspace (cwd / browse root)
+  command?: string; // terminal: run this on creation (the workspace's "npm run dev")
+  style?: unknown; // terminal: the user's terminal appearance (TerminalStyle, whitelisted here)
+}
+
+// The xterm.js theme keys we forward (the standard palette). `style` arrives from a request
+// body, so every field is type-checked and bounded — nothing outside this set reaches ttyd.
+const THEME_KEYS = new Set([
+  "background", "foreground", "cursor", "cursorAccent", "selectionBackground",
+  "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+  "brightBlack", "brightRed", "brightGreen", "brightYellow",
+  "brightBlue", "brightMagenta", "brightCyan", "brightWhite",
+]);
+
+export function sanitizeStyle(style: unknown): TerminalStyle | undefined {
+  if (!style || typeof style !== "object") return undefined;
+  const s = style as Record<string, unknown>;
+  const out: TerminalStyle = {};
+  if (s.theme && typeof s.theme === "object") {
+    const theme: Record<string, string> = {};
+    for (const [k, v] of Object.entries(s.theme as Record<string, unknown>)) {
+      if (THEME_KEYS.has(k) && typeof v === "string" && v.length <= 64 && !/[\x00-\x1f"\\]/.test(v)) theme[k] = v;
+    }
+    if (Object.keys(theme).length) out.theme = theme;
+  }
+  if (typeof s.fontSize === "number" && Number.isFinite(s.fontSize)) out.fontSize = Math.min(64, Math.max(6, Math.round(s.fontSize)));
+  if (typeof s.fontFamily === "string" && s.fontFamily.length > 0 && s.fontFamily.length <= 200 && !/[\x00-\x1f]/.test(s.fontFamily)) out.fontFamily = s.fontFamily;
+  return Object.keys(out).length ? out : undefined;
+}
+
+// ttyd `-t KEY=VALUE` client options for a style. The values ride the process env and are
+// expanded inside double quotes — never spliced into the command line — so a theme's JSON
+// (quotes, braces, `#`) needs no shell escaping and can't smuggle extra flags.
+function ttydStyleArgs(style: TerminalStyle | undefined): { args: string; envs: Record<string, string> } {
+  if (!style) return { args: "", envs: {} };
+  const parts: string[] = [];
+  const envs: Record<string, string> = {};
+  if (style.theme) { parts.push('-t "theme=$ISO_TT_THEME"'); envs.ISO_TT_THEME = JSON.stringify(style.theme); }
+  if (style.fontSize) parts.push(`-t fontSize=${style.fontSize}`);
+  if (style.fontFamily) { parts.push('-t "fontFamily=$ISO_TT_FONT"'); envs.ISO_TT_FONT = style.fontFamily; }
+  return { args: parts.length ? ` ${parts.join(" ")}` : "", envs };
+}
+
+// A view's `dir` is a RELATIVE subtree under /workspace, spliced into shell command lines
+// (ttyd's cwd, filebrowser's root) — so it is whitelisted to a plain path charset and can never
+// climb out of the workspace. Anything else is treated as "no dir" (the workspace root).
+export function safeViewDir(dir: unknown): string | undefined {
+  if (typeof dir !== "string") return undefined;
+  const d = dir.trim().replace(/^\/+|\/+$/g, "");
+  if (!d || d === "/" ) return undefined;
+  if (!/^[A-Za-z0-9._@+ -]+(\/[A-Za-z0-9._@+ -]+)*$/.test(d)) return undefined;
+  if (d.split("/").some((seg) => seg === "." || seg === "..")) return undefined;
+  return d;
 }
 
 // Create one view (registry entry + in-sandbox process). Shared by launch scaffolding
@@ -227,14 +327,35 @@ export async function scaffoldView(sandboxId: string, w: ViewSpec): Promise<View
     // A per-view forwarder on an all-interfaces shadow port tries both loopbacks.
     appPort = port;
     port = nextFree(WEB_SHADOW_BASE);
-  } else if (w.type === "code" || w.type === "agent" || w.type === "git") {
-    // First-party doorman-served views (PLAN V1/V2/V3): no sandbox port, no process.
+  } else if (w.type === "code") {
+    // First-party doorman-served view (PLAN V1): no sandbox port, no process.
     port = 0;
+  } else if (w.type === "agent") {
+    // The page is doorman-served, but its WebSocket goes to the in-sandbox ACP bridge (PLAN §5d).
+    port = nextFree(AGENT_PORT);
   } else if (!port) {
     port = nextFree(w.type === "terminal" ? TERMINAL_PORT : DIRECTORY_PORT);
   }
-  const v = addView(sandboxId, w.type, port, { label: w.label, specKey: w.specKey, appPath, appPort, ...(w.type === "agent" && w.agentId ? { agentId: w.agentId } : {}), ...(w.type === "git" && w.dir ? { dir: w.dir } : {}), ...(w.type === "web" ? { slug: newWebSlug() } : {}) });
+  // An agent view IS a thread (threads.ts): its key names the transcript in the workspace tree, so
+  // a view created in-session without a workspace key mints one — saving the view into the
+  // workspace later keeps the same chat.
+  const specKey = w.specKey ?? (w.type === "agent" ? `agent-${randomBytes(4).toString("hex")}` : undefined);
+  const dir = w.type === "terminal" || w.type === "directory" ? safeViewDir(w.dir) : undefined;
+  const command = w.type === "terminal" && typeof w.command === "string" && w.command.trim() ? w.command.trim() : undefined;
+  const style = w.type === "terminal" ? sanitizeStyle(w.style) : undefined;
+  const v = addView(sandboxId, w.type, port, {
+    label: w.label,
+    specKey,
+    appPath,
+    appPort,
+    ...(dir ? { dir } : {}),
+    ...(command ? { command } : {}),
+    ...(style ? { style } : {}),
+    ...(w.type === "agent" && w.agentId ? { agentId: w.agentId } : {}),
+    ...(w.type === "web" ? { slug: newWebSlug() } : {}),
+  });
   await startViewProcess(sandboxId, v);
+  await syncViewsFile(sandboxId);
   return v;
 }
 
@@ -247,21 +368,62 @@ async function startViewProcess(sandboxId: string, view: View): Promise<void> {
   // execd's background mode owns each process's lifetime — no nohup/& wrappers (a
   // shell that exits immediately takes its children with it).
   if (view.type === "terminal") {
-    await run(sandboxId, `ttyd --writable -p ${view.port} tmux new -A -s iso-view-${view.id}`, {
+    // The tmux session is created HERE, at view creation — in the view's `dir` and with its
+    // `command` typed in — not lazily by the first browser tab: a declared dev server must
+    // come up whether or not a human ever opens the terminal (the web view depends on it).
+    // `window-size latest` re-fits the detached 80×24 pane to the first client that attaches.
+    // The command rides the env (never spliced into the line) and is typed literally (`-l`).
+    // ttyd then attaches every tab to that one session; its own cwd is the dir too, so a
+    // `new -A` fallback (tmux server gone) still lands in the right place.
+    const s = `iso-view-${view.id}`;
+    const dir = view.dir ? `/workspace/${view.dir}` : "/workspace";
+    const tt = ttydStyleArgs(view.style);
+    const script =
+      `c="$ISO_VIEW_CMD"; unset ISO_VIEW_CMD; cd "${dir}" 2>/dev/null || cd /workspace; ` +
+      `if ! tmux has-session -t ${s} 2>/dev/null; then tmux new-session -d -s ${s} -c "$PWD"; tmux set-option -t ${s} window-size latest; ` +
+      `if [ -n "$c" ]; then tmux send-keys -t ${s} -l "$c"; tmux send-keys -t ${s} Enter; fi; fi; ` +
+      `exec ttyd --writable -p ${view.port}${tt.args} tmux new -A -s ${s}`;
+    await run(sandboxId, script, {
       cwd: "/workspace",
+      envs: { ISO_VIEW_CMD: view.command ?? "", ...tt.envs },
       background: true,
     });
   } else if (view.type === "web" && view.appPort) {
     await startWebForwarder(view);
+  } else if (view.type === "agent") {
+    // The ACP bridge: materializes the agent (its HOME, harness files, credential) and holds
+    // the harness session; the page speaks ACP to it through the doorman (PLAN §5d).
+    await startAgentBridge(view);
   } else if (view.type === "directory") {
     // filebrowser emits absolute asset paths, so it must own its public base URL —
     // the doorman forwards the UNSTRIPPED path for directory views to match.
     await run(
       sandboxId,
-      `filebrowser --noauth -r /workspace -a 0.0.0.0 -p ${view.port} -b /v/${view.id} -d /tmp/.iso-fb-${view.id}.db`,
+      `filebrowser --noauth -r "${view.dir ? `/workspace/${view.dir}` : "/workspace"}" -a 0.0.0.0 -p ${view.port} -b /v/${view.id} -d /tmp/.iso-fb-${view.id}.db`,
       { cwd: "/workspace", background: true },
     );
   }
+}
+
+// Restart a terminal's ttyd over its existing tmux session (restyle): the shell, its
+// scrollback and any running process survive — only the front changes.
+export async function restartTerminal(view: View): Promise<void> {
+  if (view.type !== "terminal") return;
+  // `^ttyd ` anchors the match to the ttyd process itself — an unanchored pattern also matches
+  // the shell running this very pkill (its command line contains the pattern), which then dies
+  // mid-command and turns a clean restart into a reported failure.
+  // Awaiting pkill only means the SIGNAL was sent: ttyd still has to unwind libwebsockets and
+  // reap its pty child, and until it does it OWNS the listen socket — the replacement would
+  // lose the bind and exit, leaving a dead view. So wait for the process to actually go (SIGKILL
+  // as the backstop) before starting the new one.
+  const pat = JSON.stringify(`^ttyd .*-p ${view.port} `);
+  await run(
+    view.sandboxId,
+    `pkill -f ${pat} || true; i=0; while pgrep -f ${pat} >/dev/null 2>&1 && [ "$i" -lt 25 ]; do sleep 0.2; i=$((i+1)); done; ` +
+      `pgrep -f ${pat} >/dev/null 2>&1 && pkill -9 -f ${pat}; true`,
+    { timeoutMs: 20_000 },
+  ).catch(() => undefined);
+  await startViewProcess(view.sandboxId, view);
 }
 
 // Dual-stack loopback forwarder: 0.0.0.0:<shadow> → 127.0.0.1 or [::1]:<appPort>, whichever
@@ -293,16 +455,22 @@ export interface LaunchRequest {
   views?: ViewSpec[];
   envConfig?: unknown; // sealed string or inline {files, vars}
   repoTokens?: unknown; // sealed string or inline GitCreds
+  claude?: unknown; // sealed string or inline AiCred — the session-wide AI credential
+  vault?: unknown; // sealed string or inline VaultManifest (PLAN §5b) — EVERY credential, via the sidecar
   git?: { name?: string; email?: string };
   env?: Record<string, string>;
   metadata?: Record<string, string>;
   // Live progress callback — the session layer mirrors it into the record the web polls.
   onPhase?: (phase: string) => void;
+  // Fires as soon as the sandbox exists — BEFORE clones and views — so the session layer can
+  // register the agent roster before any agent view's first request lands.
+  onSandbox?: (sandboxId: string) => void;
 }
 
 export interface LaunchResult {
   sandbox: Sandbox;
   views: (View & { path: string; token: string })[];
+  vault?: VaultSummary;
 }
 
 export async function launch(body: LaunchRequest): Promise<LaunchResult> {
@@ -315,6 +483,25 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
   // reserved for trusted internals, so launch-body vars are validated above.
   const env: Record<string, string> = { ...(body.env ?? {}) };
   for (const v of envConfig.vars) env[v.name] = v.value;
+  // The AI credential last, and as a whole pair (see applyAiCred), so the deliberately-chosen
+  // provider beats plain env vars of the same names (the cloud already applied its own
+  // precedence — environment override → agent/account choice — before sealing). Nothing is
+  // written to disk; the value lives only in the sandbox's env for the sandbox's lifetime.
+  const aiCred = parseAiCred(sealedOrInline(body.claude));
+  if (aiCred) applyAiCred(env, aiCred);
+  // The Credential Vault manifest (PLAN §5b). Its `env` is NON-secret routing (gateway base
+  // URLs, placeholder keys) and rides the container env under the same validation as any
+  // launch var; the values themselves go to the sidecar after the sandbox is up.
+  const vault = parseVaultManifest(sealedOrInline(body.vault));
+  if (vault?.env) {
+    const vars = parseEnvConfig({ vars: Object.entries(vault.env).map(([name, value]) => ({ name, value })) }).vars;
+    // Same whole-pair discipline as applyAiCred: if the manifest routes the Anthropic pair at
+    // all, it owns ALL of it. Otherwise a manifest that sets only ANTHROPIC_BASE_URL would
+    // leave the session's CLAUDE_CODE_OAUTH_TOKEN in place and ship that RAW subscription
+    // token to the gateway slot — the exact redirection applyAiCred exists to prevent.
+    if (vars.some((v) => AI_ENV_KEYS.includes(v.name))) for (const k of AI_ENV_KEYS) delete env[k];
+    for (const v of vars) env[v.name] = v.value;
+  }
 
   // The image (PLAN O4): analyze the repos' detection files host-side, hash them, and
   // build/reuse `isolation-server-spec:<wsHash>` — a repo's own .devcontainer (image / Dockerfile /
@@ -323,12 +510,16 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
   // tooling image, so a launch never dies on image prep.
   let image = body.image?.trim() || "";
   let spec: LaunchSpec | undefined;
-  const analysisRepos: AnalysisRepo[] = repos.map((r) => ({
-    url: r.url,
-    dir: r.name,
-    branch: r.branch,
-    token: gitCreds.repoTokens.find((t) => t.url === r.url)?.token ?? (/github\.com/.test(r.url) ? gitCreds.githubOauth : undefined),
-  }));
+  const analysisRepos: AnalysisRepo[] = repos.map((r) => {
+    // A gateway-delivered repo is fetched host-side from the gateway remote with its scoped token.
+    const via = cloneTarget(vault, r.url);
+    return {
+      url: via.url,
+      dir: r.name,
+      branch: r.branch,
+      token: via.token ?? gitCreds.repoTokens.find((t) => t.url === r.url)?.token ?? (/github\.com/.test(r.url) ? gitCreds.githubOauth : undefined),
+    };
+  });
   // Dependency cache: when a cache image for this exact (workspace, dependencies) pair
   // exists, launch FROM it and restore the baked deps post-clone; otherwise launch from
   // the spec image and build the cache in the background for next time.
@@ -374,11 +565,30 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
     env: Object.keys(env).length ? env : undefined,
     // Metadata values must be label-safe for the runtime (alphanum/-/_/. only, ≤63).
     metadata: { managedBy: "isolation-server", ...(body.name ? { name: labelSafe(body.name) } : {}), ...(body.metadata ?? {}) },
+    // A manifest attaches the egress sidecar (the vault lives there); no manifest = no sidecar.
+    ...(vault ? sidecarCreateSpec() : {}),
   });
-  log(`sandbox ${sandbox.id} created (${image})`);
+  log(`sandbox ${sandbox.id} created (${image}${vault ? ", credential vault" : ""})`);
+  body.onSandbox?.(sandbox.id);
 
+  let vaultSummary: VaultSummary | undefined;
   try {
     await waitReady(sandbox.id);
+
+    // Credentials BEFORE anything that needs the network authenticated (clones, hooks).
+    if (vault) {
+      body.onPhase?.("installing credentials");
+      try {
+        vaultSummary = await installVault(sandbox.id, vault);
+      } catch (e) {
+        // A credential the sidecar won't take must not kill the launch: the session comes up
+        // without a vault (private clones and AI calls then fail visibly, on their own), and the
+        // record says so (revision 0) instead of a dead sandbox saying nothing.
+        const msg = String((e as Error)?.message ?? e);
+        log(`credential vault install failed — continuing without it: ${msg}`);
+        vaultSummary = { revision: 0, credentials: vault.credentials.map((c) => c.name), bindings: [`install failed: ${msg.slice(0, 200)}`] };
+      }
+    }
 
     // Git author identity (non-secret) before clones, so hooks/commits attribute right.
     const gname = body.git?.name?.trim();
@@ -387,10 +597,18 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
       await run(sandbox.id, `git config --global user.name ${JSON.stringify(gname)} && git config --global user.email ${JSON.stringify(gmail)}`);
     }
 
+    // A ChatGPT subscription as the session's default: `codex` in a terminal must find itself
+    // logged in (placeholder access token — the gateway swaps it) and pointed at the gateway.
+    if (env.CODEX_SUBSCRIPTION && env.OPENAI_BASE_URL) {
+      const { codexLoginFile, shq } = await import("./harness.js");
+      const root = env.OPENAI_BASE_URL.replace(/\/v1\/?$/, "");
+      await run(sandbox.id, `${codexLoginFile(env.OPENAI_API_KEY ?? "isolation-vault", env.CODEX_ACCOUNT_ID ?? "")} && printf 'chatgpt_base_url = "%s"\\npreferred_auth_method = "chatgpt"\\nmodel_provider = "iso"\\n\\n[model_providers.iso]\\nname = "iso"\\nbase_url = "%s"\\nwire_api = "responses"\\nsupports_websockets = false\\nrequires_openai_auth = true\\n' ${shq(`${root}/backend-api/`)} ${shq(`${root}/backend-api/codex`)} > ~/.codex/config.toml`).catch((e: Error) => log(`codex login files: ${e.message}`));
+    }
+
     body.onPhase?.("cloning repositories");
     for (const repo of repos) {
       log(`cloning ${repo.url} → /workspace/${repo.name}`);
-      await cloneRepo(sandbox.id, repo, gitCreds);
+      await cloneRepo(sandbox.id, repo, gitCreds, vault);
     }
     // Cache hit: copy the baked deps (node_modules, .venv, vendor, …) into each fresh
     // clone where missing — cp -a, since /iso and /workspace may be different mounts.
@@ -436,7 +654,7 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
       if (v) views.push({ ...v, path: `/v/${v.id}/`, token: mintViewToken(v.id) });
     }
 
-    return { sandbox, views };
+    return { sandbox, views, ...(vaultSummary ? { vault: vaultSummary } : {}) };
   } catch (e) {
     // A failed launch must not leak a half-provisioned sandbox — the caller sees
     // the error; the sandbox is gone.

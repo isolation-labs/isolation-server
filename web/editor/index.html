@@ -18,11 +18,24 @@
         <button id="refresh" title="Refresh file tree" aria-label="Refresh file tree">&#8635;</button>
       </div>
       <div id="tree" role="tree"></div>
+      <!-- Source control: the nested repos' working state (VS Code's SCM view, docked under the tree). -->
+      <section id="scm" hidden>
+        <div id="scm-resize" title="Drag to resize"></div>
+        <div id="scm-head" class="section-head" role="button" tabindex="0" aria-expanded="true">
+          <span class="chev">&#9662;</span>
+          <span class="section-title">Source Control</span>
+          <span id="scm-count" class="count"></span>
+          <span class="spacer"></span>
+          <button id="scm-refresh" class="ib" title="Refresh" aria-label="Refresh source control">&#8635;</button>
+        </div>
+        <div id="scm-body"></div>
+      </section>
     </aside>
     <main id="main">
       <div id="tabs" role="tablist"></div>
       <div id="editor-host">
         <div id="editor"></div>
+        <div id="diff-editor" hidden></div>
         <div id="media-view" hidden></div>
         <div id="empty-state">
           <div class="empty-inner">

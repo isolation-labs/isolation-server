@@ -4,7 +4,7 @@
 // tarball — the doorman serves them; nothing is fetched at runtime.
 import { build } from "esbuild";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -64,18 +64,32 @@ function stampHtml(srcHtml, dir) {
 }
 stampHtml(join(root, "web/editor/index.html"), out);
 
-// The agent (PLAN V2) and git (PLAN V3) views: small apps, same doorman-served pattern.
-for (const app of ["agent", "git"]) {
-  const appOut = join(root, "dist", app);
+// The agent view (PLAN §5d): the ACP client page — Preact + zustand over the official SDK,
+// same doorman-served pattern.
+{
+  const appOut = join(root, "dist", "agent");
   mkdirSync(appOut, { recursive: true });
   await build({
-    entryPoints: [join(root, `web/${app}/main.ts`)],
+    entryPoints: [join(root, "web/agent/main.tsx")],
     bundle: true,
     minify: true,
     format: "esm",
+    platform: "browser",
     outdir: appOut,
+    entryNames: "main",
+    jsx: "automatic",
+    jsxImportSource: "preact",
+    define: { "process.env.NODE_ENV": '"production"' },
     logLevel: "warning",
   });
-  stampHtml(join(root, `web/${app}/index.html`), appOut);
+  stampHtml(join(root, "web/agent/index.html"), appOut);
 }
-console.log("[build-editor] dist/{editor,agent,git} ready");
+
+// The in-sandbox scripts (the ACP bridge + the isolation MCP server) ship verbatim: the server
+// writes them into each sandbox at view start.
+{
+  const out = join(root, "dist", "sandbox");
+  mkdirSync(out, { recursive: true });
+  for (const f of readdirSync(join(root, "sandbox"))) if (f.endsWith(".mjs")) copyFileSync(join(root, "sandbox", f), join(out, f));
+}
+console.log("[build-editor] dist/{editor,agent,sandbox} ready");

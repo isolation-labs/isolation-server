@@ -2,7 +2,7 @@
 // Everything a server needs to belong to an account lives here: the master token
 // (loopback API auth), the pairing (backend + per-server secret), the relay
 // enrollment, and how to reach the local OpenSandbox runtime.
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
@@ -64,6 +64,7 @@ export interface OsbConfig {
 interface Config {
   token?: string;
   name?: string;
+  machineId?: string; // this install's stable identity across pairings (PLAN §5d follow-up: no duplicate server rows)
   pairing?: Pairing;
   enrollment?: Enrollment;
   osb?: OsbConfig;
@@ -108,6 +109,17 @@ export function getName(): string {
 }
 
 export const getPairing = (): Pairing | undefined => cfg.pairing;
+// A stable identity for THIS install, minted once and kept across disconnect/connect and cloud
+// switches, so the cloud can recognise a machine pairing again and reuse its `servers` row
+// (sessions reference that row) instead of minting a duplicate.
+export function getMachineId(): string {
+  if (!cfg.machineId) {
+    cfg.machineId = randomUUID();
+    persist();
+  }
+  return cfg.machineId;
+}
+
 export function savePairing(p: Pairing | undefined): void {
   cfg.pairing = p;
   persist();

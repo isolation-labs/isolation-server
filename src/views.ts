@@ -9,7 +9,16 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { VIEWS_FILE, ensureDataDir, getToken } from "./config.js";
 
-export type ViewType = "terminal" | "code" | "web" | "directory" | "agent" | "git";
+export type ViewType = "terminal" | "code" | "web" | "directory" | "agent";
+
+// Terminal appearance (the web's resolved user preference, handed inline): the xterm.js theme
+// palette + font, forwarded to ttyd as client options. Whitelisted in launch.ts before it
+// ever reaches a command line.
+export interface TerminalStyle {
+  theme?: Record<string, string>;
+  fontSize?: number;
+  fontFamily?: string;
+}
 
 export interface View {
   id: string;
@@ -21,7 +30,9 @@ export interface View {
   appPath?: string; // web: subpage the view opens on
   appPort?: number; // web: the app's OWN port (view.port is the forwarder's shadow port)
   agentId?: string; // agent: the roster DEFINITION id this view is a window onto
-  dir?: string; // git: the repo directory (workspace-relative; "" = /workspace itself)
+  dir?: string; // terminal/directory: the subtree under /workspace (the shell's cwd / the browse root)
+  command?: string; // terminal: typed into the view's tmux session once, at creation
+  style?: TerminalStyle; // terminal: the appearance ttyd was started with (restyle restarts ttyd)
   slug?: string; // web: the PUBLIC hostname label (unguessable, ≥128-bit) — the view's address on the sandbox plane
 }
 
@@ -39,9 +50,21 @@ function persist(): void {
   renameSync(tmp, VIEWS_FILE);
 }
 
-export function addView(sandboxId: string, type: ViewType, port: number, extra: Pick<View, "label" | "specKey" | "appPath" | "appPort" | "slug" | "agentId" | "dir"> = {}): View {
+export function addView(sandboxId: string, type: ViewType, port: number, extra: Pick<View, "label" | "specKey" | "appPath" | "appPort" | "slug" | "agentId" | "dir" | "command" | "style"> = {}): View {
   const v: View = { id: `v-${randomBytes(6).toString("hex")}`, sandboxId, type, port, ...extra };
   views[v.id] = v;
+  persist();
+  return v;
+}
+
+// Patch display/appearance fields in place (label, style). `undefined` clears a field.
+export function updateView(id: string, patch: Partial<Pick<View, "label" | "style">>): View | undefined {
+  const v = views[id];
+  if (!v) return undefined;
+  for (const [k, val] of Object.entries(patch)) {
+    if (val === undefined) delete (v as unknown as Record<string, unknown>)[k];
+    else (v as unknown as Record<string, unknown>)[k] = val;
+  }
   persist();
   return v;
 }

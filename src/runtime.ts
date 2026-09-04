@@ -70,9 +70,58 @@ export function ensureServerConfig(serverBin: string, log: (m: string) => void):
     writeFileSync(SANDBOX_TOML, toml, { mode: 0o600 });
     log("minted the runtime API key");
   }
+  const { toml: withEgress, changed } = ensureEgressConfig(toml);
+  if (changed) {
+    toml = withEgress;
+    writeFileSync(SANDBOX_TOML, toml, { mode: 0o600 });
+    log(`egress sidecar configured (${EGRESS_IMAGE}, dns+nft) — the Credential Vault needs it`);
+  }
   const port = Number(/^\s*port\s*=\s*(\d+)/m.exec(toml)?.[1] ?? 8080);
   saveOsb({ url: `http://127.0.0.1:${port}`, apiKey });
   return { apiKey, port };
+}
+
+// The egress sidecar image the vault was verified against (PLAN §5b CV0). Pinned like the
+// runtime itself; the runtime does NOT pull it on demand, so `up` pre-pulls (best-effort).
+export const EGRESS_IMAGE = "opensandbox/egress:v1.1.4";
+
+// The Credential Vault refuses to activate unless the sidecar runs in `dns+nft` mode. An
+// operator's own `[egress]` section is respected except for that one upgrade (`dns` → the
+// mode the vault needs); a missing section is added whole. Pure, for the unit test.
+export function ensureEgressConfig(toml: string): { toml: string; changed: boolean } {
+  const section = /^\[egress\]\s*$([\s\S]*?)(?=^\[|(?![\s\S]))/m.exec(toml);
+  if (!section) {
+    const sep = toml.endsWith("\n") ? "" : "\n";
+    return { toml: `${toml}${sep}\n[egress]\nimage = "${EGRESS_IMAGE}"\nmode = "dns+nft"\n`, changed: true };
+  }
+  let body = section[1];
+  let changed = false;
+  const mode = /^\s*mode\s*=\s*"([^"]*)"/m.exec(body)?.[1];
+  if (mode === undefined) {
+    body = `\nmode = "dns+nft"${body}`;
+    changed = true;
+  } else if (mode === "dns") {
+    body = body.replace(/^(\s*mode\s*=\s*)"dns"/m, `$1"dns+nft"`);
+    changed = true;
+  }
+  if (!/^\s*image\s*=/m.test(body)) {
+    body = `\nimage = "${EGRESS_IMAGE}"${body}`;
+    changed = true;
+  }
+  if (!changed) return { toml, changed };
+  return { toml: toml.slice(0, section.index) + `[egress]` + body + toml.slice(section.index + section[0].length), changed };
+}
+
+// Pre-pull the sidecar image so the first vault launch doesn't stall on a download.
+// Best-effort: no docker CLI, no network — the launch will surface the real error.
+export function ensureEgressImage(log: (m: string) => void): void {
+  if (spawnSync("docker", ["image", "inspect", EGRESS_IMAGE], { stdio: "ignore" }).status === 0) return;
+  log(`pulling ${EGRESS_IMAGE} (egress sidecar)…`);
+  try {
+    execFileSync("docker", ["pull", EGRESS_IMAGE], { stdio: "ignore", timeout: 300_000 });
+  } catch {
+    log(`could not pull ${EGRESS_IMAGE} now — the first vault launch will retry`);
+  }
 }
 
 export interface RuntimePlan {
@@ -84,6 +133,7 @@ export interface RuntimePlan {
 export async function prepareRuntime(log: (m: string) => void): Promise<RuntimePlan> {
   const serverBin = ensureServerInstalled(log);
   const { port } = ensureServerConfig(serverBin, log);
+  ensureEgressImage(log);
   const alreadyRunning = await osbHealthy();
   if (alreadyRunning) log(`runtime already running on ${getOsb().url} — adopting it (not managed by the gate)`);
   return { serverBin, port, alreadyRunning };

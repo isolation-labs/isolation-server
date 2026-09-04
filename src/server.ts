@@ -4,15 +4,16 @@
 // is small enough that a framework would outweigh it.
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { GATE_VERSION } from "./version.js";
-import { HOST, PORT, getName, getPairing, getToken, isLoopbackOrigin, originAllowed, savePairing, tokenMatches } from "./config.js";
+import { HOST, PORT, getName, getPairing, getToken, isLoopbackOrigin, originAllowed, savePairing, tokenMatches, getMachineId } from "./config.js";
 import { beatOffline, detach, pairingStatus, startHeartbeat } from "./heartbeat.js";
 import { deleteSandbox, getSandbox, listSandboxes, osbHealthy, pauseSandbox, resumeSandbox, sandboxLogs } from "./opensandbox.js";
 import { handlePublicWebRequest, handlePublicWebUpgrade, handleViewRequest, handleViewUpgrade, invalidateEndpoints } from "./doorman.js";
-import { launch, type LaunchRequest } from "./launch.js";
+import { launch, restartTerminal, sanitizeStyle, type LaunchRequest } from "./launch.js";
 import { sinkFor, abortMerge, dropSink, saveWorkspace, syncWorkspace } from "./persistence.js";
-import { dropView, dropViewsForSandbox, getView, mintViewToken, viewsForSandbox } from "./views.js";
+import { dropView, dropViewsForSandbox, getView, mintViewToken, updateView, viewsForSandbox, type View } from "./views.js";
 import { forgetExecd, run } from "./execd.js";
-import { agentJson, getAgent, listAgents, parseRoster, sendMessage, spawnAgent, startAgent, stopAgent } from "./agents.js";
+import { agentJson, getAgent, listAgents, parseRoster, spawnAgent, startAgent, stopAgent } from "./agents.js";
+import { bridgePattern, connectorTurn, syncViewsFile } from "./acpview.js";
 import { listHarnesses } from "./harness.js";
 import { pauseSession, resumeSession,
   createSessionView,
@@ -107,7 +108,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (origin && originAllowed(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
   }
   if (method === "OPTIONS") return void res.writeHead(204).end();
 
@@ -182,7 +183,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       const r = await fetch(`${backendUrl}/api/pair/claim`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code, url: myUrl, token: getToken(), label }),
+        body: JSON.stringify({ code, url: myUrl, token: getToken(), label, machineId: getMachineId() }),
       });
       const claim = (await r.json().catch(() => ({}))) as { connectionId?: string; secret?: string; label?: string; error?: string };
       if (!r.ok) return json(res, r.status, { error: claim.error ?? `HTTP ${r.status}` });
@@ -287,28 +288,38 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const [, agentId, , act] = ag;
     const rec = getAgent(agentId);
     if (!rec) return json(res, 404, { error: "unknown agent" });
-    if (method === "GET" && !act) return json(res, 200, { ...agentJson(rec), conversation: rec.conversation });
-    if (method === "GET" && act === "messages") return json(res, 200, { messages: rec.conversation });
-    if (method === "POST" && act === "messages") {
-      const b = await readBody(req);
-      const text = typeof b.text === "string" ? b.text : "";
-      if (!text.trim()) return json(res, 400, { error: "text required" });
-      const out = await sendMessage(agentId, text, typeof b.from === "string" ? b.from : "sidebar");
-      return "error" in out ? json(res, 502, out) : json(res, 200, out);
-    }
+    if (method === "GET" && !act) return json(res, 200, agentJson(rec));
+    // Conversations are per VIEW now (a view is the thread) — talk through /views/:id/messages.
+    if (act === "messages") return json(res, 410, { error: "conversations are per view now — use /views/<viewId>/messages" });
     if (method === "POST" && act === "start") return json(res, 200, { ok: startAgent(agentId) });
     if (method === "DELETE" && !act) return json(res, 200, { ok: stopAgent(agentId) });
   }
 
   if (url.startsWith("/views/")) {
-    const vm = /^\/views\/([a-zA-Z0-9-]+)(\/view-token)?$/.exec(url);
+    const vm = /^\/views\/([a-zA-Z0-9-]+)(\/(view-token|messages))?$/.exec(url);
     if (vm) {
-      const [, vid, tokenAction] = vm;
-      if (method === "POST" && tokenAction) {
+      const [, vid, , action] = vm;
+      if (method === "POST" && action === "view-token") {
         if (!getView(vid)) return json(res, 404, { error: "unknown view" });
         return json(res, 200, { token: mintViewToken(vid) });
       }
-      if (method === "DELETE" && !tokenAction) {
+      // THE thread API (PLAN §12 v3): an agent view is a conversation. The control plane talks
+      // to it here — the cloud's channel connectors (Slack, Buzz) route a channel to ONE view.
+      if (action === "messages") {
+        const v = getView(vid);
+        if (!v || v.type !== "agent") return json(res, 404, { error: "unknown agent view" });
+        if (method === "GET") return json(res, 200, { messages: [] });
+        if (method === "POST") {
+          const b = await readBody(req);
+          const text = typeof b.text === "string" ? b.text : "";
+          if (!text.trim()) return json(res, 400, { error: "text required" });
+          const out = await connectorTurn(v, text, typeof b.from === "string" ? b.from : "control-plane");
+          return "error" in out ? json(res, 502, out) : json(res, 200, out);
+        }
+      }
+      // DELETE means "drop the view" and only ever applies to the bare /views/<id> —
+      // a sub-path (…/view-token, …/messages) must never fall through into it.
+      if (method === "DELETE" && !action) {
         const v = dropView(vid);
         // Best-effort: stop the view's in-sandbox server so the port frees up.
         if (v) {
@@ -320,13 +331,46 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
             v.type === "terminal" ? `ttyd .*-p ${v.port}`
             : v.type === "directory" ? `filebrowser .*-p ${v.port}`
             : v.type === "web" ? `portfwd.mjs .* ${v.id}`
+            : v.type === "agent" ? bridgePattern(v)
             : undefined;
           // AWAITED: the SPA deletes then immediately recreates on a spec change; an
           // un-awaited kill raced the new view's process on the same port.
           if (pat) await run(v.sandboxId, `pkill -f ${JSON.stringify(pat)} || true`).catch(() => undefined);
+          await syncViewsFile(v.sandboxId).catch(() => undefined);
         }
         return json(res, 200, { ok: true });
       }
+    }
+  }
+
+  // Threads by WORKSPACE-LEVEL key (PLAN §12 v3): the cloud's channel connectors (Slack, Buzz)
+  // address a chat as `session + thread key`, never a session-local view id. GET reads the
+  // transcript; POST runs a turn — creating the (unplaced) agent view on first contact when the
+  // body names the agent, so a channel's first message is enough to start its thread.
+  const th = /^\/sessions\/(s-[a-z0-9]+)\/threads\/([A-Za-z0-9._-]+)\/messages$/.exec(url);
+  if (th) {
+    const [, sid, key] = th;
+    const s = getSessionRecord(sid);
+    if (!s?.sandboxId) return json(res, 404, { error: "session not ready" });
+    let v = viewsForSandbox(s.sandboxId).find((x) => x.type === "agent" && x.specKey === key);
+    if (method === "GET") return v ? json(res, 200, { messages: [] }) : json(res, 200, { messages: [] });
+    if (method === "POST") {
+      const b = await readBody(req);
+      const text = typeof b.text === "string" ? b.text : "";
+      if (!text.trim()) return json(res, 400, { error: "text required" });
+      if (!v) {
+        const wanted = typeof b.agentId === "string" ? b.agentId.trim() : "";
+        if (!wanted) return json(res, 404, { error: "no such thread in this session (send agentId to start one)" });
+        // Resolve against THIS session's roster before scaffolding: an unknown agent would
+        // otherwise leave a dangling view (and its process) behind on every failed call.
+        const rec = listAgents(sid).find((a) => a.def.id === wanted || a.runtimeId === wanted);
+        if (!rec) return json(res, 404, { error: "no such agent in this session" });
+        const { scaffoldView } = await import("./launch.js");
+        v = await scaffoldView(s.sandboxId, { type: "agent", specKey: key, agentId: rec.def.id, label: typeof b.label === "string" ? b.label : rec.def.name });
+        if (!v) return json(res, 502, { error: "could not create the thread's view" });
+      }
+      const out = await connectorTurn(v, text, typeof b.from === "string" ? b.from : "channel");
+      return "error" in out ? json(res, 502, out) : json(res, 200, { ...out, viewId: v.id });
     }
   }
 
@@ -371,7 +415,9 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
           url: typeof b.url === "string" ? b.url : undefined,
           label: typeof b.label === "string" ? b.label : undefined,
           specKey: typeof b.specKey === "string" ? b.specKey : undefined,
-          dir: typeof b.dir === "string" && b.dir.trim() ? b.dir.trim().replace(/^\/+|\/+$/g, "") : undefined,
+          dir: typeof b.dir === "string" ? b.dir : undefined,
+          command: typeof b.command === "string" ? b.command : undefined,
+          style: b.style,
           agentId,
         });
         if (!v) return json(res, 400, { error: "view spec not satisfiable" });
@@ -429,7 +475,9 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         return out ? json(res, 200, sessionJson(out)) : json(res, 409, { error: "session not ready" });
       }
       if (method === "POST" && action === "start") {
-        const out = await resumeSession(id);
+        // Optional `{ vault }` = a fresh sealed manifest to re-install on resume (PLAN §5b).
+        const b = await readBody(req).catch(() => ({}) as Record<string, unknown>);
+        const out = await resumeSession(id, b.vault);
         return out ? json(res, 200, sessionJson(out)) : json(res, 409, { error: "session not ready" });
       }
       // Not implemented on this runtime yet — explicit, not silent.
@@ -439,6 +487,35 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     }
   }
   // Nested session paths (/sessions/:id/agents/approvals, /files/…, /views/:vid/…).
+  // PATCH a live view in place (the daemon contract the web speaks): `label` renames (any type,
+  // nothing restarts); `style` re-themes a terminal — ttyd restarts over the same tmux session,
+  // so id/port/URL are unchanged and the caller just reloads the iframe.
+  const pv = /^\/sessions\/(s-[a-z0-9]+)\/views\/([a-zA-Z0-9-]+)$/.exec(url);
+  if (pv && method === "PATCH") {
+    const [, id, vid] = pv;
+    const s = getSessionRecord(id);
+    const v = getView(vid);
+    if (!s || !v || v.sandboxId !== s.sandboxId) return json(res, 404, { error: "unknown view" });
+    const b = await readBody(req);
+    const restyling = "style" in b;
+    if (restyling && v.type !== "terminal") return json(res, 400, { error: "only terminal views can be restyled" });
+    const patch: Partial<Pick<View, "label" | "style">> = {};
+    if (typeof b.label === "string") patch.label = b.label.trim() || undefined;
+    if (restyling) patch.style = sanitizeStyle(b.style);
+    const nv = updateView(vid, patch) ?? v;
+    // The in-sandbox views file carries each view's label — a rename that skipped it would
+    // leave the agents' `views` tool naming the window by its old label until the next launch.
+    if ("label" in patch) await syncViewsFile(v.sandboxId).catch(() => undefined);
+    if (restyling) {
+      try {
+        await restartTerminal(nv);
+      } catch (e) {
+        return json(res, 500, { error: `failed to restyle terminal: ${(e as Error).message}` });
+      }
+    }
+    return json(res, 200, viewJson(nv, id));
+  }
+
   const nested = /^\/sessions\/(s-[a-z0-9]+)\/(.+)$/.exec(url);
   if (nested) {
     const sub = nested[2];

@@ -24,6 +24,10 @@ export interface CreateSandboxSpec {
   env?: Record<string, string>;
   metadata?: Record<string, string>;
   timeoutSec?: number | null;
+  // The egress sidecar (PLAN §5b): an outbound policy attaches it; credentialProxy turns on
+  // the transparent MITM the Credential Vault injects through. Both or neither.
+  networkPolicy?: { defaultAction: "allow" | "deny"; egress: { action: string; target: string }[] };
+  credentialProxy?: { enabled: boolean };
 }
 
 class OsbError extends Error {
@@ -71,6 +75,8 @@ export function createSandbox(spec: CreateSandboxSpec): Promise<Sandbox> {
     resourceLimits: { cpu: spec.cpu ?? "2", memory: spec.memory ?? "2Gi" },
     ...(spec.env ? { env: spec.env } : {}),
     ...(spec.metadata ? { metadata: spec.metadata } : {}),
+    ...(spec.networkPolicy ? { networkPolicy: spec.networkPolicy } : {}),
+    ...(spec.credentialProxy ? { credentialProxy: spec.credentialProxy } : {}),
     timeout: spec.timeoutSec === undefined ? 86400 : spec.timeoutSec,
   });
 }
@@ -105,8 +111,15 @@ export interface Endpoint {
 }
 
 export async function endpointFor(sandboxId: string, port: number): Promise<Endpoint> {
-  const { endpoint } = await call<{ endpoint: string }>("GET", `/v1/sandboxes/${sandboxId}/endpoints/${port}`);
+  return endpointWithHeaders(sandboxId, port);
+}
+
+// Same, plus the auth headers the runtime hands out for a port that needs them (the egress
+// sidecar's API on 18080 answers only with its per-sandbox `OPENSANDBOX-EGRESS-AUTH`).
+export async function endpointWithHeaders(sandboxId: string, port: number): Promise<Endpoint & { headers: Record<string, string> }> {
+  const { endpoint, headers } = await call<{ endpoint: string; headers?: Record<string, string> }>("GET", `/v1/sandboxes/${sandboxId}/endpoints/${port}`);
   const slash = endpoint.indexOf("/");
-  if (slash === -1) return { host: endpoint, basePath: "" };
-  return { host: endpoint.slice(0, slash), basePath: endpoint.slice(slash).replace(/\/+$/, "") };
+  const h = headers ?? {};
+  if (slash === -1) return { host: endpoint, basePath: "", headers: h };
+  return { host: endpoint.slice(0, slash), basePath: endpoint.slice(slash).replace(/\/+$/, ""), headers: h };
 }

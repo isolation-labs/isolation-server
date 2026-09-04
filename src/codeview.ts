@@ -1,4 +1,5 @@
-// The first-party code view (PLAN V1) — a Monaco editor the doorman serves itself.
+// The first-party code view (PLAN V1, with V3's git folded in) — a Monaco editor the
+// doorman serves itself.
 // No in-sandbox process: the page + assets are bundled into dist/editor at build
 // time, and the file operations ride execd's file/exec APIs. Auth happened in the
 // doorman before we're called (view token / cookie), so every route here is scoped
@@ -8,6 +9,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { downloadFile, run, writeFile } from "./execd.js";
+import { handleGitApi } from "./codegit.js";
 import type { View } from "./views.js";
 
 const EDITOR_DIR = join(dirname(fileURLToPath(import.meta.url)), "editor");
@@ -63,6 +65,40 @@ async function mtimeOf(sandboxId: string, rel: string): Promise<number | undefin
   const r = await run(sandboxId, `stat -c %Y "$ISO_P" 2>/dev/null`, { envs: { ISO_P: `${WORKSPACE}/${rel}` }, timeoutMs: 10_000 });
   const n = Number(r.stdout.trim());
   return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+// The editor's once-a-second "did anything move" probe, one round trip: (a) has ANY
+// entry under /workspace changed since the last probe — a `find` against a marker file
+// that stops at the first hit, by ctime (set by the kernel on every write/rename/
+// delete/chmod; no tool can backdate it, unlike mtime), skipping node_modules-class
+// noise and .git/objects — and (b) the mtimes of the files the editor has open (0 =
+// gone). Agents, terminals, git and workspace sync all show up the same way: they
+// touch the filesystem. The page runs the expensive `git status` only when (a) says yes.
+// The marker is per view (many editors on one sandbox must not eat each other's ticks)
+// and is refreshed BEFORE the scan (a write during the scan lands in the next tick).
+async function probe(sandboxId: string, viewId: string, rels: string[], res: ServerResponse): Promise<void> {
+  const cmd =
+    `M="/tmp/.iso-probe-$ISO_VIEW"; if [ -e "$M" ]; then touch "$M.next"; ` +
+    `if find "$M" -cnewer "$M" >/dev/null 2>&1; then P=-cnewer; else P=-newer; fi; ` +
+    `n=$(find "$ISO_WS" -mindepth 1 \\( -name node_modules -o -name .venv -o -name venv -o -name __pycache__ -o -name .cache -o -path '*/.git/objects' -o -path '*/.git/logs' \\) -prune -o "$P" "$M" -print 2>/dev/null | head -1); ` +
+    `mv -f "$M.next" "$M"; [ -n "$n" ] && echo CHANGED; else touch "$M"; echo CHANGED; fi; ` +
+    `cd "$ISO_WS" && printf '%s\\n' "$ISO_PATHS" | while IFS= read -r f; do [ -n "$f" ] || continue; m=$(stat -c %Y "$f" 2>/dev/null); printf '%s\\t%s\\n' "\${m:-0}" "$f"; done`;
+  const r = await run(sandboxId, cmd, {
+    envs: { ISO_WS: WORKSPACE, ISO_VIEW: viewId.replace(/[^A-Za-z0-9_-]/g, ""), ISO_PATHS: rels.join("\n") },
+    timeoutMs: 20_000,
+  });
+  const mtimes: Record<string, number> = {};
+  let changed = false;
+  for (const line of r.stdout.split("\n")) {
+    if (line === "CHANGED") {
+      changed = true;
+      continue;
+    }
+    const tab = line.indexOf("\t");
+    if (tab < 0) continue;
+    mtimes[line.slice(tab + 1)] = Number(line.slice(0, tab)) || 0;
+  }
+  json(res, 200, { changed, mtimes });
 }
 
 // Tree file operations, one endpoint: create/mkdir/rename/copy/delete. Both paths ride
@@ -165,12 +201,19 @@ export async function handleCodeView(req: IncomingMessage, res: ServerResponse, 
 
   if (rest.startsWith("/api/")) {
     try {
+      // Source control: the sidebar's git section, tree decorations, diffs and git ops.
+      if (rest.startsWith("/api/git/")) return await handleGitApi(req, res, view, rest.slice("/api/git".length), q);
       const raw = q.get("path");
       const rel = raw ? safeRelPath(raw) : undefined;
       if (rest === "/api/list" && method === "GET") {
         // Empty/absent path = the workspace root.
         if (raw && rel === undefined) return json(res, 400, { error: "bad path" });
         return await listDir(view.sandboxId, rel ?? "", res);
+      }
+      if (rest === "/api/probe" && method === "GET") {
+        const rels = q.getAll("path").map(safeRelPath);
+        if (rels.length > 200 || rels.some((p) => !p)) return json(res, 400, { error: "bad path" });
+        return await probe(view.sandboxId, view.id, rels as string[], res);
       }
       if (rest === "/api/file" && (method === "GET" || method === "PUT")) {
         if (!rel) return json(res, 400, { error: "bad path" });

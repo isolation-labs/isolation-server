@@ -1,19 +1,19 @@
-// The agent supervisor (PLAN O5a — design in docs/O5-agents.md). A session runs N
-// independent agents; each is its OWN conversation (a Claude-session-in-Cursor), with
-// its own identity, harness, and memory. No shared room, no coordinator. Coordination +
-// management is the control plane here (list/start/stop/message/spawn) — the operations
-// the web sidebar drives and, later, the iso-mcp tools an external orchestrator calls.
+// The agent supervisor (PLAN O5a, reshaped 2026-09-03: A VIEW IS THE THREAD). A session runs N
+// independent agents — personas with a harness and a credential. A CONVERSATION is a THREAD,
+// and a thread is an agent VIEW: its stable key names the transcript, which lives in the sandbox
+// under the workspace tree (threads.ts) — many threads per agent, each one window. No shared
+// room, no coordinator. Coordination + management is the control plane here (list/start/stop/
+// spawn); talking happens per view (agentview.ts, the /views/:id/messages route).
 //
-// Memory is AGNOSTIC: each agent's conversation persists per (workspace, agent) behind a
-// store interface (local per-server file now; the workspace persistence layer — R2 /
-// workspace file / injected sink — is the multi-server backing, O5 follow-up). Stable per
-// (workspace, agent) across sessions. Harness is pluggable + agnostic (echo built-in for
-// credential-free runs; claude-code/codex/gemini adapters plug in the same interface).
+// Every harness is an ACP agent (PLAN §5d): the harness MATERIALIZES the agent into its sandbox
+// (harness.ts) and the in-sandbox bridge (sandbox/iso-acp-bridge.mjs) drives it; this module is
+// the roster + credentials + the base prompt.
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import { HOME } from "./config.js";
-import { getHarness, type HarnessId } from "./harness.js";
+import type { HarnessId } from "./harness.js";
+import type { View } from "./views.js";
 
 const log = (...a: unknown[]) => console.log("[agents]", ...a);
 const STORE = join(HOME, "agents"); // <STORE>/<workspaceId>/<agentId>.json — stable per (workspace, agent)
@@ -26,7 +26,7 @@ export type AgentStatus = "idle" | "running" | "stopped";
 export interface AgentDef {
   id: string;
   name: string;
-  harness: HarnessId; // agnostic: "echo" | "claude-code" | "codex" | …
+  harness: HarnessId; // "claude-code" | "codex" | "goose" | …
   model?: string | null;
   systemPrompt?: string; // the USER layer (base Isolation prompt is prepended at run time)
   npub?: string; // its addressable identity (public part; the nsec is a stored secret)
@@ -46,35 +46,42 @@ interface AgentRecord {
   sessionId: string;
   sandboxId?: string;
   status: AgentStatus;
-  conversation: Message[];
 }
 
 // Live agents, keyed by a session-scoped runtime id (`a-…`). The DEFINITION id is stable
 // per workspace; the runtime id is this instance in this session.
 const live = new Map<string, AgentRecord>();
 
-// --- agnostic conversation memory (per workspace, per agent) -------------------
+// The launch's per-agent credentials (the cloud's sealed `agentSecrets`, opened by the session
+// layer): agent definition id → the env its harness runs with. With the Credential Vault the
+// token is a placeholder the sidecar overwrites; the base URL is the agent's own gateway slot.
+export interface AgentCredential {
+  kind: string;
+  provider: string;
+  token: string; // the agent's gateway token
+  baseUrl?: string; // its gateway slot
+  accountId?: string; // ChatGPT subscriptions: what Codex's login file needs beside the token
+}
+const credentials = new Map<string, AgentCredential>(); // `${sessionId}:${agentDefId}`
+export function setAgentCredentials(sessionId: string, list: { key: string; credential: AgentCredential }[]): void {
+  for (const { key, credential } of list) credentials.set(`${sessionId}:${key}`, credential);
+}
+export function parseAgentSecrets(raw: unknown): { key: string; credential: AgentCredential }[] {
+  const list = (raw as { credentials?: unknown })?.credentials;
+  if (!Array.isArray(list)) return [];
+  return list.flatMap((e: Record<string, unknown>) => {
+    const c = e?.credential as Record<string, unknown> | undefined;
+    return typeof e?.key === "string" && c && typeof c.token === "string"
+      ? [{ key: e.key, credential: { kind: String(c.kind ?? "apiKey"), provider: String(c.provider ?? "anthropic"), token: c.token, baseUrl: typeof c.baseUrl === "string" ? c.baseUrl : undefined, accountId: typeof c.accountId === "string" ? c.accountId : undefined } }]
+      : [];
+  });
+}
+// The agent's own credential (its gateway slot), if the launch carried one; else the sandbox's
+// own env (the session slot) applies.
+export const credentialFor = (sessionId: string, agentDefId: string): AgentCredential | undefined => credentials.get(`${sessionId}:${agentDefId}`);
 
-function convPath(workspaceId: string, agentDefId: string): string {
-  const dir = join(STORE, safe(workspaceId));
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  return join(dir, `${safe(agentDefId)}.json`);
-}
-const safe = (s: string): string => s.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 128) || "x";
-
-function loadConversation(workspaceId: string, agentDefId: string): Message[] {
-  try {
-    return JSON.parse(readFileSync(convPath(workspaceId, agentDefId), "utf8")) as Message[];
-  } catch {
-    return [];
-  }
-}
-function saveConversation(rec: AgentRecord): void {
-  const p = convPath(rec.workspaceId, rec.def.id);
-  const tmp = `${p}.tmp`;
-  writeFileSync(tmp, JSON.stringify(rec.conversation), { mode: 0o600 });
-  renameSync(tmp, p);
-}
+// (The old per-server conversation files under <HOME>/agents are gone: threads live in the
+// sandbox — threads.ts. STORE stays only for the legacy listing helper below.)
 
 // --- the base Isolation system prompt (framework layer) ------------------------
 
@@ -84,8 +91,8 @@ function saveConversation(rec: AgentRecord): void {
 function basePrompt(def: AgentDef): string {
   return [
     `You are "${def.name}", an autonomous agent working inside an Isolation session — an isolated container with a project checked out at /workspace.`,
-    `You are one of several independent agents on this workspace; each has its own separate conversation. You do NOT share a chat with the others.`,
-    `You coordinate ONLY through the shared files at /workspace (git) and through the structured control plane (never by chatting at another agent).`,
+    `You are one of several independent agents on this workspace; each conversation (thread) is separate. You do NOT share a chat with the others.`,
+    `You coordinate through the shared files at /workspace (git) and through the \`isolation\` tools (thread_send to another agent, never by assuming it reads your chat).`,
     `Your own instructions follow.`,
   ].join(" ");
 }
@@ -101,7 +108,6 @@ function newAgent(workspaceId: string, sessionId: string, sandboxId: string | un
     sessionId,
     sandboxId,
     status,
-    conversation: loadConversation(workspaceId, def.id), // re-hydrate stable memory
   };
   const runtimeId = `a-${randomBytes(5).toString("hex")}`;
   live.set(runtimeId, rec);
@@ -154,36 +160,17 @@ export function stopAgent(agentId: string): boolean {
 
 export function dropSessionAgents(sessionId: string): void {
   for (const [k, r] of live) if (r.sessionId === sessionId) live.delete(k);
+  for (const k of [...credentials.keys()]) if (k.startsWith(`${sessionId}:`)) credentials.delete(k);
 }
 
-// --- the conversation turn ------------------------------------------------------
+// The thread a view names: its workspace-level key when it has one (the same window in the next
+// session is the same chat), else the session-local view id (a chat that dies with the session).
+export const threadKeyOf = (view: View): string => view.specKey || view.id;
 
-// Send a message to ONE agent and get its reply. Boots a lazy/stopped agent (a message is
-// an implicit start). Persists the thread (agnostic memory). Independent per agent.
-export async function sendMessage(agentId: string, text: string, from = "sidebar"): Promise<{ reply: Message } | { error: string }> {
-  const id = findRuntimeId(agentId);
-  if (!id) return { error: "unknown agent" };
-  const rec = live.get(id) as AgentRecord;
-  if (rec.status !== "running") rec.status = "running"; // a message starts a lazy/stopped agent
-  const user: Message = { role: "user", text, ts: Date.now(), from };
-  rec.conversation.push(user);
-  try {
-    const harness = getHarness(rec.def.harness);
-    const replyText = await harness.runTurn({
-      systemPrompt: effectiveSystemPrompt(rec.def),
-      history: rec.conversation.slice(0, -1),
-      userText: text,
-      agent: { id: rec.def.id, name: rec.def.name, model: rec.def.model ?? undefined },
-      sandboxId: rec.sandboxId,
-    });
-    const reply: Message = { role: "assistant", text: replyText, ts: Date.now() };
-    rec.conversation.push(reply);
-    saveConversation(rec);
-    return { reply };
-  } catch (e) {
-    rec.conversation.pop(); // don't persist a user turn that errored with no reply
-    return { error: String((e as Error)?.message ?? e) };
-  }
+// The agent a view is a window onto — by roster definition id or runtime id, in the view's session.
+export function agentForView(view: View): (AgentRecord & { runtimeId: string }) | undefined {
+  if (!view.agentId) return undefined;
+  return [...live.entries()].filter(([, r]) => r.sandboxId === view.sandboxId).map(([runtimeId, r]) => ({ ...r, runtimeId })).find((a) => a.def.id === view.agentId || a.runtimeId === view.agentId);
 }
 
 // JSON projections for the API.
@@ -196,7 +183,6 @@ export const agentJson = (r: AgentRecord & { runtimeId: string }) => ({
   npub: r.def.npub ?? null,
   lifecycle: r.def.lifecycle ?? "always",
   status: r.status,
-  messages: r.conversation.length,
 });
 
 export { STORE as AGENTS_STORE };
@@ -206,13 +192,16 @@ export function parseRoster(raw: unknown): AgentDef[] {
   if (!Array.isArray(raw)) return [];
   const out: AgentDef[] = [];
   for (const a of raw) {
-    if (typeof a?.id !== "string" || typeof a?.name !== "string") continue;
+    // The cloud's compose-launch specs carry the agent id as `key` and the prompt as
+    // `instructions` (PLAN §12); the daemon-era roster used `id` / `systemPrompt`. Take either.
+    const id = typeof a?.id === "string" ? a.id : typeof a?.key === "string" ? a.key : undefined;
+    if (!id || typeof a?.name !== "string") continue;
     out.push({
-      id: a.id,
+      id,
       name: a.name,
-      harness: (typeof a.harness === "string" ? a.harness : "echo") as HarnessId,
+      harness: (typeof a.harness === "string" ? a.harness : "claude-code") as HarnessId,
       model: typeof a.model === "string" ? a.model : null,
-      systemPrompt: typeof a.systemPrompt === "string" ? a.systemPrompt : "",
+      systemPrompt: typeof a.systemPrompt === "string" ? a.systemPrompt : typeof a.instructions === "string" ? a.instructions : "",
       npub: typeof a.npub === "string" ? a.npub : undefined,
       lifecycle: a.lifecycle === "lazy" ? "lazy" : "always",
     });

@@ -87,6 +87,10 @@ const NODE_VERSION = "22.14.0";
 const TTYD_VERSION = "1.7.7";
 const FILEBROWSER_VERSION = "2.63.16";
 const DEVCONTAINER_CLI_VERSION = "0.80.0";
+// The ACP adapters + goose the agent view drives (PLAN §5d) — pinned with the tooling image.
+const CLAUDE_ACP_VERSION = "0.73.0";
+const CODEX_ACP_VERSION = "1.8.0";
+const GOOSE_VERSION = "1.49.0";
 const PULL_TIMEOUT_MS = 10 * 60_000;
 const DOCKER_CFG_ROOT = join(HOME, "docker-config");
 
@@ -99,7 +103,10 @@ export function imageExists(tag: string): boolean {
 
 // The tooling layer every session gets, whatever its base: git/tmux (clones, terminal
 // mirror), a static Node bundled as `iso-node` (the web-view forwarder — exposed as
-// node/npm only when the base has none), ttyd, filebrowser. Every fetch is
+// node/npm only when the base has none), ttyd, filebrowser, and the native agent CLIs —
+// `claude` (Claude Code) and `codex` plus their ACP adapters and goose (PLAN §5d: the agent
+// view drives every harness over ACP) — installed under the bundled Node so an agent always
+// has its harness whatever the base image is. Every fetch is
 // arch-matched and the optional ones are guarded so an exotic base degrades a view
 // instead of failing the build. (The code view is doorman-served Monaco — nothing to
 // install in the image; PLAN V1 dropped code-server.)
@@ -117,6 +124,11 @@ RUN set -eux; ARCH="$(uname -m)"; case "$ARCH" in x86_64) T=x86_64;; aarch64|arm
 RUN (set -eux; ARCH="$(uname -m)"; case "$ARCH" in x86_64) F=amd64;; aarch64|arm64) F=arm64;; *) F="$ARCH";; esac; \\
     curl -fsSL "https://github.com/filebrowser/filebrowser/releases/download/v${FILEBROWSER_VERSION}/linux-$F-filebrowser.tar.gz" | tar -xz -C /usr/local/bin filebrowser \\
     && chmod +x /usr/local/bin/filebrowser) || true
+RUN (set -eux; /opt/iso/bin/npm install -g --no-fund --no-audit @anthropic-ai/claude-code @openai/codex @agentclientprotocol/claude-agent-acp@${CLAUDE_ACP_VERSION} @agentclientprotocol/codex-acp@${CODEX_ACP_VERSION}; \\
+    for b in claude codex claude-agent-acp codex-acp; do if [ -x "/opt/iso/bin/$b" ]; then ln -sf "/opt/iso/bin/$b" "/usr/local/bin/$b"; fi; done) || true
+RUN (set -eux; ARCH="$(uname -m)"; case "$ARCH" in x86_64) G=x86_64;; aarch64|arm64) G=aarch64;; *) G="$ARCH";; esac; \\
+    (command -v bzip2 >/dev/null || (command -v apt-get >/dev/null && apt-get update && apt-get install -y --no-install-recommends bzip2 && rm -rf /var/lib/apt/lists/*)); \\
+    mkdir -p /tmp/goose; curl -fsSL "https://github.com/block/goose/releases/download/v${GOOSE_VERSION}/goose-$G-unknown-linux-gnu.tar.bz2" | tar -xj -C /tmp/goose; mv /tmp/goose/goose /usr/local/bin/goose; chmod +x /usr/local/bin/goose; rm -rf /tmp/goose) || true
 RUN mkdir -p /workspace
 WORKDIR /workspace
 `;
