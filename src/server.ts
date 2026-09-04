@@ -108,7 +108,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (origin && originAllowed(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
   }
   if (method === "OPTIONS") return void res.writeHead(204).end();
 
@@ -503,6 +503,9 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (typeof b.label === "string") patch.label = b.label.trim() || undefined;
     if (restyling) patch.style = sanitizeStyle(b.style);
     const nv = updateView(vid, patch) ?? v;
+    // The in-sandbox views file carries each view's label — a rename that skipped it would
+    // leave the agents' `views` tool naming the window by its old label until the next launch.
+    if ("label" in patch) await syncViewsFile(v.sandboxId).catch(() => undefined);
     if (restyling) {
       try {
         await restartTerminal(nv);

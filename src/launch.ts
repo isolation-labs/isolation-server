@@ -406,11 +406,23 @@ async function startViewProcess(sandboxId: string, view: View): Promise<void> {
 }
 
 // Restart a terminal's ttyd over its existing tmux session (restyle): the shell, its
-// scrollback and any running process survive — only the front changes. The kill is AWAITED
-// so the new ttyd doesn't race the old one for the port.
+// scrollback and any running process survive — only the front changes.
 export async function restartTerminal(view: View): Promise<void> {
   if (view.type !== "terminal") return;
-  await run(view.sandboxId, `pkill -f ${JSON.stringify(`ttyd .*-p ${view.port} `)} || true`).catch(() => undefined);
+  // `^ttyd ` anchors the match to the ttyd process itself — an unanchored pattern also matches
+  // the shell running this very pkill (its command line contains the pattern), which then dies
+  // mid-command and turns a clean restart into a reported failure.
+  // Awaiting pkill only means the SIGNAL was sent: ttyd still has to unwind libwebsockets and
+  // reap its pty child, and until it does it OWNS the listen socket — the replacement would
+  // lose the bind and exit, leaving a dead view. So wait for the process to actually go (SIGKILL
+  // as the backstop) before starting the new one.
+  const pat = JSON.stringify(`^ttyd .*-p ${view.port} `);
+  await run(
+    view.sandboxId,
+    `pkill -f ${pat} || true; i=0; while pgrep -f ${pat} >/dev/null 2>&1 && [ "$i" -lt 25 ]; do sleep 0.2; i=$((i+1)); done; ` +
+      `pgrep -f ${pat} >/dev/null 2>&1 && pkill -9 -f ${pat}; true`,
+    { timeoutMs: 20_000 },
+  ).catch(() => undefined);
   await startViewProcess(view.sandboxId, view);
 }
 
