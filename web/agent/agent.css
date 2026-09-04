@@ -66,6 +66,9 @@ body { background: var(--bg); color: var(--fg); font: 14px/1.5 -apple-system, Bl
 .md li.task.done::before { content: "☑ "; color: var(--ok); }
 .md blockquote { margin: 6px 0; padding: 2px 10px; border-left: 3px solid var(--line); color: var(--muted); }
 .md a { color: var(--blue); }
+.file-link { cursor: pointer; }
+.md a.file-link { color: inherit; text-decoration: underline dotted var(--muted); text-underline-offset: 3px; }
+.md a.file-link:hover, .loc.file-link:hover, .diff-path.file-link:hover { color: var(--blue); }
 .md table { border-collapse: collapse; margin: 8px 0; font-size: 13px; }
 .md th, .md td { border: 1px solid var(--line); padding: 4px 8px; }
 .md hr { border: 0; border-top: 1px solid var(--line); }

@@ -23,7 +23,38 @@ function inline(s: string): string {
   return out.replace(/\u0000(\d+)\u0000/g, (_m, k: string) => codeSpans[Number(k)] ?? "");
 }
 
+// --- workspace file links --------------------------------------------------------
+// Paths the agent mentions become links the page turns into "open in the code view"
+// (main.tsx posts `isolation:open-file` to the embedding SPA). Absolute `/workspace/…` paths
+// always link; a relative path links when it has a directory part; a bare `Name.ext:17` links
+// when an absolute path with that basename appeared earlier in the same message.
+const PATH_RE = /(?<![\w/.-])(\/workspace\/[\w.@+-][\w.@+\/-]*|(?:[\w.@+-]+\/)+[\w.@+-]+\.[A-Za-z0-9]{1,8}|[\w.@+-]+\.[A-Za-z0-9]{1,8})(?::(\d+))?(?::\d+)?(?![\w/])/g;
+
+function linkify(html: string, seen: Map<string, string>): string {
+  // Only text nodes and code spans are candidates; anchors/pre blocks stay as they are.
+  return html.replace(/(<a\b[^>]*>[\s\S]*?<\/a>|<pre\b[\s\S]*?<\/pre>)|(<code>)([\s\S]*?)(<\/code>)|([^<]+)/g, (m, keep: string | undefined, o: string | undefined, code: string | undefined, c: string | undefined, text: string | undefined) => {
+    if (keep) return keep;
+    const body = code ?? text ?? "";
+    const out = body.replace(PATH_RE, (whole, path: string, line: string | undefined) => {
+      let rel: string | undefined;
+      if (path.startsWith("/workspace/")) {
+        rel = path.slice("/workspace/".length);
+        seen.set(rel.split("/").pop() ?? rel, rel);
+      } else if (path.includes("/")) rel = path.replace(/^\.\//, "");
+      else rel = seen.get(path);
+      if (!rel || !/\.[A-Za-z0-9]{1,8}$/.test(rel)) return whole;
+      return `<a class="file-link" href="#" data-file="${esc(rel)}"${line ? ` data-line="${line}"` : ""} title="Open in the code view">${whole}</a>`;
+    });
+    return code ? `${o}${out}${c}` : out;
+  });
+}
+
 export function renderMarkdown(src: string): string {
+  const seen = new Map<string, string>();
+  return linkify(renderBlocks(src), seen);
+}
+
+function renderBlocks(src: string): string {
   const lines = src.replace(/\r\n?/g, "\n").split("\n");
   const html: string[] = [];
   let i = 0;
@@ -74,7 +105,7 @@ export function renderMarkdown(src: string): string {
       flush();
       const q: string[] = [];
       while (i < lines.length && /^\s*>\s?/.test(lines[i])) q.push(lines[i++].replace(/^\s*>\s?/, ""));
-      html.push(`<blockquote>${renderMarkdown(q.join("\n"))}</blockquote>`);
+      html.push(`<blockquote>${renderBlocks(q.join("\n"))}</blockquote>`);
       continue;
     }
     if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {

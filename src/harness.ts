@@ -55,6 +55,7 @@ const instructions = (persona: string): string =>
     "You run inside an Isolation session. The `isolation` MCP server gives you tools: `session_info` (who/where you are),",
     "`views` (the windows of this session), `memory_read`/`memory_write` (your own note for this workspace — keep it short and",
     "current), and `thread_send` (message another agent's thread). Read your memory when a task touches earlier work.",
+    "Refer to files by their full `/workspace/...` path (with `:line` when useful) — the chat turns those into links that open the file in the code view.",
     "",
   ].join("\n");
 

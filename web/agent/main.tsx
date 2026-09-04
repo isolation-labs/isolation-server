@@ -30,9 +30,24 @@ const phaseLabel: Record<State["phase"], string> = {
 
 const TOOL_ICON: Record<string, string> = { read: "◎", edit: "✎", delete: "✕", move: "⇄", search: "⌕", execute: "▶", think: "◌", fetch: "⇣", switch_mode: "⇆", other: "⚙" };
 
+// A workspace-relative file (+ line) → the code view. The page is an iframe inside the SPA,
+// which routes `isolation:open-file` into the session's code view (or opens one); standalone
+// there is nothing to open, so the click is a no-op beyond the hint.
+export function openInEditor(file: string, line?: number): void {
+  const rel = file.replace(/^\/workspace\//, "").replace(/^\.\//, "");
+  if (window.parent !== window) window.parent.postMessage({ type: "isolation:open-file", file: rel, ...(line ? { line } : {}) }, "*");
+  else showError("Open this chat inside a session to jump to files");
+}
+
 function Markdown({ text, className }: { text: string; className?: string }) {
   const html = useMemo(() => renderMarkdown(text), [text]);
-  return <div class={`md ${className ?? ""}`} dangerouslySetInnerHTML={{ __html: html }} />;
+  const onClick = (e: MouseEvent) => {
+    const a = (e.target as HTMLElement).closest?.("a.file-link") as HTMLAnchorElement | null;
+    if (!a) return;
+    e.preventDefault();
+    openInEditor(a.dataset.file ?? "", a.dataset.line ? Number(a.dataset.line) : undefined);
+  };
+  return <div class={`md ${className ?? ""}`} onClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
 // A small line diff (LCS on lines) for edit tool calls; big files fall back to after-only.
@@ -83,7 +98,9 @@ function DiffView({ path, oldText, newText }: { path: string; oldText?: string |
   const diff = useMemo(() => (oldText != null ? lineDiff(oldText, newText) : undefined), [oldText, newText]);
   return (
     <div class="diff">
-      <div class="diff-path">{path}</div>
+      <div class="diff-path file-link" title="Open in the code view" onClick={() => openInEditor(path)}>
+        {path.replace(/^\/workspace\//, "")}
+      </div>
       {diff ? (
         <pre class="diff-body">
           {diff.map((l, k) => (
@@ -122,7 +139,15 @@ function ToolCard({ call }: { call: ToolCallState }) {
         {call.locations.length > 0 && (
           <span class="tool-locs">
             {call.locations.slice(0, 3).map((l, k) => (
-              <span key={k} class="loc">
+              <span
+                key={k}
+                class="loc file-link"
+                title="Open in the code view"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openInEditor(l.path, l.line ?? undefined);
+                }}
+              >
                 {l.path.replace(/^\/workspace\//, "")}
                 {l.line ? `:${l.line}` : ""}
               </span>
