@@ -4,7 +4,7 @@
 // is small enough that a framework would outweigh it.
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { GATE_VERSION } from "./version.js";
-import { HOST, PORT, getName, getPairing, getToken, isLoopbackOrigin, originAllowed, savePairing, tokenMatches } from "./config.js";
+import { HOST, PORT, getName, getPairing, getToken, isLoopbackOrigin, originAllowed, savePairing, tokenMatches, getMachineId } from "./config.js";
 import { beatOffline, detach, pairingStatus, startHeartbeat } from "./heartbeat.js";
 import { deleteSandbox, getSandbox, listSandboxes, osbHealthy, pauseSandbox, resumeSandbox, sandboxLogs } from "./opensandbox.js";
 import { handlePublicWebRequest, handlePublicWebUpgrade, handleViewRequest, handleViewUpgrade, invalidateEndpoints } from "./doorman.js";
@@ -183,7 +183,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       const r = await fetch(`${backendUrl}/api/pair/claim`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code, url: myUrl, token: getToken(), label }),
+        body: JSON.stringify({ code, url: myUrl, token: getToken(), label, machineId: getMachineId() }),
       });
       const claim = (await r.json().catch(() => ({}))) as { connectionId?: string; secret?: string; label?: string; error?: string };
       if (!r.ok) return json(res, r.status, { error: claim.error ?? `HTTP ${r.status}` });
