@@ -68,34 +68,57 @@ test("parseRoster: shapes, defaults, and garbage rejection", () => {
     "garbage",
   ]);
   assert.equal(roster.length, 2);
-  assert.equal(roster[0].harness, "echo");
+  assert.equal(roster[0].harness, "claude-code");
   assert.equal(roster[0].lifecycle, "always");
   assert.equal(roster[1].lifecycle, "lazy");
   assert.equal(agents.parseRoster("not-an-array").length, 0);
 });
 
 test("effectiveSystemPrompt layers the base under the user prompt", () => {
-  const p = agents.effectiveSystemPrompt({ id: "x", name: "Rev", harness: "echo", systemPrompt: "You review PRs." });
+  const p = agents.effectiveSystemPrompt({ id: "x", name: "Rev", harness: "claude-code", systemPrompt: "You review PRs." });
   assert.ok(p.includes('You are "Rev"'));
   assert.ok(p.endsWith("You review PRs."));
 });
 
-test("echo harness proves persona + per-agent history", async () => {
-  const h = harness.getHarness("echo");
-  const out = await h.runTurn({
-    systemPrompt: "base\n\npersona text",
-    history: [{ role: "user", text: "one" }, { role: "assistant", text: "r" }],
-    userText: "two",
-    agent: { id: "a", name: "A" },
-  });
-  assert.ok(out.text.includes("persona text"));
-  assert.ok(out.text.includes("turn 2"));
+test("harness materializers: claude-code / codex / goose shape their HOME + env (PLAN §5d)", () => {
+  const mcp = { name: "isolation", command: "/tmp/.iso-mcp.sh", args: [], env: { ISO_AGENT_ID: "a" } };
+  const claude = harness.getHarness("claude-code").materialize({ home: "/h", agent: { id: "a", name: "A", model: "claude-sonnet-5" }, persona: "be A", credential: { kind: "subscription", provider: "anthropic", token: "tok", baseUrl: "https://gw/t/a" }, mcp });
+  assert.equal(claude.command, "claude-agent-acp");
+  assert.equal(claude.env.ANTHROPIC_API_KEY, "tok");
+  assert.equal(claude.env.ANTHROPIC_BASE_URL, "https://gw/t/a");
+  assert.equal(claude.env.ANTHROPIC_MODEL, "claude-sonnet-5");
+  assert.equal(claude.env.IS_SANDBOX, "1");
+  assert.equal(claude.initialModeId, "bypassPermissions");
+  const md = claude.files.find((f) => f.path === "/h/.claude/CLAUDE.md");
+  assert.ok(md && md.content.startsWith("be A") && md.content.includes("thread_send"));
+
+  const codexSub = harness.getHarness("codex").materialize({ home: "/h", agent: { id: "b", name: "B", model: "gpt-5.3-codex" }, persona: "be B", credential: { kind: "subscription", provider: "openai", token: "gwtok", baseUrl: "https://gw/t/b/v1", accountId: "acct" }, mcp });
+  assert.equal(codexSub.command, "codex-acp");
+  assert.equal(codexSub.env.OPENAI_API_KEY, undefined, "a subscription keeps every key out of codex's env");
+  assert.equal(codexSub.env.CODEX_HOME, "/h/.codex");
+  const auth = JSON.parse(codexSub.files.find((f) => f.path === "/h/.codex/auth.json").content);
+  assert.equal(auth.tokens.account_id, "acct");
+  const toml = codexSub.files.find((f) => f.path === "/h/.codex/config.toml").content;
+  assert.ok(toml.includes('chatgpt_base_url = "https://gw/t/b/backend-api/"'));
+  assert.ok(toml.includes('model = "gpt-5.3-codex"'));
+  assert.ok(toml.includes("requires_openai_auth = true"));
+
+  const codexKey = harness.getHarness("codex").materialize({ home: "/h", agent: { id: "c", name: "C" }, persona: "p", credential: { kind: "apiKey", provider: "openai", token: "k", baseUrl: "https://gw/t/c/v1" }, mcp });
+  assert.equal(codexKey.env.OPENAI_API_KEY, "k");
+  assert.ok(codexKey.files.find((f) => f.path === "/h/.codex/config.toml").content.includes('base_url = "https://gw/t/c/v1"'));
+
+  const g = harness.getHarness("goose").materialize({ home: "/h", agent: { id: "d", name: "D" }, persona: "p", credential: { kind: "apiKey", provider: "openai", token: "k", baseUrl: "https://gw/t/d/v1" }, mcp });
+  assert.deepEqual([g.command, g.args], ["goose", ["acp"]]);
+  assert.equal(g.env.OPENAI_HOST, "https://gw/t/d");
+  assert.equal(g.env.GOOSE_DISABLE_KEYRING, "1");
+  const yaml = g.files.find((f) => f.path === "/h/.config/goose/config.yaml").content;
+  assert.ok(yaml.includes("active_provider: openai") && yaml.includes("  isolation:") && yaml.includes('cmd: "/tmp/.iso-mcp.sh"'));
 });
 
 test("unknown harness reports itself instead of crashing", async () => {
   const h = harness.getHarness("nope");
   assert.equal(h.installed, false);
-  await assert.rejects(() => h.runTurn({ systemPrompt: "", history: [], userText: "x", agent: { id: "a", name: "A" } }));
+  assert.throws(() => h.materialize({ home: "/h", agent: { id: "a", name: "A" }, persona: "", mcp: { name: "isolation", command: "x", args: [], env: {} } }));
 });
 
 test("local sink: ETag CAS contract (create, stale, advance, id safety)", () => {

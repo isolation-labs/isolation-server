@@ -5,6 +5,7 @@
 import { endpointFor } from "./opensandbox.js";
 
 const EXECD_PORT = 44772;
+const BACKGROUND_TIMEOUT_MS = 10 * 365 * 24 * 3600 * 1000; // "forever" for a view process
 
 // Published host ports are stable while the sandbox runs; re-resolve on failure.
 const hosts = new Map<string, string>();
@@ -44,7 +45,10 @@ export async function run(sandboxId: string, command: string, opts: RunOpts = {}
       ...(opts.cwd ? { cwd: opts.cwd } : {}),
       ...(opts.envs ? { envs: opts.envs } : {}),
       ...(opts.background ? { background: true } : {}),
-      timeout: opts.timeoutMs ?? 120_000,
+      // execd enforces `timeout` on BACKGROUND commands too (the process is killed when it
+      // elapses — hard-learned: every view process died two minutes in), so a background
+      // command gets an effectively unbounded one unless the caller bounds it.
+      timeout: opts.timeoutMs ?? (opts.background ? BACKGROUND_TIMEOUT_MS : 120_000),
     }),
   });
   if (!r.ok) {

@@ -16,6 +16,7 @@ import { getView, verifyViewToken, viewBySlug, type View } from "./views.js";
 import { startWebForwarder, webForwarderAlive } from "./launch.js";
 import { handleCodeView } from "./codeview.js";
 import { handleAgentView } from "./agentview.js";
+import { ensureBridge } from "./acpview.js";
 
 const proxy = httpProxy.createProxyServer({ ws: true, xfwd: true });
 proxy.on("error", (err, _req, res) => {
@@ -111,8 +112,9 @@ export async function handleViewRequest(req: IncomingMessage, res: ServerRespons
   if (queryToken) {
     res.setHeader("Set-Cookie", `isolation-server_token=${encodeURIComponent(queryToken)}; Path=/v/${viewId}; HttpOnly; SameSite=None; Secure`);
   }
-  // Code and agent views are first-party (PLAN V1/V2): the doorman serves the app and
-  // its API itself — there is no sandbox port to proxy to.
+  // Code and agent views are first-party (PLAN V1/§5d): the doorman serves the app (and the
+  // code view's API) itself. An agent view's WebSocket is the one thing proxied — to the
+  // in-sandbox ACP bridge (handleViewUpgrade).
   if (view.type === "code") {
     await handleCodeView(req, res, view, m[2] || "/");
     return true;
@@ -144,13 +146,22 @@ function viewPath(view: { type: string }, url: string | undefined, viewId: strin
 export async function handleViewUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
   const viewId = viewIdFromUrl(req.url);
   const view = viewId ? getView(viewId) : undefined;
-  if (!viewId || !view || view.type === "code" || view.type === "agent" || !authorized(req, viewId).ok) {
-    // Code/agent views are doorman-served static pages + REST — no WebSocket to upgrade to.
+  if (!viewId || !view || view.type === "code" || !view.port || !authorized(req, viewId).ok) {
+    // Code views are doorman-served static pages + REST — no WebSocket to upgrade to.
     socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
     socket.destroy();
     return;
   }
   try {
+    // An agent view's bridge can be gone (a crash, a sandbox restart, a lifecycle race), and
+    // execd answers a dead port with a 502 RESPONSE the proxy would relay silently — so the
+    // bridge is checked (and restarted, one attempt at a time per view) BEFORE the upgrade.
+    // The bridge reloads the harness session from the thread file, so nothing is lost.
+    if (view.type === "agent" && !(await healBridge(view))) {
+      socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
+      socket.destroy();
+      return;
+    }
     const t = await resolveTarget(view.sandboxId, view.port);
     req.url = `${t.basePath}${viewPath(view, req.url, viewId)}`;
     proxy.ws(req, socket, head, { target: `http://${t.host}` });
@@ -158,6 +169,17 @@ export async function handleViewUpgrade(req: IncomingMessage, socket: Duplex, he
     targets.delete(`${view.sandboxId}:${view.port}`);
     socket.destroy();
   }
+}
+
+// One heal in flight per view: concurrent reconnects share it instead of racing restarts.
+const bridgeHeals = new Map<string, Promise<boolean>>();
+function healBridge(view: View): Promise<boolean> {
+  let p = bridgeHeals.get(view.id);
+  if (!p) {
+    p = ensureBridge(view).finally(() => bridgeHeals.delete(view.id));
+    bridgeHeals.set(view.id, p);
+  }
+  return p;
 }
 
 // --- The public web plane (sandbox hostnames) -----------------------------------

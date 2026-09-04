@@ -1,69 +1,58 @@
-// The harness abstraction (PLAN O5 — agnostic brains). An agent names a harness; the
-// supervisor runs a turn through it. One tiny interface keeps the model model-agnostic:
-// `echo` is built in (deterministic, zero credentials — the credential-free test + demo
-// path); real adapters (claude-code / codex / gemini over ACP, or a CLI in the sandbox)
-// implement the SAME interface and register here. An unknown/uninstalled harness reports
-// itself rather than vanishing — the same "(not installed)" honesty as the catalog.
-import { AI_ENV_KEYS } from "./launch.js";
+// The harness abstraction (PLAN §5d — every harness is an ACP agent). An agent names a harness;
+// the harness MATERIALIZES the agent into a sandbox: the files under the agent's own HOME (its
+// instructions, its credential files, its config), the command that starts the ACP adapter,
+// and the env it runs with. The in-sandbox bridge (sandbox/iso-acp-bridge.mjs) then drives the
+// adapter over ACP — one identical client for claude-code, codex and goose; the harness-specific
+// knowledge lives entirely here. An unknown/uninstalled harness reports itself rather than
+// vanishing — the same "(not installed)" honesty as the catalog.
+import type { AgentCredential } from "./agents.js";
 
 export type HarnessId = string;
 
-export interface TurnInput {
-  systemPrompt: string; // base Isolation prompt + the user prompt, already merged
-  history: { role: "user" | "assistant"; text: string }[];
-  userText: string;
+export interface MaterializeInput {
+  home: string; // the agent's HOME inside the sandbox (per agent, under the workspace tree)
   agent: { id: string; name: string; model?: string };
-  sandboxId?: string; // where the agent's tools execute (real harnesses use this)
-  // The harness's own resumable session for THIS thread (claude-code's session id), if it has
-  // one from an earlier turn — a real harness keeps its context there, not in `history`.
-  harnessSession?: string;
-  // The agent's credential as ENV (PLAN §5b): the gateway base URL for its slot + a placeholder
-  // key the sidecar overwrites. Provided by the supervisor from the launch's sealed credentials.
-  env?: Record<string, string>;
+  persona: string; // the base Isolation prompt + the user's instructions, already merged
+  credential?: AgentCredential; // the agent's own credential (its gateway slot), else none
+  mcp: { name: string; command: string; args: string[]; env: Record<string, string> }; // the isolation MCP server
 }
 
-export interface TurnOutput {
-  text: string;
-  harnessSession?: string; // what to store on the thread for the next turn
+export interface Materialized {
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  files: { path: string; content: string; mode?: number }[];
+  initialModeId?: string; // an ACP session mode to select right after session/new, when offered
 }
 
 export interface Harness {
   id: HarnessId;
   label: string;
   installed: boolean;
-  runTurn(input: TurnInput): Promise<TurnOutput>;
+  materialize(input: MaterializeInput): Materialized;
 }
 
-// Built-in echo harness: proves the whole pipeline with no model credentials. It
-// demonstrates that (a) the base+user system prompt reached the harness, (b) the agent's
-// OWN history is what it sees (not another agent's), and (c) turns persist. It's not a
-// toy stub in the wrong place — it's the deterministic fixture every real adapter is
-// tested against, and the offline demo brain.
-const echo: Harness = {
-  id: "echo",
-  label: "Echo (built-in, no credentials)",
-  installed: true,
-  async runTurn({ systemPrompt, history, userText, agent }) {
-    const persona = (systemPrompt.split("\n\n").slice(1).join(" ").trim() || "(no user instructions)").slice(0, 120);
-    const priorUser = history.filter((m) => m.role === "user").length;
-    return {
-      text: [
-        `[${agent.name}] `,
-        `you said: "${userText}". `,
-        `I'm running as persona: ${persona}. `,
-        `this is turn ${priorUser + 1} of MY conversation${agent.model ? ` (model ${agent.model})` : ""}.`,
-      ].join(""),
-    };
-  },
-};
-
-// Claude Code IN the sandbox (PLAN §5 P1): each turn is one `claude -p` run over execd, resumed
-// from the thread's own claude session so the context lives in the sandbox with the code. The
-// CLI is installed on first use (npm, cached in the image later — TOOLING_VERSION). Permissions
-// are skipped: the sandbox IS the permission boundary. Credentials arrive as env — the agent's
-// gateway slot; the real key never enters the container (the sidecar injects it).
-const CLAUDE_INSTALL = 'command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 || (command -v iso-node >/dev/null 2>&1 && "$(dirname "$(command -v iso-node)")/npm" install -g @anthropic-ai/claude-code >/dev/null 2>&1)';
 export const shq = (v: string): string => `'${v.replace(/'/g, `'\\''`)}'`;
+
+// --- shared pieces ------------------------------------------------------------------
+
+// The instructions file every harness reads at start. The persona is the user's layer; the
+// framework layer names the `isolation` tools so the agent knows they exist.
+const instructions = (persona: string): string =>
+  [
+    persona,
+    "",
+    "## Isolation",
+    "You run inside an Isolation session. The `isolation` MCP server gives you tools: `session_info` (who/where you are),",
+    "`views` (the windows of this session), `memory_read`/`memory_write` (your own note for this workspace — keep it short and",
+    "current), and `thread_send` (message another agent's thread). Read your memory when a task touches earlier work.",
+    "",
+  ].join("\n");
+
+const envList = (env: Record<string, string>): { name: string; value: string }[] => Object.entries(env).map(([name, value]) => ({ name, value }));
+
+// --- Codex login/config (a ChatGPT subscription through the gateway) --------------------
+
 // Codex's login file for a ChatGPT subscription: the (gateway) token as the access token — the
 // gateway resolves the real OAuth — plus the account id the backend keys the plan off.
 // Codex decides "logged in" by DECODING the id token's claims (it cannot verify a signature and
@@ -83,148 +72,170 @@ export const codexAccessToken = (gatewayToken: string, accountId: string): strin
   const claims = { iss: "isolation", sub: accountId, exp: now + 365 * 86400, iat: now, isogw: gatewayToken, "https://api.openai.com/auth": { chatgpt_account_id: accountId, chatgpt_plan_type: "pro" } };
   return `${b64u(JSON.stringify({ alg: "HS256", typ: "JWT" }))}.${b64u(JSON.stringify(claims))}.${b64u("isolation")}`;
 };
-export const codexLoginFile = (accessToken: string, accountId: string): string =>
-  `mkdir -p ~/.codex && printf '%s' ${shq(JSON.stringify({ OPENAI_API_KEY: null, tokens: { id_token: codexIdToken(accountId), access_token: codexAccessToken(accessToken, accountId), refresh_token: "", account_id: accountId }, last_refresh: new Date().toISOString() }))} > ~/.codex/auth.json && chmod 600 ~/.codex/auth.json`;
+export const codexAuthJson = (accessToken: string, accountId: string): string =>
+  JSON.stringify({ OPENAI_API_KEY: null, tokens: { id_token: codexIdToken(accountId), access_token: codexAccessToken(accessToken, accountId), refresh_token: "", account_id: accountId }, last_refresh: new Date().toISOString() });
+export const codexLoginFile = (accessToken: string, accountId: string): string => `mkdir -p ~/.codex && printf '%s' ${shq(codexAuthJson(accessToken, accountId))} > ~/.codex/auth.json && chmod 600 ~/.codex/auth.json`;
+
+// Codex's config for a gateway slot. ChatGPT mode through the gateway: codex's built-in provider
+// speaks a websocket the gateway cannot carry, so the slot is declared as a provider of our own in
+// ChatGPT-auth mode (requires_openai_auth) with websockets off — plain HTTPS to
+// <slot>/backend-api/codex. An API key rides an explicit HTTP-only provider (the default dials
+// api.openai.com over a websocket, ignoring OPENAI_BASE_URL).
+export function codexConfigToml(opts: { gatewayRoot?: string; subscription: boolean; model?: string }): string {
+  const lines: string[] = [];
+  if (opts.model) lines.push(`model = ${JSON.stringify(opts.model)}`);
+  if (opts.gatewayRoot && opts.subscription) {
+    lines.push(`chatgpt_base_url = ${JSON.stringify(`${opts.gatewayRoot}/backend-api/`)}`, `preferred_auth_method = "chatgpt"`, `model_provider = "iso"`, "", "[model_providers.iso]", `name = "iso"`, `base_url = ${JSON.stringify(`${opts.gatewayRoot}/backend-api/codex`)}`, `wire_api = "responses"`, `supports_websockets = false`, `requires_openai_auth = true`);
+  } else if (opts.gatewayRoot) {
+    lines.push(`model_provider = "iso"`, "", "[model_providers.iso]", `name = "iso"`, `base_url = ${JSON.stringify(`${opts.gatewayRoot}/v1`)}`, `wire_api = "responses"`, `supports_websockets = false`, `env_key = "OPENAI_API_KEY"`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+// --- the harnesses -----------------------------------------------------------------
+
+// Claude Code through the official ACP adapter. Its instructions live in the agent's own
+// user-level CLAUDE.md; permissions default to bypass (the sandbox IS the boundary — the
+// adapter only allows that with IS_SANDBOX set); the credential is the agent's gateway slot.
 const claudeCode: Harness = {
   id: "claude-code",
-  label: "Claude Code (in the sandbox)",
+  label: "Claude Code (ACP)",
   installed: true,
-  async runTurn({ systemPrompt, userText, agent, sandboxId, harnessSession, env }) {
-    if (!sandboxId) throw new Error("claude-code needs a running sandbox");
-    const { run } = await import("./execd.js");
-    const args = [
-      "claude",
-      "-p",
-      shq(userText),
-      "--output-format",
-      "json",
-      "--dangerously-skip-permissions",
-      // The persona rides EVERY turn: a resumed claude session does not remember flags from the
-      // turn that created it.
-      "--append-system-prompt",
-      shq(systemPrompt),
-      ...(harnessSession ? ["--resume", shq(harnessSession)] : []),
-      ...(agent.model ? ["--model", shq(agent.model)] : []),
-    ];
-    // An agent's credential replaces the WHOLE Anthropic pair (launch.ts AI_ENV_KEYS), exactly as
-    // applyAiCred does host-side: the container already carries the SESSION's credential, and
-    // `envs` can only ADD names. A leftover CLAUDE_CODE_OAUTH_TOKEN out-ranks the agent's key while
-    // the agent's ANTHROPIC_BASE_URL redirects it — the session's raw OAuth token to the agent's
-    // gateway slot. Clear every key of the pair the agent does not set itself.
-    const unset = env && AI_ENV_KEYS.some((k) => k in env) ? AI_ENV_KEYS.filter((k) => !(k in env)).flatMap((k) => ["-u", k]) : [];
-    const exe = unset.length ? ["env", ...unset, ...args] : args;
-    // IS_SANDBOX: Claude Code's own switch for "I am inside a container" — without it, skipping
-    // permissions is refused for root (which the sandbox user is).
-    const r = await run(sandboxId, `${CLAUDE_INSTALL}; ${exe.join(" ")}`, { cwd: "/workspace", envs: { IS_SANDBOX: "1", ...(env ?? {}) }, timeoutMs: 15 * 60_000 });
-    // `--output-format json` prints ONE object: { type: "result", result, session_id, is_error … }.
-    const line = r.stdout.split("\n").reverse().find((l) => l.trim().startsWith("{"));
-    let parsed: { result?: string; session_id?: string; is_error?: boolean; subtype?: string } | undefined;
-    try {
-      parsed = line ? JSON.parse(line) : undefined;
-    } catch {
-      parsed = undefined;
+  materialize({ home, agent, persona, credential, mcp }) {
+    const env: Record<string, string> = { IS_SANDBOX: "1", NO_BROWSER: "1", ...(agent.model ? { ANTHROPIC_MODEL: agent.model } : {}) };
+    if (credential) {
+      env.ANTHROPIC_API_KEY = credential.token;
+      if (credential.baseUrl) env.ANTHROPIC_BASE_URL = credential.baseUrl;
     }
-    if (!parsed) throw new Error((r.stderr || r.stdout).trim().split("\n").slice(-3).join(" / ").slice(0, 400) || "claude produced no result");
-    if (parsed.is_error) throw new Error(parsed.result?.slice(0, 400) || `claude: ${parsed.subtype ?? "error"}`);
-    return { text: parsed.result ?? "", harnessSession: parsed.session_id ?? harnessSession };
+    void mcp; // registered through ACP's session/new (the bridge config), not a file
+    return {
+      command: "claude-agent-acp",
+      args: [],
+      env,
+      files: [
+        { path: `${home}/.claude/CLAUDE.md`, content: instructions(persona), mode: 0o600 },
+        { path: `${home}/.claude/settings.json`, content: JSON.stringify({ permissions: { defaultMode: "bypassPermissions" } }, null, 2), mode: 0o600 },
+        // Skip the CLI's first-run onboarding (theme/login prompts) in an unattended home.
+        { path: `${home}/.claude.json`, content: JSON.stringify({ hasCompletedOnboarding: true, theme: "dark" }), mode: 0o600 },
+      ],
+      initialModeId: "bypassPermissions",
+    };
   },
 };
 
-// Codex IN the sandbox — the ChatGPT/OpenAI counterpart of claude-code: one `codex exec --json`
-// per turn, resumed from the thread's own codex thread (`codex exec resume <id>`), the agent's
-// instructions folded into the first prompt (codex exec has no system-prompt flag). Approvals
-// and codex's own sandbox are bypassed: ours is the boundary. Credentials arrive as env — the
-// OpenAI-shaped pair for the agent's gateway slot.
+// Codex through the official ACP adapter: the login + config files in the agent's own
+// ~/.codex (a ChatGPT subscription is a minted JWT pair pointing at the gateway slot; an API
+// key is an HTTP-only provider at the slot), instructions in ~/.codex/AGENTS.md, approvals and
+// codex's own sandbox bypassed — ours is the boundary.
 const codex: Harness = {
   id: "codex",
-  label: "Codex (in the sandbox)",
+  label: "Codex (ACP)",
   installed: true,
-  async runTurn({ systemPrompt, userText, agent, sandboxId, harnessSession, env }) {
-    if (!sandboxId) throw new Error("codex needs a running sandbox");
-    const { run } = await import("./execd.js");
-    // codex exec has no system-prompt flag and a resumed thread only sees the new prompt, so the
-    // persona is restated on every turn as a leading instructions block.
-    const prompt = `[Instructions for this session — follow them, they are not from the user]\n${systemPrompt}\n[End of instructions]\n\n${userText}`;
-    // Codex's default provider dials api.openai.com over a websocket, ignoring OPENAI_BASE_URL —
-    // so the gateway slot is declared as an explicit HTTP-only provider (Responses wire API,
-    // key from OPENAI_API_KEY). Without a base URL in env, codex's own defaults apply.
-    const base = env?.OPENAI_BASE_URL;
-    const gatewayRoot = base?.replace(/\/v1\/?$/, "");
-    // Two ways to the gateway: an API key rides an explicit HTTP-only provider (codex's default
-    // dials api.openai.com over a websocket); a ChatGPT subscription keeps codex's own ChatGPT
-    // mode but with `chatgpt_base_url` pointed at the gateway slot — codex sends its normal
-    // `/backend-api/codex/…` requests there, logged in with a placeholder the gateway swaps.
-    // ChatGPT mode through the gateway: codex's built-in provider speaks a websocket the gateway
-    // cannot carry, so the slot is declared as a provider of our own in ChatGPT-auth mode
-    // (requires_openai_auth) with websockets off — plain HTTPS to <slot>/backend-api/codex.
-    const provider = env?.CODEX_SUBSCRIPTION && gatewayRoot
-      ? [
-          "-c", shq(`chatgpt_base_url="${gatewayRoot}/backend-api/"`),
-          "-c", shq(`preferred_auth_method="chatgpt"`),
-          "-c", "model_provider=iso",
-          "-c", shq(`model_providers.iso={ name="iso", base_url="${gatewayRoot}/backend-api/codex", wire_api="responses", supports_websockets=false, requires_openai_auth=true }`),
-        ]
-      : base
-        ? ["-c", "model_provider=iso", "-c", shq(`model_providers.iso={ name="iso", base_url="${base}", wire_api="responses", supports_websockets=false, env_key="OPENAI_API_KEY" }`)]
-        : [];
-    const login = env?.CODEX_SUBSCRIPTION ? `${codexLoginFile(env.OPENAI_API_KEY ?? "isolation-vault", env.CODEX_ACCOUNT_ID ?? "")}; ` : "";
-    const common = ["--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", ...provider, "-C", "/workspace", ...(agent.model ? ["-m", shq(agent.model)] : [])];
-    // `resume` is a subcommand that only takes -c overrides: every exec-level flag goes BEFORE it.
-    const cmd = harnessSession
-      ? ["codex", "exec", ...common.filter((a, i, arr) => !(a === "-c" || (i > 0 && arr[i - 1] === "-c"))), "resume", ...common.filter((a, i, arr) => a === "-c" || (i > 0 && arr[i - 1] === "-c")), shq(harnessSession), shq(prompt)]
-      : ["codex", "exec", ...common, shq(prompt)];
-    // In ChatGPT mode an OPENAI_API_KEY in the environment wins over the login file and flips
-    // codex to API-key mode (straight to api.openai.com) — keep the key out of its env.
-    // The container env may carry the session slot's key too — unset both in the command itself.
-    const envs = env?.CODEX_SUBSCRIPTION ? Object.fromEntries(Object.entries(env).filter(([k]) => k !== "OPENAI_API_KEY" && k !== "OPENAI_BASE_URL")) : env;
-    const exe = env?.CODEX_SUBSCRIPTION ? ["env", "-u", "OPENAI_API_KEY", "-u", "OPENAI_BASE_URL", ...cmd] : cmd;
-    const r = await run(sandboxId, `${login}${exe.join(" ")}`, { cwd: "/workspace", envs, timeoutMs: 15 * 60_000 });
-    // JSONL: thread.started {thread_id}; item.completed {item:{type:"agent_message", text}} — the
-    // last agent message is the reply.
-    let threadId: string | undefined;
-    let text: string | undefined;
-    for (const line of r.stdout.split("\n")) {
-      const t = line.trim();
-      if (!t.startsWith("{")) continue;
-      try {
-        const ev = JSON.parse(t) as { type?: string; thread_id?: string; item?: { type?: string; text?: string }; error?: { message?: string } };
-        if (ev.thread_id) threadId = ev.thread_id;
-        if (ev.type === "item.completed" && ev.item?.type === "agent_message" && typeof ev.item.text === "string") text = ev.item.text;
-        if (ev.type === "error" && ev.error?.message && !text) throw new Error(ev.error.message.slice(0, 400));
-      } catch (e) {
-        if ((e as Error).message && !(e instanceof SyntaxError)) throw e;
-      }
+  materialize({ home, agent, persona, credential, mcp }) {
+    void mcp;
+    const sub = credential?.kind === "subscription";
+    const gatewayRoot = credential?.baseUrl?.replace(/\/+$/, "").replace(/\/v1$/, "");
+    const env: Record<string, string> = { NO_BROWSER: "1", INITIAL_AGENT_MODE: "agent-full-access", CODEX_HOME: `${home}/.codex` };
+    const files: Materialized["files"] = [
+      { path: `${home}/.codex/AGENTS.md`, content: instructions(persona), mode: 0o600 },
+      { path: `${home}/.codex/config.toml`, content: codexConfigToml({ gatewayRoot, subscription: sub, model: agent.model }), mode: 0o600 },
+    ];
+    if (credential && sub) {
+      // In ChatGPT mode an API key in the environment wins over the login file and flips codex to
+      // API-key mode — keep every key out of its env; the login file carries the gateway token.
+      files.push({ path: `${home}/.codex/auth.json`, content: codexAuthJson(credential.token, credential.accountId ?? ""), mode: 0o600 });
+    } else if (credential) {
+      env.OPENAI_API_KEY = credential.token;
+      env.CODEX_API_KEY = credential.token;
     }
-    if (text === undefined) throw new Error((r.stderr || r.stdout).trim().split("\n").slice(-3).join(" / ").slice(0, 400) || "codex produced no reply");
-    return { text, harnessSession: threadId ?? harnessSession };
+    return { command: "codex-acp", args: [], env, files };
+  },
+};
+
+// goose (native ACP): every other provider's API key. Its provider config points at the
+// agent's gateway slot (OpenAI-shaped — the gateway resolves the real upstream), secrets come
+// from env (no keyring in a container), the `isolation` MCP server is a stdio extension, and
+// approvals are off (GOOSE_MODE auto) — the sandbox is the boundary.
+const goose: Harness = {
+  id: "goose",
+  label: "goose (ACP)",
+  installed: true,
+  materialize({ home, agent, persona, credential, mcp }) {
+    const host = credential?.baseUrl?.replace(/\/+$/, "").replace(/\/v1$/, "");
+    const model = agent.model || "gpt-5.1";
+    const env: Record<string, string> = { GOOSE_DISABLE_KEYRING: "1", GOOSE_MODE: "auto", GOOSE_PROVIDER: "openai", GOOSE_MODEL: model, NO_BROWSER: "1" };
+    if (credential) {
+      env.OPENAI_API_KEY = credential.token;
+      if (host) env.OPENAI_HOST = host;
+    }
+    const yaml = [
+      "active_provider: openai",
+      "providers:",
+      "  openai:",
+      "    enabled: true",
+      "    configured: true",
+      `    model: ${JSON.stringify(model)}`,
+      "GOOSE_PROVIDER: openai",
+      `GOOSE_MODEL: ${JSON.stringify(model)}`,
+      "GOOSE_MODE: auto",
+      "extensions:",
+      "  developer:",
+      "    type: builtin",
+      "    name: developer",
+      "    display_name: Developer",
+      "    enabled: true",
+      "    bundled: true",
+      "    timeout: 300",
+      `  ${mcp.name}:`,
+      "    type: stdio",
+      `    name: ${mcp.name}`,
+      `    display_name: ${mcp.name}`,
+      "    enabled: true",
+      `    cmd: ${JSON.stringify(mcp.command)}`,
+      `    args: ${JSON.stringify(mcp.args)}`,
+      `    envs: ${JSON.stringify(mcp.env)}`,
+      "    env_keys: []",
+      "    timeout: 300",
+      "",
+    ].join("\n");
+    return {
+      command: "goose",
+      args: ["acp"],
+      env,
+      files: [
+        { path: `${home}/.config/goose/config.yaml`, content: yaml, mode: 0o600 },
+        { path: `${home}/.config/goose/.goosehints`, content: instructions(persona), mode: 0o600 },
+      ],
+    };
   },
 };
 
 const registry = new Map<HarnessId, Harness>([
-  [echo.id, echo],
   [claudeCode.id, claudeCode],
   [codex.id, codex],
+  [goose.id, goose],
 ]);
 
-// Register a real adapter (claude-code/codex/…) — called from wherever they're wired.
 export function registerHarness(h: Harness): void {
   registry.set(h.id, h);
 }
 
-// Resolve a harness; an unknown id degrades to a harness that reports it's unavailable
-// (so a turn fails with a clear message instead of a crash).
+// Resolve a harness; an unknown id degrades to one that reports itself unavailable, so a view
+// shows a clear message instead of a dead bridge.
 export function getHarness(id: HarnessId): Harness {
   return (
     registry.get(id) ?? {
       id,
       label: `${id} (not installed)`,
       installed: false,
-      async runTurn() {
-        throw new Error(`harness "${id}" is not installed in this session`);
+      materialize() {
+        throw new Error(`harness "${id}" is not available in this session`);
       },
     }
   );
 }
 
-export const listHarnesses = (): { id: HarnessId; label: string; installed: boolean }[] =>
-  [...registry.values()].map((h) => ({ id: h.id, label: h.label, installed: h.installed }));
+export const listHarnesses = (): { id: HarnessId; label: string; installed: boolean }[] => [...registry.values()].map((h) => ({ id: h.id, label: h.label, installed: h.installed }));
+
+// `envList` is what ACP's McpServerStdio wants for env.
+export { envList as mcpEnvList };

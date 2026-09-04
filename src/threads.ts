@@ -21,13 +21,18 @@ export interface Thread {
   key: string;
   agentId: string; // the roster DEFINITION id this thread talks to
   messages: Message[];
-  harnessSession?: string; // the harness's own resumable session id (claude-code --resume, goose session)
+  harnessSession?: string; // the harness's ACP session id (PLAN §5d) — what the bridge reloads
+  harness?: string;
   createdAt: number;
   updatedAt: number;
 }
 
 const safeKey = (k: string): string => k.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 120) || "thread";
-const threadPath = (key: string) => `${THREADS_DIR}/${safeKey(key)}.json`;
+export const threadPath = (key: string): string => `${THREADS_DIR}/${safeKey(key)}.json`;
+export const memoryPath = (agentId: string): string => `${AGENTS_DIR}/${safeKey(agentId)}/memory.md`;
+// The agent's own HOME (PLAN §5d): its harness's session store, instructions and credential
+// files live here — under the workspace tree, so the conversation rides persistence to R2.
+export const agentHome = (agentId: string): string => `${AGENTS_DIR}/${safeKey(agentId)}/home`;
 
 // Per-sandbox cache: the sandbox is the truth, this only spares a download per turn. Dropped
 // with the sandbox (forgetThreads) — a resumed session re-reads from the tree.
@@ -51,7 +56,7 @@ export async function loadThread(sandboxId: string, key: string, agentId: string
     try {
       const parsed = JSON.parse(await r.text()) as Partial<Thread>;
       if (Array.isArray(parsed.messages)) {
-        t = { key: safeKey(key), agentId: parsed.agentId ?? agentId, messages: parsed.messages as Message[], harnessSession: parsed.harnessSession, createdAt: parsed.createdAt ?? Date.now(), updatedAt: parsed.updatedAt ?? Date.now() };
+        t = { key: safeKey(key), agentId: parsed.agentId ?? agentId, messages: parsed.messages as Message[], harnessSession: parsed.harnessSession, harness: parsed.harness, createdAt: parsed.createdAt ?? Date.now(), updatedAt: parsed.updatedAt ?? Date.now() };
       }
     } catch {
       /* unreadable transcript — start a fresh one rather than wedging the chat */
@@ -82,7 +87,7 @@ export const forgetThreads = (sandboxId: string): void => {
 // The agent's own memory note (may not exist). Small by contract — it is prepended to the prompt.
 export async function loadMemory(sandboxId: string, agentId: string): Promise<string> {
   try {
-    const r = await downloadFile(sandboxId, `${AGENTS_DIR}/${safeKey(agentId)}/memory.md`);
+    const r = await downloadFile(sandboxId, memoryPath(agentId));
     return r.ok ? (await r.text()).slice(0, 16_000) : "";
   } catch {
     return "";

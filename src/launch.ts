@@ -14,6 +14,7 @@ import { buildDependencyCacheInBackground, cacheImageAvailable, cacheImageTag, r
 import { dockerAvailable, ensureSpecImage, type ImageRegistry } from "./images.js";
 import { addView, mintViewToken, newWebSlug, viewsForSandbox, type View, type ViewType } from "./views.js";
 import { cloneTarget, installVault, parseVaultManifest, sidecarCreateSpec, vaultCoversHost, type VaultManifest, type VaultSummary } from "./vault.js";
+import { startAgentBridge, syncViewsFile } from "./acpview.js";
 
 // The launch's persistence envelope (same shape the web sends the daemon today:
 // `workspaceId` + `persistence.workspace.{endpoint, creds}`).
@@ -42,9 +43,10 @@ function parseWorkspaceSink(body: LaunchRequest): WorkspaceSink | undefined {
 
 const log = (...a: unknown[]) => console.log("[launch]", ...a);
 
-export const TOOLING_IMAGE = "isolation-server/tooling:0.6"; // 0.6: claude + codex CLIs
+export const TOOLING_IMAGE = "isolation-server/tooling:0.7"; // 0.6: claude + codex CLIs; 0.7: ACP adapters + goose (PLAN §5d)
 const TERMINAL_PORT = 7681;
 const DIRECTORY_PORT = 8055;
+const AGENT_PORT = 7820; // the in-sandbox ACP bridge behind an agent view (PLAN §5d)
 const WEB_SHADOW_BASE = 42000;
 
 // Runtime metadata values are k8s-style labels: alphanumeric/-/_/. , ≤63 chars,
@@ -272,9 +274,12 @@ export async function scaffoldView(sandboxId: string, w: ViewSpec): Promise<View
     // A per-view forwarder on an all-interfaces shadow port tries both loopbacks.
     appPort = port;
     port = nextFree(WEB_SHADOW_BASE);
-  } else if (w.type === "code" || w.type === "agent") {
-    // First-party doorman-served views (PLAN V1/V2): no sandbox port, no process.
+  } else if (w.type === "code") {
+    // First-party doorman-served view (PLAN V1): no sandbox port, no process.
     port = 0;
+  } else if (w.type === "agent") {
+    // The page is doorman-served, but its WebSocket goes to the in-sandbox ACP bridge (PLAN §5d).
+    port = nextFree(AGENT_PORT);
   } else if (!port) {
     port = nextFree(w.type === "terminal" ? TERMINAL_PORT : DIRECTORY_PORT);
   }
@@ -284,6 +289,7 @@ export async function scaffoldView(sandboxId: string, w: ViewSpec): Promise<View
   const specKey = w.specKey ?? (w.type === "agent" ? `agent-${randomBytes(4).toString("hex")}` : undefined);
   const v = addView(sandboxId, w.type, port, { label: w.label, specKey, appPath, appPort, ...(w.type === "agent" && w.agentId ? { agentId: w.agentId } : {}), ...(w.type === "web" ? { slug: newWebSlug() } : {}) });
   await startViewProcess(sandboxId, v);
+  await syncViewsFile(sandboxId);
   return v;
 }
 
@@ -302,6 +308,10 @@ async function startViewProcess(sandboxId: string, view: View): Promise<void> {
     });
   } else if (view.type === "web" && view.appPort) {
     await startWebForwarder(view);
+  } else if (view.type === "agent") {
+    // The ACP bridge: materializes the agent (its HOME, harness files, credential) and holds
+    // the harness session; the page speaks ACP to it through the doorman (PLAN §5d).
+    await startAgentBridge(view);
   } else if (view.type === "directory") {
     // filebrowser emits absolute asset paths, so it must own its public base URL —
     // the doorman forwards the UNSTRIPPED path for directory views to match.

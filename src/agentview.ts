@@ -1,14 +1,13 @@
-// The agent view (PLAN V2) — a doorman-served chat window onto ONE agent, the same
-// first-party pattern as the code view: the page + assets ship in dist/agent, and the
-// API bridges to the agent supervisor. A VIEW IS THE THREAD: this view's transcript lives
-// in the sandbox under its key (threads.ts), so the same view in N tabs polls one thread and
-// converges, while another view of the same agent is a separate conversation. Auth (view
-// token / cookie) happened in the doorman.
+// The agent view (PLAN §5d) — the doorman-served ACP client page onto ONE thread of ONE agent.
+// The page + assets ship in dist/agent; the conversation itself rides a WebSocket the doorman
+// proxies to the in-sandbox bridge (acpview.ts). The only API here is the view's own
+// description — who the agent is — for the page header. Auth (view token / cookie) happened in
+// the doorman.
 import { readFileSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { agentForView, agentJson, sendMessage, startAgent, stopAgent, threadMessages } from "./agents.js";
+import { agentForView, agentJson } from "./agents.js";
 import type { View } from "./views.js";
 
 const AGENT_DIR = join(dirname(fileURLToPath(import.meta.url)), "agent");
@@ -36,36 +35,8 @@ export async function handleAgentView(req: IncomingMessage, res: ServerResponse,
   if (rest.startsWith("/api/")) {
     const rec = agentForView(view);
     if (!rec) return json(res, 404, { error: "agent not running in this session (session restarted?)" });
-    try {
-      if (rest === "/api/agent" && method === "GET") {
-        return json(res, 200, agentJson(rec));
-      }
-      if (rest === "/api/messages" && method === "GET") {
-        // The THREAD this view is (threads.ts) + the agent's status; the page renders the tail it hasn't seen.
-        return json(res, 200, { status: rec.status, messages: await threadMessages(view) });
-      }
-      if (rest === "/api/messages" && method === "POST") {
-        const chunks: Buffer[] = [];
-        for await (const c of req) {
-          chunks.push(c as Buffer);
-          if (chunks.reduce((n, b) => n + b.length, 0) > 256 * 1024) return json(res, 413, { error: "message too large" });
-        }
-        let text = "";
-        try {
-          text = String((JSON.parse(Buffer.concat(chunks).toString("utf8")) as { text?: unknown }).text ?? "");
-        } catch {
-          return json(res, 400, { error: "bad json" });
-        }
-        if (!text.trim()) return json(res, 400, { error: "text required" });
-        const out = await sendMessage(view, text, "view");
-        return "error" in out ? json(res, 502, out) : json(res, 200, out);
-      }
-      if (rest === "/api/start" && method === "POST") return json(res, 200, { ok: startAgent(rec.runtimeId) });
-      if (rest === "/api/stop" && method === "POST") return json(res, 200, { ok: stopAgent(rec.runtimeId) });
-      return json(res, 404, { error: "unknown api route" });
-    } catch (e) {
-      return json(res, 502, { error: String((e as Error)?.message ?? e) });
-    }
+    if (rest === "/api/agent" && method === "GET") return json(res, 200, { ...agentJson(rec), viewId: view.id, threadKey: view.specKey ?? view.id, label: view.label ?? null });
+    return json(res, 404, { error: "unknown api route" });
   }
 
   // Static chat app: flat directory, extension-typed, no traversal.

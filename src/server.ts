@@ -12,7 +12,8 @@ import { launch, type LaunchRequest } from "./launch.js";
 import { sinkFor, abortMerge, dropSink, saveWorkspace, syncWorkspace } from "./persistence.js";
 import { dropView, dropViewsForSandbox, getView, mintViewToken, viewsForSandbox } from "./views.js";
 import { forgetExecd, run } from "./execd.js";
-import { agentJson, getAgent, listAgents, parseRoster, sendMessage, spawnAgent, startAgent, stopAgent, threadMessages } from "./agents.js";
+import { agentJson, getAgent, listAgents, parseRoster, spawnAgent, startAgent, stopAgent } from "./agents.js";
+import { bridgePattern, connectorTurn, syncViewsFile } from "./acpview.js";
 import { listHarnesses } from "./harness.js";
 import { pauseSession, resumeSession,
   createSessionView,
@@ -307,12 +308,12 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       if (action === "messages") {
         const v = getView(vid);
         if (!v || v.type !== "agent") return json(res, 404, { error: "unknown agent view" });
-        if (method === "GET") return json(res, 200, { messages: await threadMessages(v) });
+        if (method === "GET") return json(res, 200, { messages: [] });
         if (method === "POST") {
           const b = await readBody(req);
           const text = typeof b.text === "string" ? b.text : "";
           if (!text.trim()) return json(res, 400, { error: "text required" });
-          const out = await sendMessage(v, text, typeof b.from === "string" ? b.from : "control-plane");
+          const out = await connectorTurn(v, text, typeof b.from === "string" ? b.from : "control-plane");
           return "error" in out ? json(res, 502, out) : json(res, 200, out);
         }
       }
@@ -330,10 +331,12 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
             v.type === "terminal" ? `ttyd .*-p ${v.port}`
             : v.type === "directory" ? `filebrowser .*-p ${v.port}`
             : v.type === "web" ? `portfwd.mjs .* ${v.id}`
+            : v.type === "agent" ? bridgePattern(v)
             : undefined;
           // AWAITED: the SPA deletes then immediately recreates on a spec change; an
           // un-awaited kill raced the new view's process on the same port.
           if (pat) await run(v.sandboxId, `pkill -f ${JSON.stringify(pat)} || true`).catch(() => undefined);
+          await syncViewsFile(v.sandboxId).catch(() => undefined);
         }
         return json(res, 200, { ok: true });
       }
@@ -350,7 +353,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const s = getSessionRecord(sid);
     if (!s?.sandboxId) return json(res, 404, { error: "session not ready" });
     let v = viewsForSandbox(s.sandboxId).find((x) => x.type === "agent" && x.specKey === key);
-    if (method === "GET") return v ? json(res, 200, { messages: await threadMessages(v) }) : json(res, 200, { messages: [] });
+    if (method === "GET") return v ? json(res, 200, { messages: [] }) : json(res, 200, { messages: [] });
     if (method === "POST") {
       const b = await readBody(req);
       const text = typeof b.text === "string" ? b.text : "";
@@ -366,7 +369,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         v = await scaffoldView(s.sandboxId, { type: "agent", specKey: key, agentId: rec.def.id, label: typeof b.label === "string" ? b.label : rec.def.name });
         if (!v) return json(res, 502, { error: "could not create the thread's view" });
       }
-      const out = await sendMessage(v, text, typeof b.from === "string" ? b.from : "channel");
+      const out = await connectorTurn(v, text, typeof b.from === "string" ? b.from : "channel");
       return "error" in out ? json(res, 502, out) : json(res, 200, { ...out, viewId: v.id });
     }
   }

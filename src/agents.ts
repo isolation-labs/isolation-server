@@ -5,14 +5,14 @@
 // room, no coordinator. Coordination + management is the control plane here (list/start/stop/
 // spawn); talking happens per view (agentview.ts, the /views/:id/messages route).
 //
-// Harness is pluggable + agnostic (echo built-in for credential-free runs; claude-code/codex/
-// goose adapters plug in the same interface).
+// Every harness is an ACP agent (PLAN §5d): the harness MATERIALIZES the agent into its sandbox
+// (harness.ts) and the in-sandbox bridge (sandbox/iso-acp-bridge.mjs) drives it; this module is
+// the roster + credentials + the base prompt.
 import { randomBytes } from "node:crypto";
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import { HOME } from "./config.js";
-import { getHarness, type HarnessId } from "./harness.js";
-import { loadMemory, loadThread, saveThread, type Thread } from "./threads.js";
+import type { HarnessId } from "./harness.js";
 import type { View } from "./views.js";
 
 const log = (...a: unknown[]) => console.log("[agents]", ...a);
@@ -26,7 +26,7 @@ export type AgentStatus = "idle" | "running" | "stopped";
 export interface AgentDef {
   id: string;
   name: string;
-  harness: HarnessId; // agnostic: "echo" | "claude-code" | "codex" | …
+  harness: HarnessId; // "claude-code" | "codex" | "goose" | …
   model?: string | null;
   systemPrompt?: string; // the USER layer (base Isolation prompt is prepended at run time)
   npub?: string; // its addressable identity (public part; the nsec is a stored secret)
@@ -76,21 +76,9 @@ export function parseAgentSecrets(raw: unknown): { key: string; credential: Agen
       : [];
   });
 }
-// The env a harness gets for an agent: its own credential, else nothing (the sandbox's own env —
-// the session slot — applies). Anthropic-shaped for claude-code; OpenAI-shaped for the rest.
-function envFor(sessionId: string, agentDefId: string): Record<string, string> | undefined {
-  const c = credentials.get(`${sessionId}:${agentDefId}`);
-  if (!c) return undefined;
-  if (c.kind === "subscription" && c.provider !== "openai") return { ANTHROPIC_API_KEY: c.token, ...(c.baseUrl ? { ANTHROPIC_BASE_URL: c.baseUrl } : {}) };
-  return c.provider === "anthropic"
-    ? { ANTHROPIC_API_KEY: c.token, ...(c.baseUrl ? { ANTHROPIC_BASE_URL: c.baseUrl } : {}) }
-    : {
-        OPENAI_API_KEY: c.token,
-        ...(c.baseUrl ? { OPENAI_BASE_URL: `${c.baseUrl.replace(/\/+$/, "")}/v1` } : {}),
-        // A ChatGPT subscription: the codex adapter writes its login + config from these.
-        ...(c.kind === "subscription" ? { CODEX_SUBSCRIPTION: "1", ...(c.accountId ? { CODEX_ACCOUNT_ID: c.accountId } : {}) } : {}),
-      };
-}
+// The agent's own credential (its gateway slot), if the launch carried one; else the sandbox's
+// own env (the session slot) applies.
+export const credentialFor = (sessionId: string, agentDefId: string): AgentCredential | undefined => credentials.get(`${sessionId}:${agentDefId}`);
 
 // (The old per-server conversation files under <HOME>/agents are gone: threads live in the
 // sandbox — threads.ts. STORE stays only for the legacy listing helper below.)
@@ -104,7 +92,7 @@ function basePrompt(def: AgentDef): string {
   return [
     `You are "${def.name}", an autonomous agent working inside an Isolation session — an isolated container with a project checked out at /workspace.`,
     `You are one of several independent agents on this workspace; each conversation (thread) is separate. You do NOT share a chat with the others.`,
-    `You coordinate ONLY through the shared files at /workspace (git) and through the structured control plane (never by chatting at another agent).`,
+    `You coordinate through the shared files at /workspace (git) and through the \`isolation\` tools (thread_send to another agent, never by assuming it reads your chat).`,
     `Your own instructions follow.`,
   ].join(" ");
 }
@@ -175,51 +163,6 @@ export function dropSessionAgents(sessionId: string): void {
   for (const k of [...credentials.keys()]) if (k.startsWith(`${sessionId}:`)) credentials.delete(k);
 }
 
-// --- the conversation turn ------------------------------------------------------
-
-// One turn on ONE thread — the view names it. Boots a lazy/stopped agent (a message is an
-// implicit start). The transcript is read from and written to the sandbox (threads.ts); the
-// agent's memory note is prepended to its prompt. Independent per thread.
-export async function sendMessage(view: View, text: string, from = "view"): Promise<{ reply: Message } | { error: string }> {
-  const rec = agentForView(view);
-  if (!rec) return { error: "this view has no agent" };
-  if (!rec.sandboxId) return { error: "session has no sandbox yet" };
-  // A message starts a lazy/stopped agent — through the LIVE record: agentForView hands back a
-  // copy, so assigning to `rec.status` would leave the roster reading "idle" forever.
-  if (rec.status !== "running") startAgent(rec.runtimeId);
-  // A thread that cannot be read (sandbox unreachable) must fail the turn, never run it against
-  // an empty transcript — saving that would replace the real one.
-  let thread: Thread;
-  try {
-    thread = await loadThread(rec.sandboxId, threadKeyOf(view), rec.def.id);
-  } catch (e) {
-    return { error: String((e as Error)?.message ?? e) };
-  }
-  const user: Message = { role: "user", text, ts: Date.now(), from };
-  thread.messages.push(user);
-  try {
-    const harness = getHarness(rec.def.harness);
-    const memory = await loadMemory(rec.sandboxId, rec.def.id);
-    const out = await harness.runTurn({
-      systemPrompt: `${effectiveSystemPrompt(rec.def)}${memory ? `\n\nYour memory for this workspace:\n${memory}` : ""}`,
-      history: thread.messages.slice(0, -1),
-      userText: text,
-      agent: { id: rec.def.id, name: rec.def.name, model: rec.def.model ?? undefined },
-      sandboxId: rec.sandboxId,
-      harnessSession: thread.harnessSession,
-      env: envFor(rec.sessionId, rec.def.id),
-    });
-    const reply: Message = { role: "assistant", text: out.text, ts: Date.now() };
-    if (out.harnessSession) thread.harnessSession = out.harnessSession;
-    thread.messages.push(reply);
-    await saveThread(rec.sandboxId, thread);
-    return { reply };
-  } catch (e) {
-    thread.messages.pop(); // don't persist a user turn that errored with no reply
-    return { error: String((e as Error)?.message ?? e) };
-  }
-}
-
 // The thread a view names: its workspace-level key when it has one (the same window in the next
 // session is the same chat), else the session-local view id (a chat that dies with the session).
 export const threadKeyOf = (view: View): string => view.specKey || view.id;
@@ -228,13 +171,6 @@ export const threadKeyOf = (view: View): string => view.specKey || view.id;
 export function agentForView(view: View): (AgentRecord & { runtimeId: string }) | undefined {
   if (!view.agentId) return undefined;
   return [...live.entries()].filter(([, r]) => r.sandboxId === view.sandboxId).map(([runtimeId, r]) => ({ ...r, runtimeId })).find((a) => a.def.id === view.agentId || a.runtimeId === view.agentId);
-}
-
-// A thread's transcript for the API.
-export async function threadMessages(view: View): Promise<Message[]> {
-  const rec = agentForView(view);
-  if (!rec?.sandboxId) return [];
-  return (await loadThread(rec.sandboxId, threadKeyOf(view), rec.def.id)).messages;
 }
 
 // JSON projections for the API.
@@ -263,7 +199,7 @@ export function parseRoster(raw: unknown): AgentDef[] {
     out.push({
       id,
       name: a.name,
-      harness: (typeof a.harness === "string" ? a.harness : "echo") as HarnessId,
+      harness: (typeof a.harness === "string" ? a.harness : "claude-code") as HarnessId,
       model: typeof a.model === "string" ? a.model : null,
       systemPrompt: typeof a.systemPrompt === "string" ? a.systemPrompt : typeof a.instructions === "string" ? a.instructions : "",
       npub: typeof a.npub === "string" ? a.npub : undefined,
