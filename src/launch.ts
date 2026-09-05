@@ -446,6 +446,34 @@ export async function webForwarderAlive(view: View): Promise<boolean> {
 
 // --- the launch ----------------------------------------------------------------
 
+// authorized_keys, written where sshd looks. Public keys only — nothing here is secret, which is
+// why this is the one credential kind that goes INTO the sandbox rather than being proxied.
+// Best-effort: a session must still come up if this fails, so a broken key or a missing home
+// directory costs ssh access and nothing else.
+export function authorizedKeysFile(keys: string[] | undefined): string {
+  // Keep only what sshd would actually accept, so one malformed paste can't shift the lines below
+  // it out of use. A newline inside a "key" would inject extra entries — drop those outright.
+  const clean = (keys ?? [])
+    .map((k) => String(k ?? "").trim())
+    .filter((k) => k && !/[\r\n]/.test(k) && /^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)\s+\S+/.test(k));
+  return clean.length ? `${clean.join("\n")}\n` : "";
+}
+
+export async function installAuthorizedKeys(sandboxId: string, keys: string[] | undefined, onPhase?: (p: string) => void): Promise<void> {
+  const content = authorizedKeysFile(keys);
+  if (!content) return;
+  onPhase?.("installing ssh keys");
+  try {
+    // ~ is the sandbox user's home, whoever that is — never a hardcoded /root. sshd REFUSES to
+    // read either path if the modes are looser than these.
+    await run(sandboxId, `mkdir -p ~/.ssh && chmod 700 ~/.ssh`);
+    await writeFile(sandboxId, "/tmp/.iso-authorized_keys", content, 0o600);
+    await run(sandboxId, `cat /tmp/.iso-authorized_keys > ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && rm -f /tmp/.iso-authorized_keys`);
+  } catch {
+    /* ssh access is a convenience; never fail a launch over it */
+  }
+}
+
 export interface LaunchRequest {
   name?: string;
   image?: string;
@@ -458,6 +486,10 @@ export interface LaunchRequest {
   claude?: unknown; // sealed string or inline AiCred — the session-wide AI credential
   vault?: unknown; // sealed string or inline VaultManifest (PLAN §5b) — EVERY credential, via the sidecar
   git?: { name?: string; email?: string };
+  // PUBLIC ssh keys allowed to log in to the sandbox. The ONE credential kind that is delivered
+  // into the sandbox as itself: it is a public key, so there is nothing to protect, and it only
+  // has meaning inside — every other kind is fronted by the gateway.
+  authorizedKeys?: string[];
   env?: Record<string, string>;
   metadata?: Record<string, string>;
   // Live progress callback — the session layer mirrors it into the record the web polls.
@@ -632,6 +664,11 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
     for (const f of envConfig.files) {
       await writeFile(sandbox.id, `/workspace/${f.path}`, f.content, 0o600);
     }
+
+    // The member's PUBLIC ssh keys, so they can reach this session over ssh (the bastion, or a
+    // direct sshd where one is running). One key per line, exactly what sshd expects; 0600 on the
+    // file and 0700 on the directory, which sshd REFUSES to read if they are looser.
+    await installAuthorizedKeys(sandbox.id, body.authorizedKeys, body.onPhase);
     // devcontainer lifecycle hooks (repository configs): postCreate runs once per fresh
     // sandbox, postStart every boot — inside the sandbox, in the owning repo's dir.
     const hooks = spec?.source === "repository" ? spec.devContainer.raw : undefined;

@@ -94,6 +94,10 @@ export interface DaemonLaunchBody {
     repos?: { url?: string; dir?: string; branch?: string }[];
     defaultViews?: Record<string, { type?: string; label?: string; dir?: string; command?: string; style?: unknown; url?: string; port?: number; agentId?: string }>;
     gitIdentity?: { name?: string; email?: string };
+    // PUBLIC ssh keys that may log INTO this session (the member's `ssh` credentials). Non-secret,
+    // and the only credential kind delivered into the sandbox as itself — every other one is
+    // fronted by the gateway, which is the point of the gateway.
+    authorizedKeys?: string[];
   };
   workspaceId?: string;
   environmentId?: string;
@@ -155,6 +159,7 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
     workspaceId: body.workspaceId,
     persistence: body.persistence,
     repos: (body.workspace?.repos ?? []).map((r) => ({ url: r.url, name: r.dir, branch: r.branch })),
+    authorizedKeys: body.workspace?.authorizedKeys,
     views: viewSpecsFrom(body),
     envConfig: body.envConfig,
     repoTokens: body.repoTokens,

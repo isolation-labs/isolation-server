@@ -320,3 +320,33 @@ test("sanitizeStyle: theme keys/values are whitelisted and bounded; garbage yiel
   assert.equal(launch.sanitizeStyle("nope"), undefined);
   assert.equal(launch.sanitizeStyle({ theme: { bogus: "x" } }), undefined);
 });
+
+// ── authorized_keys (the ssh credential) ──────────────────────────────────────────────────────
+// A public key is the ONE credential kind that goes into the sandbox as itself, so what lands in
+// the file is exactly what the member added — and nothing else. sshd reads the file line by line,
+// so a key carrying its own newline would inject entries nobody authorized.
+const { authorizedKeysFile } = await import("../dist/launch.js");
+
+test("authorizedKeysFile keeps real keys, one per line, and drops everything else", () => {
+  const ed = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI dan@laptop";
+  const rsa = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAB work";
+  assert.equal(authorizedKeysFile([ed]), `${ed}\n`);
+  assert.equal(authorizedKeysFile([ed, rsa]), `${ed}\n${rsa}\n`, "one key per line");
+  assert.equal(authorizedKeysFile([`  ${ed}  `]), `${ed}\n`, "trimmed");
+
+  // Nothing to write is an empty string, so the caller skips the sandbox round trip entirely.
+  assert.equal(authorizedKeysFile(undefined), "");
+  assert.equal(authorizedKeysFile([]), "");
+  assert.equal(authorizedKeysFile(["", "   "]), "");
+
+  // Not a key: a private key, a bare comment, junk.
+  assert.equal(authorizedKeysFile(["-----BEGIN OPENSSH PRIVATE KEY-----"]), "");
+  assert.equal(authorizedKeysFile(["ssh-ed25519"]), "", "a type with no body is not a key");
+  assert.equal(authorizedKeysFile(["hello world"]), "");
+
+  // INJECTION: a value carrying a newline would smuggle a second authorized key into the file.
+  assert.equal(authorizedKeysFile([`${ed}\n${rsa}`]), "", "a multi-line value is refused whole");
+  assert.equal(authorizedKeysFile([`${ed}\r\nssh-rsa AAAAB evil`]), "");
+  // One bad entry must not take the good ones with it.
+  assert.equal(authorizedKeysFile(["junk", ed, `${rsa}\nmore`]), `${ed}\n`);
+});
