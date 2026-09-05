@@ -337,6 +337,9 @@ test("authorizedKeysFile keeps real keys, one per line, and drops everything els
   // Nothing to write is an empty string, so the caller skips the sandbox round trip entirely.
   assert.equal(authorizedKeysFile(undefined), "");
   assert.equal(authorizedKeysFile([]), "");
+  // Off the wire, so shape is never guaranteed: anything but a list is simply no keys.
+  assert.equal(authorizedKeysFile("ssh-ed25519 AAAA me"), "");
+  assert.equal(authorizedKeysFile({ 0: "ssh-ed25519 AAAA me" }), "");
   assert.equal(authorizedKeysFile(["", "   "]), "");
 
   // Not a key: a private key, a bare comment, junk.

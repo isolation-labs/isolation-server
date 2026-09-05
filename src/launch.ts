@@ -450,16 +450,17 @@ export async function webForwarderAlive(view: View): Promise<boolean> {
 // why this is the one credential kind that goes INTO the sandbox rather than being proxied.
 // Best-effort: a session must still come up if this fails, so a broken key or a missing home
 // directory costs ssh access and nothing else.
-export function authorizedKeysFile(keys: string[] | undefined): string {
+export function authorizedKeysFile(keys: unknown): string {
   // Keep only what sshd would actually accept, so one malformed paste can't shift the lines below
   // it out of use. A newline inside a "key" would inject extra entries — drop those outright.
-  const clean = (keys ?? [])
+  // The list comes off the wire, so a non-array is just "no keys" — never a thrown launch.
+  const clean = (Array.isArray(keys) ? keys : [])
     .map((k) => String(k ?? "").trim())
     .filter((k) => k && !/[\r\n]/.test(k) && /^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)\s+\S+/.test(k));
   return clean.length ? `${clean.join("\n")}\n` : "";
 }
 
-export async function installAuthorizedKeys(sandboxId: string, keys: string[] | undefined, onPhase?: (p: string) => void): Promise<void> {
+export async function installAuthorizedKeys(sandboxId: string, keys: unknown, onPhase?: (p: string) => void): Promise<void> {
   const content = authorizedKeysFile(keys);
   if (!content) return;
   onPhase?.("installing ssh keys");
