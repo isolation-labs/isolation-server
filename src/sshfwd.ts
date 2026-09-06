@@ -82,6 +82,12 @@ export async function openSsh(sessionId: string, sandboxId: string): Promise<num
   const sockets = new Set<Socket>();
   const started = await listenOnFreePort((client) => {
     sockets.add(client);
+    // BEFORE anything can go wrong: an unhandled 'error' on a socket takes the whole process
+    // down, and this one has no handler until the splice attaches its own — an HTTP round trip
+    // to the runtime and a WebSocket upgrade later. An ssh client that hangs up in that window
+    // (Ctrl-C, a port scanner, a probe against a Cloud server's public interface) resets the
+    // connection and would otherwise kill isolation-server.
+    client.on("error", () => client.destroy());
     client.on("close", () => sockets.delete(client));
     // Nothing may be read before the WebSocket is up: ssh sends its version banner the instant it
     // connects, and a socket that starts flowing here would drop those bytes on the floor.
@@ -115,6 +121,16 @@ export function closeSsh(sessionId: string): void {
 // hanging up mid-handshake is routine) and must never reach the process. Exported so the tests can
 // drive the real splice against the real bridge, with no sandbox in the way.
 export function spliceOverWs(client: Socket, ws: Socket, head: Buffer): void {
+  // Either end can already be gone: the WebSocket handshake is a round trip to the runtime, and an
+  // ssh client that hangs up (or a `closeSsh` during it) has then ALREADY emitted 'close' — the
+  // listeners below would never fire, so the surviving half would live on forever with its ping
+  // timer, holding a proxy connection into the sandbox. One hung-up client per leak adds up fast on
+  // a server that binds its public interface.
+  if (client.destroyed || ws.destroyed) {
+    client.destroy();
+    ws.destroy();
+    return;
+  }
   const dec = new FrameDecoder();
   let closed = false;
   // execd's proxy is free to drop a connection it considers idle, and an ssh session can sit

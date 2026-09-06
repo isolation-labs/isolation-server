@@ -65,6 +65,36 @@ for (const rec of Object.values(sessions)) {
   if (secrets.length) setAgentCredentials(rec.id, secrets);
 }
 
+// ssh forwarders are bound by THIS process (sshfwd.ts), so a persisted `sshPort` is a lie the
+// moment the server restarts — and a dangerous one: the next launch is handed a port from the
+// bottom of the same range, so a saved `ssh -p 22200` command would open a shell in a DIFFERENT
+// session's sandbox. Drop every persisted port on boot, then re-open a forwarder for each session
+// whose sandbox is still around (the in-sandbox bridge outlives this process) and let it publish
+// whatever port it actually got.
+{
+  const reopen: SessionRecord[] = [];
+  let cleared = false;
+  for (const rec of Object.values(sessions)) {
+    if (rec.sshPort === undefined) continue;
+    delete rec.sshPort;
+    cleared = true;
+    if (rec.sandboxId && rec.state !== "error") reopen.push(rec);
+  }
+  if (cleared) persist();
+  if (reopen.length) {
+    void (async () => {
+      for (const rec of reopen) {
+        const port = rec.sandboxId ? await openSsh(rec.id, rec.sandboxId).catch(() => null) : null;
+        if (!port) continue;
+        // The session can have been finished while the bind was in flight; `update` would then be
+        // a silent no-op and the listener would sit on a port out of a 100-wide range forever.
+        if (sessions[rec.id]) update(rec.id, { sshPort: port });
+        else closeSsh(rec.id);
+      }
+    })();
+  }
+}
+
 function persist(): void {
   ensureDataDir();
   const tmp = `${FILE}.tmp`;
@@ -190,6 +220,9 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
       // ssh rides a per-session TCP forwarder (sshfwd.ts) — opened only when the launch actually
       // brought sshd up, so `sshPort` present means "this really answers".
       const sshPort = out.ssh ? await openSsh(id, out.sandbox.id).catch(() => null) : null;
+      // `finishSession` can land while the launch is still finishing: it already closed a
+      // forwarder that did not exist yet, so the one just bound is ours to take back down.
+      if (sshPort && !sessions[id]) closeSsh(id);
       update(id, { sandboxId: out.sandbox.id, state: "ready", phase: undefined, viewsPending: 0, ...(out.vault ? { vault: out.vault } : {}), ...(sshPort ? { sshPort } : {}) });
       log(`${id} ready (sandbox ${out.sandbox.id.slice(0, 8)})${rec.roster?.length ? `, ${rec.roster.length} agent(s)` : ""}`);
     })
@@ -228,6 +261,20 @@ export async function finishSession(id: string): Promise<void> {
   dropSessionAgents(id);
   delete sessions[id];
   persist();
+}
+
+// DELETE /sandboxes/:id kills a sandbox without going through `finishSession`, so the session's
+// ssh forwarder has to be torn down here too — otherwise it stays bound (holding one of a 100-wide
+// range) and the record keeps advertising an `sshPort` that answers nothing, which is exactly what
+// the field's "present means this really answers" contract promises it never does.
+export function dropSshForSandbox(sandboxId: string): void {
+  const s = sessionForSandbox(sandboxId);
+  if (!s) return;
+  closeSsh(s.id);
+  if (s.sshPort !== undefined) {
+    delete s.sshPort;
+    persist();
+  }
 }
 
 export function renameSession(id: string, name: string): SessionRecord | undefined {

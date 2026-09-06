@@ -17,6 +17,7 @@ import { bridgePattern, connectorTurn, syncViewsFile } from "./acpview.js";
 import { listHarnesses } from "./harness.js";
 import { pauseSession, resumeSession,
   createSessionView,
+  dropSshForSandbox,
   finishSession,
   getSessionRecord,
   listSessionRecords,
@@ -545,6 +546,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       }
       if (method === "DELETE" && !action) {
         await deleteSandbox(id);
+        dropSshForSandbox(id);
         dropViewsForSandbox(id);
         invalidateEndpoints(id);
         forgetExecd(id);

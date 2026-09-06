@@ -80,6 +80,9 @@ export class FrameDecoder {
 
 /** Splice an upgraded WebSocket to `127.0.0.1:<target>`; resolves when both halves are closed. */
 export function spliceToTcp(ws, target, head) {
+  // A client that vanishes right after the 101 has already emitted 'close', so the handlers below
+  // would never run and the TCP half would sit open against sshd. Cheaper to notice here.
+  if (ws.destroyed) return;
   const up = net.connect(target, "127.0.0.1");
   up.setNoDelay(true);
   ws.setNoDelay(true);
@@ -120,6 +123,10 @@ function main() {
   const [listenPort, targetPort, pidFile] = process.argv.slice(2);
   const server = createServer((_req, res) => { res.writeHead(426); res.end("upgrade required"); });
   server.on("upgrade", (req, sock, head) => {
+    // node's http server REMOVES its own 'error' listener before emitting 'upgrade', so from here
+    // the socket is bare: a peer that resets while we write the 101 (or the 400 below) would emit
+    // an unhandled 'error' and take the bridge down, and with it ssh for the whole sandbox.
+    sock.on("error", () => sock.destroy());
     const key = req.headers["sec-websocket-key"];
     if (!key || (req.headers.upgrade ?? "").toLowerCase() !== "websocket") {
       sock.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");

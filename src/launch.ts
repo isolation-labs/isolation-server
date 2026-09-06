@@ -487,6 +487,11 @@ export async function startSshAccess(sandboxId: string, onPhase?: (p: string) =>
   try {
     const conf = [
       `Port ${SSHD_PORT}`,
+      // Loopback ONLY. The bridge connects to 127.0.0.1, and it is the only intended way in — the
+      // default (every interface) would put sshd's pre-auth surface on the sandbox's own network,
+      // where a neighbouring container can reach it. Must stay AFTER `Port`: sshd applies the
+      // ports declared so far to a ListenAddress that names none.
+      "ListenAddress 127.0.0.1",
       "PermitRootLogin prohibit-password", // by KEY only — never a password
       "PasswordAuthentication no",
       "KbdInteractiveAuthentication no",

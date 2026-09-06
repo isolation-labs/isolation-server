@@ -14,7 +14,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 
-process.env.ISOLATION_SERVER_HOME ??= mkdtempSync(join(tmpdir(), "iso-ssh-test-"));
+// Our OWN scratch dir, never an inherited ISOLATION_SERVER_HOME: the exit hook below deletes it
+// recursively, and a developer with that variable set would otherwise lose their server's data dir.
+const TMP = mkdtempSync(join(tmpdir(), "iso-ssh-test-"));
+// Point the server's config home at it too, BEFORE the dist imports below: config.ts resolves
+// HOME at module load (and adopts a legacy ~/.isogate by renaming it), and importing sshfwd pulls
+// that in. Set unconditionally — an inherited value would send the test at a real data dir.
+process.env.ISOLATION_SERVER_HOME = TMP;
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const BRIDGE = join(ROOT, "sandbox", "iso-ws-bridge.mjs");
@@ -86,7 +92,7 @@ test("ssh bytes survive the full splice: tcp → ws → bridge → tcp and back"
   await new Promise((r) => echo.listen(0, "127.0.0.1", r));
   const targetPort = echo.address().port;
   const bridgePort = await freePort();
-  const pidFile = join(process.env.ISOLATION_SERVER_HOME, "bridge.pid");
+  const pidFile = join(TMP, "bridge.pid");
 
   const proc = spawn(process.execPath, [BRIDGE, String(bridgePort), String(targetPort), pidFile], { stdio: ["ignore", "pipe", "pipe"] });
   await new Promise((resolve, reject) => {
@@ -139,7 +145,7 @@ test("ssh bytes survive the full splice: tcp → ws → bridge → tcp and back"
 
 test("the bridge refuses a non-WebSocket request instead of hanging", async (t) => {
   const bridgePort = await freePort();
-  const proc = spawn(process.execPath, [BRIDGE, String(bridgePort), "1", join(process.env.ISOLATION_SERVER_HOME, "bridge2.pid")], { stdio: ["ignore", "pipe", "pipe"] });
+  const proc = spawn(process.execPath, [BRIDGE, String(bridgePort), "1", join(TMP, "bridge2.pid")], { stdio: ["ignore", "pipe", "pipe"] });
   await new Promise((resolve, reject) => {
     proc.stdout.once("data", resolve);
     proc.once("error", reject);
@@ -153,4 +159,42 @@ test("the bridge refuses a non-WebSocket request instead of hanging", async (t) 
   await assert.doesNotReject(host.wsConnect({ host: `127.0.0.1:${bridgePort}`, path: "/" }).then(({ socket }) => socket.destroy()));
 });
 
-process.on("exit", () => rmSync(process.env.ISOLATION_SERVER_HOME, { recursive: true, force: true }));
+test("a peer that resets mid-handshake does not take the bridge down", async (t) => {
+  // node's http server strips its own 'error' listener before emitting 'upgrade' (verified:
+  // listenerCount is 0 there), so anything the bridge does with that socket afterwards is one
+  // unhandled 'error' away from killing the process — and with it ssh for the whole sandbox. The
+  // guard is a listener attached at the top of the handler; this is the smoke test that abrupt
+  // hang-ups, on both the 101 and the 400 branch, leave the bridge serving.
+  const bridgePort = await freePort();
+  const proc = spawn(process.execPath, [BRIDGE, String(bridgePort), "1", join(TMP, "bridge3.pid")], { stdio: ["ignore", "pipe", "pipe"] });
+  await new Promise((resolve, reject) => {
+    proc.stdout.once("data", resolve);
+    proc.once("error", reject);
+    setTimeout(() => reject(new Error("bridge did not start")), 5000).unref();
+  });
+  t.after(() => proc.kill());
+
+  for (const req of [
+    // A well-formed upgrade, hung up on the instant it is sent.
+    `GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ${randomBytes(16).toString("base64")}\r\n\r\n`,
+    // And one with no key, which takes the 400 branch.
+    "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+  ]) {
+    await new Promise((resolve) => {
+      const c = connect(bridgePort, "127.0.0.1", () => {
+        c.write(req);
+        c.resetAndDestroy(); // RST, not FIN — the write races the teardown
+        resolve();
+      });
+      c.on("error", resolve);
+    });
+  }
+
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(proc.exitCode, null, "the bridge is still running");
+  const res = await fetch(`http://127.0.0.1:${bridgePort}/`);
+  assert.equal(res.status, 426, "and still serving");
+  await res.text();
+});
+
+process.on("exit", () => rmSync(TMP, { recursive: true, force: true }));
