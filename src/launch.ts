@@ -4,6 +4,9 @@
 // workspace persistence layer on top of this in later phases; nothing here persists
 // a secret beyond the sandbox's lifetime.
 import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createSandbox, type Sandbox } from "./opensandbox.js";
 import { run, waitReady, writeFile } from "./execd.js";
 import { sealedOrInline } from "./envelope.js";
@@ -460,6 +463,88 @@ export function authorizedKeysFile(keys: unknown): string {
   return clean.length ? `${clean.join("\n")}\n` : "";
 }
 
+// The in-sandbox ssh daemon's port. Not 22: the sandbox may already have something there, and
+// this one is never published to the world — the only way in is the bridge below.
+export const SSHD_PORT = 2222;
+// The WS↔TCP bridge that fronts it. The runtime publishes exactly two container ports to the host
+// and proxies everything else over HTTP/WebSocket only, so this is what makes sshd reachable at
+// all: execd's /proxy/<this> carries a WebSocket, the bridge unwraps it onto sshd. sshfwd.ts is
+// the host end of the same pipe.
+export const SSH_BRIDGE_PORT = 44773;
+const SSH_BRIDGE_PATH = "/tmp/.iso-ws-bridge.mjs";
+const SSH_BRIDGE_PID = "/tmp/.iso-ws-bridge.pid";
+const SSHD_PID = "/tmp/.iso-sshd.pid";
+// Shipped verbatim into every sandbox, like the ACP bridge (build copies sandbox/ to dist/sandbox).
+const SSH_BRIDGE_SRC = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "sandbox", "iso-ws-bridge.mjs"), "utf8");
+
+// Bring up ssh inside the sandbox — sshd plus the WebSocket bridge in front of it — so `ssh`,
+// `scp` and VS Code Remote have something to talk to.
+//
+// Key-only, root-login-by-key, no passwords, no host-key checking surprises: host keys are
+// generated once per sandbox on first start. Best-effort, like the keys themselves — a session
+// must still come up when ssh cannot.
+export async function startSshAccess(sandboxId: string, onPhase?: (p: string) => void): Promise<boolean> {
+  try {
+    const conf = [
+      `Port ${SSHD_PORT}`,
+      "PermitRootLogin prohibit-password", // by KEY only — never a password
+      "PasswordAuthentication no",
+      "KbdInteractiveAuthentication no",
+      "PubkeyAuthentication yes",
+      "UsePAM no", // no PAM in a slim image; without this sshd refuses every login
+      `PidFile ${SSHD_PID}`,
+      "AcceptEnv LANG LC_*",
+      "X11Forwarding no",
+      "PrintMotd no",
+    ].join("\n");
+    await writeFile(sandboxId, "/etc/ssh/sshd_config.d/iso.conf", `${conf}\n`, 0o644);
+    // -A generates any missing host keys and leaves existing ones alone, so a resumed sandbox
+    // keeps its identity and clients don't see a changed-host-key warning.
+    // Echo a marker rather than trusting an exit code: run() reports ok, not a status, and an
+    // exotic base with no sshd must degrade to "no ssh" instead of looking like a failed launch.
+    const r = await run(
+      sandboxId,
+      // sshd lives in /usr/sbin, which is NOT on execd's PATH — `command -v sshd` finds nothing
+      // even where the daemon is installed. Look for the binary by path, then run it by path.
+      `SSHD=""; for p in /usr/sbin/sshd /usr/local/sbin/sshd /sbin/sshd; do [ -x "$p" ] && SSHD="$p" && break; done; ` +
+        `[ -n "$SSHD" ] || { echo ISO_SSHD_ABSENT; exit 0; }; ` +
+        `mkdir -p /run/sshd /etc/ssh/sshd_config.d; ssh-keygen -A >/dev/null 2>&1; ` +
+        // sshd is started with -f, so ONLY this file is read — the distro's own config, and with
+        // it the sftp subsystem, is out of the picture. Without a Subsystem line `scp` and VS Code
+        // Remote fail with "subsystem request failed" (modern scp is sftp underneath); the binary
+        // sits in a different place on every distro, hence the search. Appended after the fresh
+        // write above, so it is never defined twice (sshd refuses that).
+        `for p in /usr/lib/openssh/sftp-server /usr/lib/ssh/sftp-server /usr/libexec/openssh/sftp-server /usr/libexec/sftp-server; do ` +
+        `[ -x "$p" ] && echo "Subsystem sftp $p" >> /etc/ssh/sshd_config.d/iso.conf && break; done; ` +
+        // Stop a previous daemon by PIDFILE, never `pkill -f`: the pattern would have to name
+        // this config, and the shell running the command has that same string in its own command
+        // line — pkill -f matches it and the command kills itself before reaching sshd.
+        `[ -f ${SSHD_PID} ] && kill "$(cat ${SSHD_PID})" 2>/dev/null; ` +
+        `"$SSHD" -f /etc/ssh/sshd_config.d/iso.conf -E /tmp/.iso-sshd.log && echo ISO_SSHD_UP`,
+    );
+    if (!r.stdout.includes("ISO_SSHD_UP")) return false;
+    return await startSshBridge(sandboxId, onPhase);
+  } catch {
+    return false;
+  }
+}
+
+// The bridge process. Stopped by PIDFILE for the same reason sshd is: `pkill -f` would match the
+// pattern inside the command line of the shell running it and kill itself before reaching the
+// target. The script writes its own pid on listen, so a restart always has a pid to stop.
+async function startSshBridge(sandboxId: string, onPhase?: (p: string) => void): Promise<boolean> {
+  await writeFile(sandboxId, SSH_BRIDGE_PATH, SSH_BRIDGE_SRC, 0o644);
+  await run(sandboxId, `[ -f ${SSH_BRIDGE_PID} ] && kill "$(cat ${SSH_BRIDGE_PID})" 2>/dev/null; rm -f ${SSH_BRIDGE_PID}; true`).catch(() => undefined);
+  // Background, and NOT wrapped in `nohup …&` — execd rejects that.
+  await run(sandboxId, `$(command -v iso-node || command -v node) ${SSH_BRIDGE_PATH} ${SSH_BRIDGE_PORT} ${SSHD_PORT} ${SSH_BRIDGE_PID}`, { cwd: "/workspace", background: true });
+  // The pidfile appears only once the listener is actually bound, so it is the readiness signal:
+  // without it, the first `ssh` would race the bridge and get a 502 out of execd's proxy.
+  const r = await run(sandboxId, `i=0; while [ ! -f ${SSH_BRIDGE_PID} ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done; [ -f ${SSH_BRIDGE_PID} ] && echo ISO_BRIDGE_UP`, { timeoutMs: 20_000 });
+  if (!r.stdout.includes("ISO_BRIDGE_UP")) return false;
+  onPhase?.("ssh ready");
+  return true;
+}
+
 export async function installAuthorizedKeys(sandboxId: string, keys: unknown, onPhase?: (p: string) => void): Promise<void> {
   const content = authorizedKeysFile(keys);
   if (!content) return;
@@ -504,6 +589,7 @@ export interface LaunchResult {
   sandbox: Sandbox;
   views: (View & { path: string; token: string })[];
   vault?: VaultSummary;
+  ssh?: boolean; // sshd came up inside the sandbox — the session may open a forwarder for it
 }
 
 export async function launch(body: LaunchRequest): Promise<LaunchResult> {
@@ -605,6 +691,8 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
   body.onSandbox?.(sandbox.id);
 
   let vaultSummary: VaultSummary | undefined;
+  // Whether sshd actually came up — the session only advertises an ssh command when it did.
+  let sshUp = false;
   try {
     await waitReady(sandbox.id);
 
@@ -670,6 +758,8 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
     // direct sshd where one is running). One key per line, exactly what sshd expects; 0600 on the
     // file and 0700 on the directory, which sshd REFUSES to read if they are looser.
     await installAuthorizedKeys(sandbox.id, body.authorizedKeys, body.onPhase);
+    // sshd only earns its place once a key can actually open it.
+    sshUp = authorizedKeysFile(body.authorizedKeys) ? await startSshAccess(sandbox.id, body.onPhase) : false;
     // devcontainer lifecycle hooks (repository configs): postCreate runs once per fresh
     // sandbox, postStart every boot — inside the sandbox, in the owning repo's dir.
     const hooks = spec?.source === "repository" ? spec.devContainer.raw : undefined;
@@ -692,7 +782,7 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
       if (v) views.push({ ...v, path: `/v/${v.id}/`, token: mintViewToken(v.id) });
     }
 
-    return { sandbox, views, ...(vaultSummary ? { vault: vaultSummary } : {}) };
+    return { sandbox, views, ...(vaultSummary ? { vault: vaultSummary } : {}), ...(sshUp ? { ssh: true } : {}) };
   } catch (e) {
     // A failed launch must not leak a half-provisioned sandbox — the caller sees
     // the error; the sandbox is gone.

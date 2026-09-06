@@ -109,12 +109,14 @@ export function imageExists(tag: string): boolean {
 // has its harness whatever the base image is. Every fetch is
 // arch-matched and the optional ones are guarded so an exotic base degrades a view
 // instead of failing the build. (The code view is doorman-served Monaco — nothing to
-// install in the image; PLAN V1 dropped code-server.)
+// install in the image; PLAN V1 dropped code-server.) openssh-SERVER is here too: ssh into a
+// session terminates at a daemon inside the sandbox, which is the only way native ssh / scp /
+// VS Code Remote can work — the runtime proxies HTTP and WebSocket only, never raw TCP.
 export function specDockerfile(base: string): string {
   return `FROM ${base}
 USER root
 RUN (command -v apt-get >/dev/null && apt-get update && apt-get install -y --no-install-recommends \\
-      git tmux curl ca-certificates procps openssh-client xz-utils && rm -rf /var/lib/apt/lists/*) || true
+      git tmux curl ca-certificates procps openssh-client openssh-server xz-utils && rm -rf /var/lib/apt/lists/*) || true
 RUN set -eux; ARCH="$(uname -m)"; case "$ARCH" in x86_64) N=x64;; aarch64|arm64) N=arm64;; *) N="$ARCH";; esac; \\
     mkdir -p /opt/iso; curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-$N.tar.gz" | tar -xz -C /opt/iso --strip-components=1; \\
     ln -sf /opt/iso/bin/node /usr/local/bin/iso-node; \\

@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { DATA, PORT, ensureDataDir, getSandbox } from "./config.js";
 import { launch, scaffoldView, type LaunchRequest, type ViewSpec } from "./launch.js";
 import { deleteSandbox } from "./opensandbox.js";
+import { closeSsh, openSsh } from "./sshfwd.js";
 import { run } from "./execd.js";
 import { dropSink, sinkFor } from "./persistence.js";
 import { dropViewsForSandbox, viewsForSandbox, type View, type ViewType } from "./views.js";
@@ -42,6 +43,9 @@ export interface SessionRecord {
   roster?: AgentDef[];
   agentSecretsSealed?: string; // the launch's per-agent credentials, still sealed to this server — re-opened on boot
   vault?: VaultSummary; // what the sidecar holds (names only — never values); revision 0 = lost, needs re-mint
+  // The port `ssh -p` reaches this session on, when ssh is open for it (a key was installed AND
+  // sshd came up). Absent = no ssh; the web shows the command only when this is set.
+  sshPort?: number;
 }
 
 let sessions: Record<string, SessionRecord> = {};
@@ -182,8 +186,11 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
   };
 
   void launch(req)
-    .then((out) => {
-      update(id, { sandboxId: out.sandbox.id, state: "ready", phase: undefined, viewsPending: 0, ...(out.vault ? { vault: out.vault } : {}) });
+    .then(async (out) => {
+      // ssh rides a per-session TCP forwarder (sshfwd.ts) — opened only when the launch actually
+      // brought sshd up, so `sshPort` present means "this really answers".
+      const sshPort = out.ssh ? await openSsh(id, out.sandbox.id).catch(() => null) : null;
+      update(id, { sandboxId: out.sandbox.id, state: "ready", phase: undefined, viewsPending: 0, ...(out.vault ? { vault: out.vault } : {}), ...(sshPort ? { sshPort } : {}) });
       log(`${id} ready (sandbox ${out.sandbox.id.slice(0, 8)})${rec.roster?.length ? `, ${rec.roster.length} agent(s)` : ""}`);
     })
     .catch((e: Error) => {
@@ -192,6 +199,7 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
       // addressable (and listed to the web) pointing at a sandbox the launch already deleted.
       const dead = sessions[id]?.sandboxId;
       update(id, { state: "error", error: e.message, phase: undefined, viewsPending: 0 });
+      closeSsh(id);
       if (dead) {
         dropViewsForSandbox(dead);
         dropSink(dead);
@@ -209,6 +217,8 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
 export async function finishSession(id: string): Promise<void> {
   const s = sessions[id];
   if (!s) return;
+  // Before the sandbox goes: the listener would otherwise stay open on a port pointing at nothing.
+  closeSsh(id);
   if (s.sandboxId) {
     await deleteSandbox(s.sandboxId).catch(() => undefined);
     dropViewsForSandbox(s.sandboxId);
@@ -247,6 +257,10 @@ export function sessionJson(s: SessionRecord): Record<string, unknown> {
     // and calls `start` again when it reads revision 0 (PLAN §5b). Without it here that
     // contract is unreachable: nothing else surfaces the record's vault summary.
     ...(s.vault ? { vault: s.vault } : {}),
+    // The port `ssh -p` reaches this session on. Present only when ssh really answers (a key was
+    // installed, sshd came up, the bridge is listening and a forwarder is bound), so the web can
+    // show the command on its presence alone.
+    ...(s.sshPort ? { sshPort: s.sshPort } : {}),
   };
 }
 
