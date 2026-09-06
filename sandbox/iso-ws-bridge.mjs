@@ -136,9 +136,11 @@ function main() {
     spliceToTcp(sock, Number(targetPort), head);
   });
   server.on("clientError", (_e, sock) => sock.destroy());
-  // 0.0.0.0, like the web-view forwarder: execd reaches in-sandbox ports over the container's own
-  // address, not loopback. Nothing is published to the host, and sshd behind it is key-only.
-  server.listen(Number(listenPort), "0.0.0.0", () => {
+  // Loopback ONLY. execd runs inside this sandbox's own network namespace, so its /proxy/<port>
+  // reaches 127.0.0.1 — verified against a real sandbox before narrowing this, because the wrong
+  // answer here is "ssh silently stops working". A wildcard bind would put this hop, and through
+  // it sshd's pre-auth surface, on the sandbox's container network where a neighbour can reach it.
+  server.listen(Number(listenPort), "127.0.0.1", () => {
     // The pidfile is how the server stops a previous bridge. `pkill -f` cannot be used: the shell
     // running it carries the pattern in its own command line and kills itself first.
     if (pidFile) { try { writeFileSync(pidFile, String(process.pid)); } catch { /* best effort */ } }
