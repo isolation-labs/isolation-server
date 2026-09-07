@@ -367,3 +367,42 @@ test("ensureSshCapability pulls AUDIT_WRITE back, keeps every other drop", () =>
   assert.equal(ensureSshCapability(toml).changed, false);
   assert.equal(ensureSshCapability(`[docker]\nfoo = 1\n`).changed, false);
 });
+
+// --- the private tunnel (docs/vpc-plan.md) -------------------------------------------------------
+const cfgMod = await import("../dist/config.js");
+
+test("vpc config round-trips and a domain-only sandbox config is legal", () => {
+  cfgMod.saveVpc({ creds: "tok", ip: "127.9.9.9" });
+  assert.deepEqual(cfgMod.getVpc(), { creds: "tok", ip: "127.9.9.9" });
+  cfgMod.saveVpc(undefined);
+  assert.equal(cfgMod.getVpc(), undefined);
+  // The web plane no longer needs creds: the Worker delivers previews over the private tunnel.
+  cfgMod.saveSandbox({ domain: "isolation.cc" });
+  assert.deepEqual(cfgMod.getSandbox(), { domain: "isolation.cc" });
+  cfgMod.saveSandbox(undefined);
+});
+
+test("allWebSlugs lists exactly the live web views' slugs — what the heartbeat reports to the Worker", () => {
+  const w1 = views.addView("sb-slugs", "web", 7001, { slug: "a".repeat(26), appPort: 3000 });
+  const w2 = views.addView("sb-slugs", "web", 7002, { slug: "b".repeat(26), appPort: 3001 });
+  const t = views.addView("sb-slugs", "terminal", 7681, {});
+  const got = views.allWebSlugs().filter((s) => s.viewId === w1.id || s.viewId === w2.id || s.viewId === t.id);
+  assert.deepEqual(
+    got.sort((x, y) => x.slug.localeCompare(y.slug)),
+    [{ slug: "a".repeat(26), viewId: w1.id }, { slug: "b".repeat(26), viewId: w2.id }],
+    "web views only, terminal excluded",
+  );
+  views.dropView(w1.id);
+  assert.ok(!views.allWebSlugs().some((s) => s.viewId === w1.id), "a dropped view's slug is gone");
+  views.dropViewsForSandbox("sb-slugs");
+});
+
+test("a web view's URL follows the sandbox domain: https://<slug>.<domain>/ once a domain is set", async () => {
+  const sessionsMod = await import("../dist/sessions.js");
+  const v = views.addView("sb-url", "web", 7003, { slug: "c".repeat(26), appPort: 5173 });
+  cfgMod.saveSandbox({ domain: "isolation.cc" });
+  assert.equal(sessionsMod.viewJson(v, "s-x").target.url, `https://${"c".repeat(26)}.isolation.cc/`);
+  cfgMod.saveSandbox(undefined);
+  assert.match(sessionsMod.viewJson(v, "s-x").target.url, /^http:\/\/c{26}\.localhost:\d+\/$/, "no domain → the .localhost fallback");
+  views.dropViewsForSandbox("sb-url");
+});

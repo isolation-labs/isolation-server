@@ -2,7 +2,7 @@
 // stays behind this interface (the enrollment names it); the URL is never hardcoded
 // and changes on every restart, which the heartbeat self-heals.
 import { type ChildProcess, spawn } from "node:child_process";
-import { HOST, PORT, getEnrollment, getSandbox } from "./config.js";
+import { HOST, PORT, getEnrollment, getSandbox, getVpc } from "./config.js";
 
 const log = (...a: unknown[]) => console.log("[tunnel]", ...a);
 
@@ -164,11 +164,14 @@ class SandboxTunnelManager {
   async start(): Promise<void> {
     await this.stop();
     const sb = getSandbox();
-    if (!sb) return;
+    // Domain-only (docs/vpc-plan.md): the Worker delivers previews over the private tunnel; there is
+    // no per-server public wildcard to run. Only the legacy creds-bearing config spawns anything.
+    if (!sb?.creds) return;
     if (sb.provider !== "cloudflared") throw new Error(`unsupported sandbox provider '${sb.provider}'`);
     const bin = await ensureCloudflared(log);
     this.stopping = false;
-    const child = spawn(bin, ["tunnel", "run", "--token", sb.creds], { stdio: ["ignore", "pipe", "pipe"] });
+    const creds = sb.creds;
+    const child = spawn(bin, ["tunnel", "run", "--token", creds], { stdio: ["ignore", "pipe", "pipe"] });
     this.child = child;
     const scan = (chunk: Buffer) => {
       if (!this.up && /Registered tunnel connection/i.test(chunk.toString())) {
@@ -210,3 +213,69 @@ class SandboxTunnelManager {
 }
 
 export const sandboxTunnelManager = new SandboxTunnelManager();
+
+// The PRIVATE tunnel (docs/vpc-plan.md): the cloud-minted named tunnel with no ingress and no DNS,
+// reachable only by the Worker's cf1:network binding at this server's unique loopback ip. Nothing to
+// scan for — there is no URL. QUIC is required by Workers VPC. Same restart/backoff as the relay.
+class PrivateTunnelManager {
+  private child: ChildProcess | undefined;
+  private up = false;
+  private stopping = false;
+  private restarts = 0;
+  lastError: string | undefined;
+
+  status(): { connected: boolean; ip?: string } {
+    const v = getVpc();
+    return { connected: this.up && !!this.child, ...(v ? { ip: v.ip } : {}) };
+  }
+
+  async start(): Promise<void> {
+    if (this.child) return;
+    this.stopping = false;
+    const bin = await ensureCloudflared(log);
+    this.spawnWith(bin);
+  }
+
+  private spawnWith(bin: string): void {
+    const v = getVpc();
+    if (!v?.creds) return;
+    const child = spawn(bin, ["tunnel", "--no-autoupdate", "--protocol", "quic", "run", "--token", v.creds], { stdio: ["ignore", "pipe", "pipe"] });
+    this.child = child;
+    const watch = (chunk: Buffer) => {
+      if (!this.up && /Registered tunnel connection/i.test(chunk.toString())) {
+        this.up = true;
+        this.restarts = 0;
+        log(`private tunnel up (${v.ip})`);
+      }
+    };
+    child.stdout?.on("data", watch);
+    child.stderr?.on("data", watch);
+    child.on("error", (e) => {
+      this.lastError = e.message;
+      log(`private tunnel spawn failed: ${e.message}`);
+    });
+    child.on("exit", (code) => {
+      this.child = undefined;
+      this.up = false;
+      if (this.stopping) return;
+      const delay = RESTART_BACKOFF_MS[Math.min(this.restarts++, RESTART_BACKOFF_MS.length - 1)];
+      log(`private tunnel exited (code ${code}) — restarting in ${delay / 1000}s`);
+      setTimeout(() => {
+        if (!this.stopping) void ensureCloudflared(log).then((b) => this.spawnWith(b)).catch((e: Error) => log(e.message));
+      }, delay);
+    });
+  }
+
+  async stop(): Promise<void> {
+    this.stopping = true;
+    const c = this.child;
+    this.child = undefined;
+    this.up = false;
+    if (c) {
+      c.kill("SIGTERM");
+      await new Promise((r) => setTimeout(r, 300));
+      if (c.exitCode === null) c.kill("SIGKILL");
+    }
+  }
+}
+export const privateTunnelManager = new PrivateTunnelManager();

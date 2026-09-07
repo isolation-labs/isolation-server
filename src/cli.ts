@@ -58,6 +58,10 @@ async function main(): Promise<void> {
     }
     // 2. The relay binary, pre-fetched so `connect` never waits on a download.
     await ensureCloudflared(say).catch((e: Error) => say(`(cloudflared not provisioned yet: ${e.message})`));
+    // 2b. The private tunnel's loopback ip (docs/vpc-plan.md). Linux serves any 127.x.y.z out of the
+    //     box; macOS binds only 127.0.0.1 until lo0 gets an alias — one sudo, kept across restarts of
+    //     the gate but not of the machine, so `up` re-checks every time.
+    await ensureLoopbackAlias(say);
     // 3. The gate itself.
     installService({ id: "gate", argv: gateArgv() });
     for (let i = 0; i < 20; i++) {
@@ -134,3 +138,25 @@ function fail(msg: string): never {
 }
 
 void main();
+
+// macOS only: `sudo ifconfig lo0 alias <ip>` when the private ip is configured and not yet bound.
+async function ensureLoopbackAlias(say: (m: string) => void): Promise<void> {
+  const { getVpc } = await import("./config.js");
+  const ip = getVpc()?.ip;
+  if (!ip || process.platform !== "darwin") return;
+  const { execFileSync } = await import("node:child_process");
+  const have = (() => {
+    try {
+      return execFileSync("ifconfig", ["lo0"], { encoding: "utf8" }).includes(`inet ${ip} `);
+    } catch {
+      return false;
+    }
+  })();
+  if (have) return;
+  say(`adding loopback alias ${ip} for the private tunnel (sudo may prompt)…`);
+  try {
+    execFileSync("sudo", ["ifconfig", "lo0", "alias", ip], { stdio: "inherit" });
+  } catch {
+    say(`could not add the alias — run: sudo ifconfig lo0 alias ${ip}`);
+  }
+}

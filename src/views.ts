@@ -87,6 +87,9 @@ export const newWebSlug = (): string => {
   return [...randomBytes(26)].map((b) => alphabet[b % 32]).join("");
 };
 export const viewsForSandbox = (sandboxId: string): View[] => Object.values(views).filter((v) => v.sandboxId === sandboxId);
+// Every live web view's public slug — what the heartbeat reports so the Worker can route previews.
+export const allWebSlugs = (): Array<{ slug: string; viewId: string }> =>
+  Object.values(views).flatMap((v) => (v.type === "web" && v.slug ? [{ slug: v.slug, viewId: v.id }] : []));
 
 // The view's route id, minted once and PERSISTED: a user's saved `ssh <id>@host` has to keep
 // working across restarts of this server and of the bastion, so it can never be regenerated.

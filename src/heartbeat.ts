@@ -2,9 +2,10 @@
 // backend needs no changes): a paired gate periodically reports its CURRENT reachable
 // URL + proves liveness. The backend probes that URL inbound (the same path a browser
 // takes) and drives the server's liveness dot from the verdict. Daemon→backend only.
-import { PORT, getPairing, isLoopbackOrigin, savePairing, saveEnrollment, saveBastion, saveSandbox, getMachineId } from "./config.js";
+import { PORT, getPairing, getVpc, isLoopbackOrigin, savePairing, saveEnrollment, saveBastion, saveSandbox, saveVpc, getMachineId } from "./config.js";
 import { GATE_VERSION } from "./version.js";
-import { sandboxTunnelManager, tunnelManager } from "./tunnel.js";
+import { privateTunnelManager, sandboxTunnelManager, tunnelManager } from "./tunnel.js";
+import { allWebSlugs } from "./views.js";
 import { bastion } from "./bastion.js";
 
 const log = (...a: unknown[]) => console.log("[heartbeat]", ...a);
@@ -28,14 +29,23 @@ let lastBeat: BeatStatus | undefined;
 let goingOffline = false;
 let rejectStreak = 0;
 
-const currentUrl = (): string => tunnelManager.publicUrl() ?? `http://localhost:${PORT}`;
+// On a private tunnel (docs/vpc-plan.md) the server's address IS its loopback ip — the Worker dials
+// it over the binding — and there is no public URL to report. Otherwise the relay's quick-tunnel URL.
+const currentUrl = (): string => {
+  const v = getVpc();
+  if (v) return `http://${v.ip}:${PORT}`;
+  return tunnelManager.publicUrl() ?? `http://localhost:${PORT}`;
+};
 
 async function beat(): Promise<void> {
   if (goingOffline) return;
   const p = getPairing();
   if (!p) return;
   const url = currentUrl();
-  const body: Record<string, string> = { connectionId: p.connectionId, secret: p.secret, version: GATE_VERSION, machineId: getMachineId() };
+  const body: Record<string, unknown> = { connectionId: p.connectionId, secret: p.secret, version: GATE_VERSION, machineId: getMachineId() };
+  // Public web previews (docs/vpc-plan.md): every live web view's slug, so the Worker can route
+  // https://<slug>.<domain>/ to this server. The cloud replaces its list per beat.
+  body.webSlugs = allWebSlugs();
   // Report the URL only when changed — and never report the loopback fallback to a
   // REMOTE cloud (a beat racing the tunnel dial would clobber a still-valid tunnel URL).
   if (url !== lastSent && (isLoopbackOrigin(p.backendUrl) || !isLoopbackOrigin(url))) body.url = url;
@@ -46,7 +56,7 @@ async function beat(): Promise<void> {
       body: JSON.stringify(body),
     });
     if (r.ok) {
-      if (body.url) lastSent = body.url;
+      if (typeof body.url === "string") lastSent = body.url;
       rejectStreak = 0;
       lastBeat = { ok: true, at: Date.now() };
       const resp = (await r.json().catch(() => ({}))) as { tunnel?: string; newSecret?: string };
@@ -97,6 +107,9 @@ export function detach(): void {
   // <slug>.localhost, exactly as they did before this server was ever paired.
   saveSandbox(undefined);
   void sandboxTunnelManager.stop();
+  // And the private tunnel: the cloud minted it, the cloud revoked us — it must not keep a way in.
+  saveVpc(undefined);
+  void privateTunnelManager.stop();
 }
 
 export function pairingStatus(): { paired: boolean; backendUrl?: string; lastBeat?: BeatStatus } {

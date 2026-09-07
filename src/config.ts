@@ -51,9 +51,11 @@ export interface Enrollment {
 // the cloud (Cloud VMs: seeded at provision; any server: `POST /sandbox` or the launch
 // body). Never hardcoded. Absent → web views are addressed as `<slug>.localhost`.
 export interface SandboxConfig {
-  provider: "cloudflared";
-  creds: string; // the named tunnel's run token
-  domain: string; // e.g. "<id>-web.run.isolation.cloud"
+  provider?: "cloudflared";
+  // The named tunnel's run token — LEGACY: a per-server public wildcard tunnel. Absent when the web
+  // plane rides the private tunnel (docs/vpc-plan.md); then `domain` alone is the whole config.
+  creds?: string;
+  domain: string; // e.g. "isolation.cc" — web views are https://<slug>.<domain>/
 }
 
 // The SSH bastion's coords, fetched from the cloud during `connect` (POST /api/pair/bastion) and
@@ -76,6 +78,15 @@ export interface BastionConfig {
   hostKey?: string;
 }
 
+// The server's PRIVATE named tunnel + its Workers VPC address (docs/vpc-plan.md). The cloud mints
+// both at pairing (or seeds them on a Cloud VM); the server runs `cloudflared tunnel run --token
+// <creds>` and binds on `ip` (a loopback address unique to this server account-wide) as well as
+// 127.0.0.1. The server has NO public URL: the Worker reaches it over the binding at `ip`.
+export interface VpcConfig {
+  creds: string; // the named tunnel's run token
+  ip: string; // 127.x.y.z
+}
+
 export interface OsbConfig {
   url: string; // the local opensandbox-server, loopback
   apiKey: string;
@@ -90,6 +101,7 @@ interface Config {
   osb?: OsbConfig;
   sandbox?: SandboxConfig;
   bastion?: BastionConfig;
+  vpc?: VpcConfig;
 }
 
 let cfg: Config = {};
@@ -165,6 +177,12 @@ export function saveSandbox(sb: SandboxConfig | undefined): void {
 
 export function saveOsb(o: OsbConfig): void {
   cfg.osb = o;
+  persist();
+}
+
+export const getVpc = (): VpcConfig | undefined => cfg.vpc;
+export function saveVpc(v: VpcConfig | undefined): void {
+  cfg.vpc = v;
   persist();
 }
 

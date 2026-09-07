@@ -4,8 +4,8 @@
 // is small enough that a framework would outweigh it.
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { GATE_VERSION } from "./version.js";
-import { HOST, PORT, getBastion, getName, getPairing, getToken, isLoopbackOrigin, originAllowed, saveBastion, savePairing, tokenMatches, getMachineId } from "./config.js";
-import { beatOffline, detach, pairingStatus, startHeartbeat } from "./heartbeat.js";
+import { HOST, PORT, getBastion, getName, getPairing, getToken, getVpc, isLoopbackOrigin, originAllowed, saveBastion, savePairing, saveVpc, tokenMatches, getMachineId } from "./config.js";
+import { beatNow, beatOffline, detach, pairingStatus, startHeartbeat } from "./heartbeat.js";
 import { deleteSandbox, getSandbox, listSandboxes, osbHealthy, pauseSandbox, resumeSandbox, sandboxLogs } from "./opensandbox.js";
 import { handlePublicWebRequest, handlePublicWebUpgrade, handleViewRequest, handleViewUpgrade, invalidateEndpoints } from "./doorman.js";
 import { launch, restartTerminal, sanitizeStyle, type LaunchRequest } from "./launch.js";
@@ -31,7 +31,7 @@ import { pauseSession, resumeSession,
   viewJson,
   type DaemonLaunchBody,
 } from "./sessions.js";
-import { sandboxTunnelManager, tunnelManager } from "./tunnel.js";
+import { privateTunnelManager, sandboxTunnelManager, tunnelManager } from "./tunnel.js";
 import { bastion, modeForView, nativeConnectFor } from "./bastion.js";
 
 const VERSION = GATE_VERSION;
@@ -121,7 +121,10 @@ function backendUrlSafe(u: string): boolean {
 // paired. Idempotent — the boot path and the pair path share it.
 import { getEnrollment, getSandbox as getSandboxConfig, saveEnrollment, saveSandbox } from "./config.js";
 export async function startConfigured(): Promise<void> {
-  if (getEnrollment() && !tunnelManager.status().connected) {
+  // A server on a private tunnel has NO public surface: the relay quick tunnel is not started
+  // (docs/vpc-plan.md). Pairing still brings one up briefly — the claim needs a reachable URL before
+  // the vpc block exists — and fetchVpcConfig stops it the moment the private tunnel is configured.
+  if (getEnrollment() && !getVpc() && !tunnelManager.status().connected) {
     try {
       await tunnelManager.start();
     } catch (e) {
@@ -129,12 +132,18 @@ export async function startConfigured(): Promise<void> {
     }
   }
   if (getPairing()) startHeartbeat();
-  if (getSandboxConfig() && !sandboxTunnelManager.status().connected) {
+  if (getSandboxConfig()?.creds && !sandboxTunnelManager.status().connected) {
     await sandboxTunnelManager.start().catch((e: Error) => log(`sandbox tunnel bring-up failed: ${e.message}`));
   }
   // The SSH bastion: an outbound control connection that publishes `ssh <routeId>@<host>` for every
   // ssh-shaped view. A server with no bastion config just stays on the local forwarder.
   bastion.startIfConfigured();
+  // The private tunnel (docs/vpc-plan.md): the cloud's only way in. Bind the ip first so the first
+  // request the Worker sends after "Registered tunnel connection" has something to land on.
+  if (getVpc()) {
+    listenOnVpcIp();
+    await privateTunnelManager.start().catch((e: Error) => log(`private tunnel bring-up failed: ${e.message}`));
+  }
 }
 
 // The cloud injects the public-web (sandbox) tunnel — at provision on a Cloud VM, or
@@ -145,11 +154,41 @@ function applyInjectedSandbox(s: unknown): void {
   const o = s as Record<string, unknown>;
   const domain = typeof o.domain === "string" ? o.domain.trim().toLowerCase() : "";
   const creds = typeof o.creds === "string" ? o.creds.trim() : "";
-  if (!domain || !creds) return;
+  if (!domain) return;
   const cur = getSandboxConfig();
-  if (cur && cur.domain === domain && cur.creds === creds) return;
-  saveSandbox({ provider: "cloudflared", creds, domain });
-  void sandboxTunnelManager.start().catch((e: Error) => log(`sandbox tunnel (injected) failed: ${e.message}`));
+  if (cur && cur.domain === domain && (cur.creds ?? "") === creds) return;
+  // Domain only (docs/vpc-plan.md): web views are https://<slug>.<domain>/ and the Worker delivers
+  // them over the private tunnel — nothing to dial here. Creds = the legacy per-server public wildcard.
+  saveSandbox(creds ? { provider: "cloudflared", creds, domain } : { domain });
+  if (creds) void sandboxTunnelManager.start().catch((e: Error) => log(`sandbox tunnel (injected) failed: ${e.message}`));
+}
+
+// The server's PRIVATE tunnel + address (POST /api/pair/vpc — same auth as the bastion coords).
+// The cloud mints it once and returns the same pair after; we run the tunnel and bind on the ip.
+// A backend with no managed tier answers `{vpc: null}` and this server stays loopback-only.
+async function fetchVpcConfig(backendUrl: string, connectionId: string, secret: string): Promise<void> {
+  try {
+    const r = await fetch(`${backendUrl}/api/pair/vpc`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ connectionId, secret }),
+    });
+    const body = (await r.json().catch(() => ({}))) as { vpc?: { creds?: string; ip?: string } | null };
+    if (!r.ok) return log(`vpc config fetch: HTTP ${r.status} — keeping the current one`);
+    const v = body.vpc;
+    if (!v || typeof v.creds !== "string" || typeof v.ip !== "string" || !/^127\.\d+\.\d+\.\d+$/.test(v.ip)) return;
+    const cur = getVpc();
+    if (cur && cur.creds === v.creds && cur.ip === v.ip) return;
+    saveVpc({ creds: v.creds, ip: v.ip });
+    await privateTunnelManager.stop();
+    await privateTunnelManager.start().catch((e: Error) => log(`private tunnel failed: ${e.message}`));
+    listenOnVpcIp();
+    // The public quick tunnel has no job left: everything reaches this server through the Worker.
+    if (!isLoopbackOrigin(backendUrl)) void tunnelManager.stop();
+    log(`private tunnel configured — the cloud reaches this server at ${v.ip}:${PORT}`);
+  } catch (e) {
+    log(`vpc config fetch failed: ${(e as Error)?.message ?? e}`);
+  }
 }
 
 async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -209,6 +248,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       runtime: { kind: "opensandbox", healthy: await osbHealthy() },
       tunnel: t,
       sandbox: sandboxTunnelManager.status(),
+      vpc: privateTunnelManager.status(),
       pairing: pairingStatus(),
       // The ssh plane: whether the bastion is configured, whether its control connection is up
       // right now, and the host users type. Routes are soft state — the count is what the bastion
@@ -253,6 +293,8 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         // endpoints. Best-effort: a backend with no bastion configured answers `{bastion:null}`,
         // and this server simply stays local-forwarder-only.
         await fetchBastionConfig(backendUrl, claim.connectionId, claim.secret);
+        // And the private tunnel the Worker will drive this server through (docs/vpc-plan.md).
+        await fetchVpcConfig(backendUrl, claim.connectionId, claim.secret);
       }
       return json(res, 200, { ok: true, label: claim.label ?? label, url: myUrl });
     } catch (e) {
@@ -334,6 +376,14 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     return json(res, 200, { ok: true, bastion: bastion.enabled() ? { host: bastion.publicHost(), connected: bastion.isLive() } : null });
   }
 
+  // Re-fetch the private tunnel + address for an already-paired server (mirrors POST /bastion).
+  if (method === "POST" && url === "/vpc") {
+    const p = getPairing();
+    if (!p) return json(res, 409, { error: "not paired — nothing to fetch a private tunnel from" });
+    await fetchVpcConfig(p.backendUrl, p.connectionId, p.secret);
+    return json(res, 200, { ok: true, vpc: privateTunnelManager.status() });
+  }
+
   // Configure the public-web tunnel out of band (self-hosters / the cloud on pairing).
   if (method === "POST" && url === "/sandbox") {
     applyInjectedSandbox(await readBody(req));
@@ -396,6 +446,8 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         const gone = getView(vid);
         if (gone?.sshRouteId) bastion.unregisterRoute(gone.sshRouteId);
         const v = dropView(vid);
+        // A dropped web view's slug must stop routing at the Worker on the next beat — now.
+        if (v?.type === "web") void beatNow();
         // Best-effort: stop the view's in-sandbox server so the port frees up.
         if (v) {
           // Every ported view type owns a process — including a web view's forwarder.
@@ -684,7 +736,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   return json(res, 404, { error: "not found" });
 }
 
-export function startServer(): void {
+function makeServer() {
   const server = createServer((req, res) => {
     void route(req, res).catch((e) => {
       if (!res.headersSent) json(res, 500, { error: String((e as Error)?.message ?? e) });
@@ -695,6 +747,28 @@ export function startServer(): void {
       if (!claimed) return handleViewUpgrade(req, socket, head);
     });
   });
+  return server;
+}
+
+// The private-tunnel listener (docs/vpc-plan.md): the same handlers on this server's unique loopback
+// ip, which is what the Worker dials over the binding. Still loopback — nothing off-host can reach
+// it except through the tunnel. Idempotent; a bind failure on macOS means the lo0 alias is missing
+// (`isolation up` adds it) and is reported, not fatal: 127.0.0.1 keeps serving local dev.
+let vpcListener: ReturnType<typeof createServer> | undefined;
+export function listenOnVpcIp(): void {
+  const v = getVpc();
+  if (!v || vpcListener) return;
+  const s = makeServer();
+  s.once("error", (e: NodeJS.ErrnoException) => {
+    vpcListener = undefined;
+    log(`cannot bind ${v.ip}:${PORT} (${e.code}) — on macOS run: sudo ifconfig lo0 alias ${v.ip}; then \`isolation up\``);
+  });
+  s.listen(PORT, v.ip, () => log(`listening on http://${v.ip}:${PORT} (private tunnel)`));
+  vpcListener = s;
+}
+
+export function startServer(): void {
+  const server = makeServer();
   server.listen(PORT, HOST, () => log(`listening on http://${HOST}:${PORT}`));
 
   const shutdown = async (): Promise<void> => {
