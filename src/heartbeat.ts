@@ -2,9 +2,9 @@
 // backend needs no changes): a paired gate periodically reports its CURRENT reachable
 // URL + proves liveness. The backend probes that URL inbound (the same path a browser
 // takes) and drives the server's liveness dot from the verdict. Daemon→backend only.
-import { PORT, getPairing, isLoopbackOrigin, savePairing, saveEnrollment, saveBastion, getMachineId } from "./config.js";
+import { PORT, getPairing, isLoopbackOrigin, savePairing, saveEnrollment, saveBastion, saveSandbox, getMachineId } from "./config.js";
 import { GATE_VERSION } from "./version.js";
-import { tunnelManager } from "./tunnel.js";
+import { sandboxTunnelManager, tunnelManager } from "./tunnel.js";
 import { bastion } from "./bastion.js";
 
 const log = (...a: unknown[]) => console.log("[heartbeat]", ...a);
@@ -90,6 +90,13 @@ export function detach(): void {
   // and the register secret would sit on disk waiting for the next restart to dial back out.
   saveBastion(undefined);
   bastion.disable();
+  // Third inbound path, same rule: the public-web (sandbox) tunnel the cloud minted for this
+  // server. Left alone it keeps a wildcard hostname resolving to this machine's doorman, so every
+  // live view stays reachable from the internet by slug on a credential the cloud has revoked —
+  // and the token would sit on disk for the next restart to dial back out. Web views fall back to
+  // <slug>.localhost, exactly as they did before this server was ever paired.
+  saveSandbox(undefined);
+  void sandboxTunnelManager.stop();
 }
 
 export function pairingStatus(): { paired: boolean; backendUrl?: string; lastBeat?: BeatStatus } {

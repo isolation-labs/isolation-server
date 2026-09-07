@@ -111,7 +111,9 @@ async function fetchSandboxConfig(backendUrl: string, connectionId: string, secr
     });
     const body = (await r.json().catch(() => ({}))) as { sandbox?: { domain?: string; creds?: string } | null };
     // A transient failure (a 502, a deploy window) must never tear down a tunnel that already
-    // works — same rule as the bastion fetch. Only a healthy "no sandbox" answer degrades us.
+    // works — same rule as the bastion fetch. Unlike the bastion, a healthy "no sandbox" answer
+    // does NOT tear down either: this config also has a self-hoster provenance (POST /sandbox),
+    // which a backend with no RELAY_DOMAIN has no business wiping. Revocation is detach()'s job.
     if (!r.ok) return log(`sandbox tunnel fetch: HTTP ${r.status} — keeping the current one`);
     applyInjectedSandbox(body.sandbox);
   } catch (e) {
@@ -274,8 +276,8 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         // endpoints. Best-effort: a backend with no bastion configured answers `{bastion:null}`,
         // and this server simply stays local-forwarder-only.
         await fetchBastionConfig(backendUrl, claim.connectionId, claim.secret);
-        // Same for the public web-preview tunnel: a connected server gets one minted for it, same
-        // wildcard mechanism a Cloud VM gets at provision (docs/web-tunnel-plan.md).
+        // Same for the public web-preview tunnel: a connected server gets one minted for it, the
+        // same wildcard mechanism a Cloud VM gets at provision.
         await fetchSandboxConfig(backendUrl, claim.connectionId, claim.secret);
       }
       return json(res, 200, { ok: true, label: claim.label ?? label, url: myUrl });
