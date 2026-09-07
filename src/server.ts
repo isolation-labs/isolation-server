@@ -98,29 +98,6 @@ async function fetchBastionConfig(backendUrl: string, connectionId: string, secr
   }
 }
 
-// Ask the cloud for a public web-preview tunnel (POST /api/pair/sandbox — same auth, same
-// mechanism Cloud VMs get at provision, just minted on demand for a connected server). Best-effort:
-// a backend with no RELAY_DOMAIN answers `{sandbox: null}` and this server just keeps serving web
-// views at <slug>.localhost — the ORIGINAL, always-worked-standalone fallback, never broken by this.
-async function fetchSandboxConfig(backendUrl: string, connectionId: string, secret: string): Promise<void> {
-  try {
-    const r = await fetch(`${backendUrl}/api/pair/sandbox`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ connectionId, secret }),
-    });
-    const body = (await r.json().catch(() => ({}))) as { sandbox?: { domain?: string; creds?: string } | null };
-    // A transient failure (a 502, a deploy window) must never tear down a tunnel that already
-    // works — same rule as the bastion fetch. Unlike the bastion, a healthy "no sandbox" answer
-    // does NOT tear down either: this config also has a self-hoster provenance (POST /sandbox),
-    // which a backend with no RELAY_DOMAIN has no business wiping. Revocation is detach()'s job.
-    if (!r.ok) return log(`sandbox tunnel fetch: HTTP ${r.status} — keeping the current one`);
-    applyInjectedSandbox(body.sandbox);
-  } catch (e) {
-    log(`sandbox tunnel fetch failed (staying on <slug>.localhost): ${(e as Error)?.message ?? e}`);
-  }
-}
-
 const bearer = (req: IncomingMessage): string | undefined => {
   const a = req.headers.authorization;
   return a?.startsWith("Bearer ") ? a.slice(7) : undefined;
@@ -276,9 +253,6 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         // endpoints. Best-effort: a backend with no bastion configured answers `{bastion:null}`,
         // and this server simply stays local-forwarder-only.
         await fetchBastionConfig(backendUrl, claim.connectionId, claim.secret);
-        // Same for the public web-preview tunnel: a connected server gets one minted for it, the
-        // same wildcard mechanism a Cloud VM gets at provision.
-        await fetchSandboxConfig(backendUrl, claim.connectionId, claim.secret);
       }
       return json(res, 200, { ok: true, label: claim.label ?? label, url: myUrl });
     } catch (e) {
@@ -358,15 +332,6 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!p) return json(res, 409, { error: "not paired — nothing to fetch bastion coords from" });
     await fetchBastionConfig(p.backendUrl, p.connectionId, p.secret);
     return json(res, 200, { ok: true, bastion: bastion.enabled() ? { host: bastion.publicHost(), connected: bastion.isLive() } : null });
-  }
-
-  // Same refetch, for the web-preview tunnel — a server paired before this shipped (or whose
-  // backend only just set RELAY_DOMAIN) picks one up without re-pairing.
-  if (method === "POST" && url === "/sandbox-config") {
-    const p = getPairing();
-    if (!p) return json(res, 409, { error: "not paired — nothing to fetch a sandbox tunnel from" });
-    await fetchSandboxConfig(p.backendUrl, p.connectionId, p.secret);
-    return json(res, 200, { ok: true, sandbox: sandboxTunnelManager.status() });
   }
 
   // Configure the public-web tunnel out of band (self-hosters / the cloud on pairing).
