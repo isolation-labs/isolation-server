@@ -120,11 +120,14 @@ function backendUrlSafe(u: string): boolean {
 // Bring up whatever the config prescribes: tunnel when enrolled, heartbeat when
 // paired. Idempotent — the boot path and the pair path share it.
 import { getEnrollment, getSandbox as getSandboxConfig, saveEnrollment, saveSandbox } from "./config.js";
-export async function startConfigured(): Promise<void> {
+export async function startConfigured(opts?: { forceRelay?: boolean }): Promise<void> {
   // A server on a private tunnel has NO public surface: the relay quick tunnel is not started at
-  // all. Pairing still brings one up briefly — the claim needs a reachable URL before the vpc block
-  // exists — and fetchVpcConfig stops it the moment the private tunnel is configured.
-  if (getEnrollment() && !getVpc() && !tunnelManager.status().connected) {
+  // boot. Pairing still brings one up briefly — the claim needs a reachable URL — and
+  // fetchVpcConfig stops it the moment the private tunnel is configured. `forceRelay` is the pair
+  // path saying so: a RE-pair runs with the PREVIOUS pairing's vpc block still on disk, and
+  // suppressing the relay on that stale block would fail the claim ("could not establish a relay
+  // tunnel") on every server that has ever had a private tunnel.
+  if (getEnrollment() && (opts?.forceRelay || !getVpc()) && !tunnelManager.status().connected) {
     try {
       await tunnelManager.start();
     } catch (e) {
@@ -166,6 +169,16 @@ function applyInjectedSandbox(s: unknown): void {
   else void sandboxTunnelManager.stop();
 }
 
+// A usable private address: a real 127.x.y.z with in-range octets, and never 127.0.0.1 — that one
+// is the MAIN listener's, so binding it would fail with EADDRINUSE forever while the relay has
+// already been torn down, leaving no way back in. Anything else is a backend bug: refuse it here so
+// the vpc block we already hold is kept (see below) instead of being replaced by an address we can
+// never serve.
+function privateIp(ip: string): boolean {
+  const m = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip);
+  return !!m && m.slice(1).every((o) => Number(o) <= 255) && ip !== "127.0.0.1";
+}
+
 // The server's PRIVATE tunnel + address (POST /api/pair/vpc — same auth as the bastion coords).
 // The cloud mints it once and returns the same pair after; we run the tunnel and bind on the ip.
 // A backend with no managed tier answers `{vpc: null}` and this server stays loopback-only.
@@ -176,18 +189,44 @@ async function fetchVpcConfig(backendUrl: string, connectionId: string, secret: 
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ connectionId, secret }),
     });
-    const body = (await r.json().catch(() => ({}))) as { vpc?: { creds?: string; ip?: string; domain?: string } | null };
+    type VpcAnswer = { vpc?: { creds?: string; ip?: string; domain?: string } | null };
+    // `undefined` = the answer was not JSON at all. That is NOT the cloud speaking, so it must never
+    // revoke: an HTML interstitial or a truncated 200 in front of the backend would otherwise cost
+    // this server its only way in, and nothing re-fetches on its own afterwards — the cloud would go
+    // on dialing a private ip we no longer serve until someone ran `POST /vpc` by hand.
+    const body = (await r.json().catch(() => undefined)) as VpcAnswer | undefined;
     if (!r.ok) return log(`vpc config fetch: HTTP ${r.status} — keeping the current one`);
+    if (!body || typeof body !== "object") return log("vpc config fetch: the answer was not JSON — keeping the current one");
     const v = body.vpc;
-    if (!v || typeof v.creds !== "string" || typeof v.ip !== "string" || !/^127\.\d+\.\d+\.\d+$/.test(v.ip)) return;
+    const creds = typeof v?.creds === "string" && v.creds ? v.creds : undefined;
+    const ip = typeof v?.ip === "string" && privateIp(v.ip) ? v.ip : undefined;
+    if (!creds || !ip) {
+      // A well-formed answer carrying a MALFORMED block is a backend bug, not a revocation either —
+      // only an explicit `{vpc: null}` is the cloud saying this server has no private tunnel.
+      if (v) return log("vpc config fetch: malformed vpc block — keeping the current one");
+      // A HEALTHY backend saying "no private tunnel" revokes the one we hold — same rule as the
+      // bastion coords, and unlike the sandbox config the vpc block has no self-hoster provenance:
+      // only the cloud ever mints it. Left alone it would keep an inbound path open for a cloud (or
+      // an account) that no longer owns this server — this is exactly the re-pair-elsewhere case —
+      // and `currentUrl()` would go on reporting an ip the new cloud can never dial.
+      if (!getVpc()) return;
+      log("the cloud reports no private tunnel for this server — dropping the one we hold");
+      saveVpc(undefined);
+      await privateTunnelManager.stop();
+      syncVpcListener();
+      // With the private tunnel gone the relay is the only way back in; startConfigured is
+      // idempotent and now sees no vpc block, so it brings one up when this server is enrolled.
+      await startConfigured().catch((e: Error) => log(`relay bring-up after vpc revocation failed: ${e.message}`));
+      return;
+    }
     // The preview domain: web views become https://<slug>.<domain>/, served by the Worker over this
     // very tunnel. Domain only — no creds, nothing to dial (see applyInjectedSandbox).
-    if (typeof v.domain === "string" && v.domain) applyInjectedSandbox({ domain: v.domain });
+    if (typeof v?.domain === "string" && v.domain) applyInjectedSandbox({ domain: v.domain });
     const cur = getVpc();
-    const unchanged = cur?.creds === v.creds && cur?.ip === v.ip;
+    const unchanged = cur?.creds === creds && cur?.ip === ip;
     // Unchanged coords still re-run the bring-up: POST /vpc is the repair path a user reaches for
     // after fixing a failed bind (the missing lo0 alias), and both steps below are idempotent.
-    if (!unchanged) saveVpc({ creds: v.creds, ip: v.ip });
+    if (!unchanged) saveVpc({ creds, ip });
     if (!unchanged) await privateTunnelManager.stop();
     // Bind first, dial second — the first request the Worker sends after "Registered tunnel
     // connection" has to land on something (same order as startConfigured).
@@ -196,7 +235,7 @@ async function fetchVpcConfig(backendUrl: string, connectionId: string, secret: 
     // The public quick tunnel has no job left: everything reaches this server through the Worker.
     if (!isLoopbackOrigin(backendUrl)) void tunnelManager.stop();
     if (unchanged) return;
-    log(`private tunnel configured — the cloud reaches this server at ${v.ip}:${PORT}`);
+    log(`private tunnel configured — the cloud reaches this server at ${ip}:${PORT}`);
   } catch (e) {
     log(`vpc config fetch failed: ${(e as Error)?.message ?? e}`);
   }
@@ -284,7 +323,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       if (!isLoopbackOrigin(backendUrl) && !tunnelManager.status().connected) {
         saveEnrollment({ provider: "cloudflared", mode: "quick" });
       }
-      await startConfigured();
+      await startConfigured({ forceRelay: true });
       if (!isLoopbackOrigin(backendUrl) && !tunnelManager.status().connected) {
         const why = tunnelManager.lastError;
         return json(res, 502, { error: `could not establish a relay tunnel${why ? ` — ${why}` : ""}` });
@@ -769,9 +808,13 @@ function makeServer() {
 // alias is missing (`isolation up` adds it) and is reported, not fatal: 127.0.0.1 keeps serving.
 let vpcListener: ReturnType<typeof createServer> | undefined;
 let vpcListenerIp: string | undefined;
+let vpcRetry: NodeJS.Timeout | undefined;
+let vpcNagged: string | undefined; // the ip we already complained about — say it once, retry quietly
 export function syncVpcListener(): void {
   const ip = getVpc()?.ip;
   if (ip === vpcListenerIp) return;
+  clearTimeout(vpcRetry);
+  vpcRetry = undefined;
   vpcListener?.close();
   vpcListener = undefined;
   vpcListenerIp = undefined;
@@ -782,9 +825,20 @@ export function syncVpcListener(): void {
       vpcListener = undefined;
       vpcListenerIp = undefined;
     }
-    log(`cannot bind ${ip}:${PORT} (${e.code}) — on macOS run: sudo ifconfig lo0 alias ${ip}; then \`isolation up\``);
+    // macOS binds nothing but 127.0.0.1 until lo0 gets the alias. Keep retrying: the moment the
+    // alias exists the bind succeeds, with no restart of anything — the alias is the only step
+    // a person has to take, and it must never also require a second one.
+    if (vpcNagged !== ip) {
+      vpcNagged = ip;
+      log(`cannot bind ${ip}:${PORT} (${e.code}) — on macOS run: sudo ifconfig lo0 alias ${ip}  (retrying every 15s until it binds)`);
+    }
+    vpcRetry = setTimeout(syncVpcListener, 15_000);
+    vpcRetry.unref();
   });
-  s.listen(PORT, ip, () => log(`listening on http://${ip}:${PORT} (private tunnel)`));
+  s.listen(PORT, ip, () => {
+    vpcNagged = undefined;
+    log(`listening on http://${ip}:${PORT} (private tunnel)`);
+  });
   vpcListener = s;
   vpcListenerIp = ip;
 }

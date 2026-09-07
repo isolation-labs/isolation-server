@@ -79,9 +79,10 @@ export interface BastionConfig {
 }
 
 // The server's PRIVATE named tunnel + its Workers VPC address. The cloud mints
-// both at pairing (or seeds them on a Cloud VM); the server runs `cloudflared tunnel run --token
-// <creds>` and binds on `ip` (a loopback address unique to this server account-wide) as well as
-// 127.0.0.1. The server has NO public URL: the Worker reaches it over the binding at `ip`.
+// both at pairing (or seeds them on a Cloud VM); the server runs `cloudflared tunnel run` with
+// `creds` in TUNNEL_TOKEN (never argv — `ps` is world-readable) and binds on `ip` (a loopback
+// address unique to this server account-wide) as well as 127.0.0.1. The server has NO public URL:
+// the Worker reaches it over the binding at `ip`.
 export interface VpcConfig {
   creds: string; // the named tunnel's run token
   ip: string; // 127.x.y.z

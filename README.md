@@ -10,8 +10,12 @@ else:
 - **Pairing + heartbeat** — link the server to an account with one command; it phones
   home, self-heals its public URL, reports its version, and detaches cleanly when
   removed.
-- **The relay tunnel** — a Cloudflare tunnel fronting the gate, so browsers reach the
-  server without any inbound firewall/port setup.
+- **The private tunnel** — once paired, the server has no public URL at all: a Cloudflare
+  tunnel with no ingress and no DNS carries everything, and only Isolation Cloud's own
+  network binding can reach it. No inbound firewall/port setup either way. (macOS binds
+  only `127.0.0.1` until `lo0` gets an alias for the address the cloud dials — `isolation
+  up` and `isolation connect` add it with one `sudo`, and the server tells you the command
+  if it can't.)
 - **The doorman** — one public origin for every view of every sandbox
   (`/v/<viewId>/*`), WebSocket-capable, authorized by short-lived view tokens instead
   of the machine credential.

@@ -11,6 +11,12 @@ const RESTART_BACKOFF_MS = [2_000, 5_000, 15_000, 60_000];
 
 import { ensureCloudflared } from "./cloudflared.js";
 
+// A tunnel run token goes in the ENVIRONMENT, never in argv: /proc/<pid>/cmdline (and plain `ps`)
+// is world-readable, so a token on the command line hands any local user the tunnel — and for the
+// private tunnel that means receiving the control-plane requests the cloud sends us, master bearer
+// and all. cloudflared reads TUNNEL_TOKEN for `tunnel run` exactly like the flag.
+const tokenEnv = (creds: string): NodeJS.ProcessEnv => ({ ...process.env, TUNNEL_TOKEN: creds });
+
 export interface TunnelStatus {
   connected: boolean;
   url?: string;
@@ -62,7 +68,7 @@ class TunnelManager {
     // this gate's loopback port. We only run it with its token; the public URL is the STABLE
     // one the cloud minted, announced immediately (no trycloudflare URL to scan for).
     if (enr?.mode === "named" && enr.creds) {
-      const child = spawn(bin, ["tunnel", "run", "--token", enr.creds], { stdio: ["ignore", "pipe", "pipe"] });
+      const child = spawn(bin, ["tunnel", "run"], { stdio: ["ignore", "pipe", "pipe"], env: tokenEnv(enr.creds) });
       this.child = child;
       let up = false;
       const watch = (chunk: Buffer) => {
@@ -171,7 +177,7 @@ class SandboxTunnelManager {
     const bin = await ensureCloudflared(log);
     this.stopping = false;
     const creds = sb.creds;
-    const child = spawn(bin, ["tunnel", "run", "--token", creds], { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(bin, ["tunnel", "run"], { stdio: ["ignore", "pipe", "pipe"], env: tokenEnv(creds) });
     this.child = child;
     const scan = (chunk: Buffer) => {
       if (!this.up && /Registered tunnel connection/i.test(chunk.toString())) {
@@ -236,9 +242,14 @@ class PrivateTunnelManager {
   // reason: only ONE cloudflared may ever be tracked, and an UNtracked one survives stop() and
   // detach() — a revoked private tunnel still connected to a live origin.
   async start(): Promise<void> {
+    // Clear `stopping` BEFORE joining an in-flight attempt. A stop() that lands while a previous
+    // start() is still fetching the binary (a cold `ensureCloudflared` downloads it) leaves
+    // `starting` pending with the flag set; joining it without clearing would let that attempt bail
+    // in spawnWith and this start() resolve having dialed NOTHING — the private tunnel then stays
+    // down until the next `up` or POST /vpc. This is the stop-then-restart path in fetchVpcConfig.
+    this.stopping = false;
     if (this.child) return;
     if (this.starting) return this.starting;
-    this.stopping = false;
     this.starting = (async () => {
       try {
         const bin = await ensureCloudflared(log);
@@ -255,7 +266,7 @@ class PrivateTunnelManager {
   private spawnWith(bin: string): void {
     const v = getVpc();
     if (!v?.creds || this.stopping || this.child) return;
-    const child = spawn(bin, ["tunnel", "--no-autoupdate", "--protocol", "quic", "run", "--token", v.creds], { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(bin, ["tunnel", "--no-autoupdate", "--protocol", "quic", "run"], { stdio: ["ignore", "pipe", "pipe"], env: tokenEnv(v.creds) });
     this.child = child;
     const watch = (chunk: Buffer) => {
       if (!this.up && /Registered tunnel connection/i.test(chunk.toString())) {
