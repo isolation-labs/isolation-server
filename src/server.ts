@@ -221,7 +221,16 @@ async function fetchVpcConfig(backendUrl: string, connectionId: string, secret: 
     }
     // The preview domain: web views become https://<slug>.<domain>/, served by the Worker over this
     // very tunnel. Domain only — no creds, nothing to dial (see applyInjectedSandbox).
+    // The cloud is AUTHORITATIVE for the preview domain: no domain in the answer means this
+    // deployment does not serve one (a loopback backend), so a previously-set domain-only config is
+    // CLEARED rather than left behind — otherwise every web view would go on advertising a URL that
+    // resolves to someone else's Worker. A creds-bearing (legacy public wildcard) config is left
+    // alone; that one is not ours to drop here.
     if (typeof v?.domain === "string" && v.domain) applyInjectedSandbox({ domain: v.domain });
+    else if (getSandboxConfig() && !getSandboxConfig()?.creds) {
+      log("the cloud serves no preview domain here — web views fall back to <slug>.localhost");
+      saveSandbox(undefined);
+    }
     const cur = getVpc();
     const unchanged = cur?.creds === creds && cur?.ip === ip;
     // Unchanged coords still re-run the bring-up: POST /vpc is the repair path a user reaches for

@@ -181,12 +181,23 @@ export async function handleViewUpgrade(req: IncomingMessage, socket: Duplex, he
 
 const hostOnly = (h: string | undefined): string => (h ?? "").split(":")[0].trim().toLowerCase();
 
+// The hostname this request was addressed to, as the BROWSER wrote it.
+//
+// When the cloud's Worker proxies a public web preview to us over the private tunnel it cannot
+// forward the real Host: `Host` is a forbidden header for fetch() in a Worker, so a `headers.set`
+// is silently dropped and we would see the tunnel's own address (127.x.y.z:8090) instead of
+// `<slug>.<domain>`. The Worker sends `x-forwarded-host` for exactly this, so prefer it.
+//
+// It is not a new trust surface: this plane is unauthenticated BY DESIGN — the ≥128-bit slug is the
+// whole secret — and anything that can reach this port could already set Host directly.
+const requestHost = (req: IncomingMessage): string => hostOnly((req.headers["x-forwarded-host"] as string | undefined) ?? req.headers.host);
+
 // The slug when this request's Host belongs to the public plane; undefined otherwise.
 // A configured sandbox domain claims ALL its subdomains (unknown slug → 404, never the
 // API). `.localhost` claims only labels that match a live web view, so plain
 // `localhost` keeps serving the control plane.
 function publicSlug(req: IncomingMessage): { slug: string; claimed: boolean } | undefined {
-  const host = hostOnly(req.headers.host);
+  const host = requestHost(req);
   const domain = getSandbox()?.domain;
   if (domain && (host === domain || host.endsWith(`.${domain}`))) {
     return { slug: host === domain ? "" : host.slice(0, host.length - domain.length - 1), claimed: true };
