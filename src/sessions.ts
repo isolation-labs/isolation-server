@@ -299,10 +299,24 @@ export async function finishSession(id: string): Promise<void> {
   persist();
 }
 
-// Register a bastion route for every ssh-shaped view of a sandbox (terminal → its live tmux
-// session, code/directory → a transparent shell for VS Code Remote and scp). Idempotent: a route
-// id is minted once and persisted on the view, so re-running this re-asserts rather than churns,
-// and a saved `ssh <id>@host` keeps working across restarts of anything.
+/**
+ * The end-user public keys the bastion will accept for a session — the SAME wire-input treatment
+ * the in-sandbox authorized_keys file gets, for the same reason: this list is an authentication
+ * allow-list, and a "key" carrying a newline would smuggle extra entries into whatever the bastion
+ * writes it into. The bastion is SHARED across every server on the cloud, so a bad entry there is
+ * not even our own tenant's problem — never send one.
+ *
+ * Empty means nobody at all can open the route, so a caller must not hand out an `ssh` command:
+ * the only answer it could ever get is "permission denied".
+ */
+export function sshKeysFor(sessionId: string): string[] {
+  return authorizedKeysFile(sessions[sessionId]?.authorizedKeys).split("\n").filter(Boolean);
+}
+
+// Register a bastion route for every ssh-shaped view of a sandbox — terminal views only, which
+// attach their live tmux session (see `modeForView`). Idempotent: a route id is minted once and
+// persisted on the view, so re-running this re-asserts rather than churns, and a saved
+// `ssh <id>@host` keeps working across restarts of anything.
 // The tmux session a terminal view runs in — the bastion `attach`es exactly this, so an ssh user
 // and the browser terminal share one live screen rather than getting two separate shells.
 function tmuxTargetFor(v: View): string {
@@ -311,11 +325,7 @@ function tmuxTargetFor(v: View): string {
 
 export function syncRoutes(sessionId: string, sandboxId: string): void {
   if (!bastion.enabled()) return;
-  // The SAME wire-input treatment the in-sandbox authorized_keys file gets, for the same reason:
-  // this list is an authentication allow-list, and a "key" carrying a newline would smuggle extra
-  // entries into whatever the bastion writes it into. The bastion is SHARED across every server on
-  // the cloud, so a bad entry there is not even our own tenant's problem — never send one.
-  const keys = authorizedKeysFile(sessions[sessionId]?.authorizedKeys).split("\n").filter(Boolean);
+  const keys = sshKeysFor(sessionId);
   for (const v of viewsForSandbox(sandboxId)) {
     const mode = modeForView(v.type);
     if (!mode) continue;

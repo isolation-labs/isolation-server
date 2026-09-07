@@ -25,6 +25,7 @@ import { pauseSession, resumeSession,
   sessionChanges,
   sessionJson,
   sessionViews,
+  sshKeysFor,
   syncRoutes,
   startSession,
   viewJson,
@@ -603,10 +604,20 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!s2 || !v || v.sandboxId !== s2.sandboxId) return json(res, 404, { error: "unknown view" });
     if (!modeForView(v.type)) return json(res, 400, { error: `${v.type} views cannot be opened externally` });
     if (!bastion.enabled()) return json(res, 503, { error: "this server has no ssh bastion configured" });
+    // A route the bastion holds with an EMPTY allow-list is one nobody can open — and that is the
+    // normal state for a member with no ssh public key, because sshd still comes up for the
+    // bastion's own agent key. Same rule as the dark-bastion case below: never hand out a command
+    // whose only possible answer is "permission denied". Not temporary, so not a 503.
+    if (!sshKeysFor(id).length) return json(res, 409, { error: "no ssh public key is authorized for this session — add one to your account and start the session again" });
     // Mint the route id now if the view predates the bastion, and make sure it is actually
     // registered — the answer must not be a command that nothing at the edge would recognize.
     const routeId = ensureRouteId(vid);
     if (!routeId || !s2.sandboxId) return json(res, 503, { error: "ssh is not available for this session" });
+    // The bastion's route table is SOFT state that lives only as long as the connection, and
+    // `registerRoute` while it is down is a silent no-op that gets replayed on reconnect. Handing
+    // out a command in that window would be a lie the user only discovers as "permission denied",
+    // so a dark bastion is a 503 here — the reconnect loop makes this answerable again on its own.
+    if (!bastion.isLive()) return json(res, 503, { error: "the ssh bastion is not reachable right now" });
     syncRoutes(id, s2.sandboxId);
     const out = nativeConnectFor(routeId, id, vid);
     return out ? json(res, 200, out) : json(res, 503, { error: "the ssh bastion is not reachable right now" });
