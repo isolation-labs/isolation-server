@@ -75,6 +75,36 @@ const authorized = (req: IncomingMessage, viewId: string): { ok: boolean; queryT
   return { ok, queryToken: u.searchParams.get("token") ?? undefined };
 };
 
+// Our own credentials must NEVER be handed to a sandbox: the app behind a view — a dev server, a
+// cloned repo's code, whatever the agent wrote — is not trusted with the token that drives this
+// server's whole control plane. It does not normally ride this far, but the cloud's control proxy
+// adds `Authorization: Bearer <master token>` to every /api/servers/<id>/p/* call while forwarding
+// the caller's other headers verbatim — and `x-forwarded-host` is one of those, so a caller can
+// steer such a request onto the public plane. Strip OURS only: a view app's own Bearer or cookie
+// auth is its business and passes through untouched.
+export function stripOurCredentials(req: IncomingMessage): void {
+  const auth = req.headers.authorization;
+  if (auth?.startsWith("Bearer ") && tokenMatches(auth.slice(7))) delete req.headers.authorization;
+  const cookie = req.headers.cookie;
+  if (!cookie) return;
+  const parts = cookie.split(";");
+  const kept = parts.filter((c) => {
+    const [k, ...rest] = c.trim().split("=");
+    if (k !== "isolation-server_token") return true;
+    const raw = rest.join("=");
+    let v = raw;
+    try {
+      v = decodeURIComponent(raw);
+    } catch {
+      /* malformed escape — judge the raw form, which is what we would have compared anyway */
+    }
+    return !tokenMatches(v);
+  });
+  if (kept.length === parts.length) return;
+  if (kept.length) req.headers.cookie = kept.join(";");
+  else delete req.headers.cookie;
+}
+
 // Endpoint cache: the published host port is stable for a running sandbox; drop the
 // entry on proxy failure or sandbox lifecycle changes so a resume re-resolves.
 const targets = new Map<string, { host: string; basePath: string }>();
@@ -126,6 +156,7 @@ export async function handleViewRequest(req: IncomingMessage, res: ServerRespons
   try {
     const t = await resolveTarget(view.sandboxId, view.port);
     req.url = `${t.basePath}${viewPath(view, req.url, viewId)}`;
+    stripOurCredentials(req);
     proxy.web(req, res, { target: `http://${t.host}` });
   } catch (e) {
     targets.delete(`${view.sandboxId}:${view.port}`);
@@ -164,6 +195,7 @@ export async function handleViewUpgrade(req: IncomingMessage, socket: Duplex, he
     }
     const t = await resolveTarget(view.sandboxId, view.port);
     req.url = `${t.basePath}${viewPath(view, req.url, viewId)}`;
+    stripOurCredentials(req);
     proxy.ws(req, socket, head, { target: `http://${t.host}` });
   } catch {
     targets.delete(`${view.sandboxId}:${view.port}`);
@@ -181,23 +213,11 @@ export async function handleViewUpgrade(req: IncomingMessage, socket: Duplex, he
 
 const hostOnly = (h: string | undefined): string => (h ?? "").split(":")[0].trim().toLowerCase();
 
-// The hostname this request was addressed to, as the BROWSER wrote it.
-//
-// When the cloud's Worker proxies a public web preview to us over the private tunnel it cannot
-// forward the real Host: `Host` is a forbidden header for fetch() in a Worker, so a `headers.set`
-// is silently dropped and we would see the tunnel's own address (127.x.y.z:8090) instead of
-// `<slug>.<domain>`. The Worker sends `x-forwarded-host` for exactly this, so prefer it.
-//
-// It is not a new trust surface: this plane is unauthenticated BY DESIGN — the ≥128-bit slug is the
-// whole secret — and anything that can reach this port could already set Host directly.
-const requestHost = (req: IncomingMessage): string => hostOnly((req.headers["x-forwarded-host"] as string | undefined) ?? req.headers.host);
-
-// The slug when this request's Host belongs to the public plane; undefined otherwise.
+// The public-plane claim for ONE hostname, or undefined when that host is not ours.
 // A configured sandbox domain claims ALL its subdomains (unknown slug → 404, never the
 // API). `.localhost` claims only labels that match a live web view, so plain
 // `localhost` keeps serving the control plane.
-function publicSlug(req: IncomingMessage): { slug: string; claimed: boolean } | undefined {
-  const host = requestHost(req);
+function claimFor(host: string): { slug: string; claimed: boolean } | undefined {
   const domain = getSandbox()?.domain;
   if (domain && (host === domain || host.endsWith(`.${domain}`))) {
     return { slug: host === domain ? "" : host.slice(0, host.length - domain.length - 1), claimed: true };
@@ -207,6 +227,35 @@ function publicSlug(req: IncomingMessage): { slug: string; claimed: boolean } | 
     if (slug && viewBySlug(slug)) return { slug, claimed: true };
   }
   return undefined;
+}
+
+// The hostname a proxied request was addressed to, as the BROWSER wrote it.
+//
+// When the cloud's Worker proxies a public web preview to us over the private tunnel it cannot
+// rely on forwarding the real Host: `Host` is a forbidden header for fetch(), so a `headers.set`
+// can be silently dropped and we would see the tunnel's own address (127.x.y.z:8090) instead of
+// `<slug>.<domain>`. The Worker sends `x-forwarded-host` for exactly this. It is a LIST header and
+// arrives as a comma-joined string (or repeated); the first entry is the original client's.
+const forwardedHost = (req: IncomingMessage): string => {
+  const raw = req.headers["x-forwarded-host"];
+  return hostOnly((Array.isArray(raw) ? raw[0] : raw)?.split(",")[0]);
+};
+
+// The slug when this request belongs to the public plane; undefined otherwise.
+function publicSlug(req: IncomingMessage): { slug: string; claimed: boolean } | undefined {
+  // The real Host wins whenever it is ours. It is the one name a browser cannot forge, so a
+  // request actually addressed to `<slug>.<domain>` stays claimed WHOLE — the token-gated API and
+  // /v/ are never reachable there — no matter what a page inside the sandbox puts on a
+  // same-origin fetch (`x-forwarded-host` is NOT a forbidden header, so sandbox JS can set it).
+  const direct = claimFor(hostOnly(req.headers.host));
+  if (direct) return direct;
+  // A forwarded host, by contrast, claims ONLY a label that names a live web view. The cloud dials
+  // the VIEW plane by this server's private address on purpose (preview.ts serveView: the public
+  // plane would otherwise 404 it) while still forwarding the browser's `v--<serverId>.<domain>`
+  // — so a label that is not a preview slug MUST fall through to `/v/` and its per-view token
+  // gate rather than being answered with "unknown app".
+  const fwd = claimFor(forwardedHost(req));
+  return fwd?.slug && viewBySlug(fwd.slug) ? fwd : undefined;
 }
 
 // Self-refreshing "app is starting" page: the iframe loads the instant the session is
@@ -277,6 +326,7 @@ export async function handlePublicWebRequest(req: IncomingMessage, res: ServerRe
   try {
     const t = await resolveTarget(view.sandboxId, view.port);
     req.url = `${t.basePath}${req.url ?? "/"}`;
+    stripOurCredentials(req);
     res.once("finish", () => {
       if (res.statusCode === 503) healForwarder(view);
     });
@@ -300,6 +350,7 @@ export async function handlePublicWebUpgrade(req: IncomingMessage, socket: Duple
   try {
     const t = await resolveTarget(view.sandboxId, view.port);
     req.url = `${t.basePath}${req.url ?? "/"}`;
+    stripOurCredentials(req);
     publicProxy.ws(req, socket, head, { target: `http://${t.host}` });
   } catch {
     targets.delete(`${view.sandboxId}:${view.port}`);

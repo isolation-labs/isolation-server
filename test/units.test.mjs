@@ -406,3 +406,68 @@ test("a web view's URL follows the sandbox domain: https://<slug>.<domain>/ once
   assert.match(sessionsMod.viewJson(v, "s-x").target.url, /^http:\/\/c{26}\.localhost:\d+\/$/, "no domain → the .localhost fallback");
   views.dropViewsForSandbox("sb-url");
 });
+
+// The public web plane routes by hostname, and the cloud reaches this server two different ways:
+// previews arrive with the browser's `<slug>.<domain>` in x-forwarded-host, while the VIEW plane
+// is dialled at the server's private address with `v--<serverId>.<domain>` forwarded (preview.ts
+// serveView). Honouring x-forwarded-host unconditionally made the public plane swallow every view
+// request as "unknown app" — and let sandbox JS shed the plane on a same-origin fetch, since
+// x-forwarded-host is not a forbidden header while Host is.
+test("public plane: the real Host claims whole; a forwarded host claims only a live web view slug", async () => {
+  const doorman = await import("../dist/doorman.js");
+  const cfg = await import("../dist/config.js");
+  const slug = "d".repeat(26);
+  const v = views.addView("sb-plane", "web", 7004, { slug, appPort: 5173 });
+  cfg.saveSandbox({ domain: "isolation.cc" });
+
+  const call = async (headers) => {
+    const res = { statusCode: 0, body: "", headersSent: false };
+    res.writeHead = (s) => ((res.statusCode = s), (res.headersSent = true), res);
+    res.end = (b) => ((res.body = b ?? ""), res);
+    res.setHeader = () => res;
+    res.once = () => res;
+    const claimed = await doorman.handlePublicWebRequest({ url: "/v/v-abc/", method: "GET", headers }, res);
+    return { claimed, res };
+  };
+
+  // The view plane: private Host, `v--<id>` forwarded. Must FALL THROUGH to /v/ and its token gate.
+  let r = await call({ host: "127.0.0.2:8090", "x-forwarded-host": "v--srv-1.isolation.cc" });
+  assert.equal(r.claimed, false, "a forwarded non-slug label must not be claimed by the public plane");
+
+  // An unknown label on the REAL Host is still claimed whole — never falls through to the API.
+  r = await call({ host: "nosuchslug.isolation.cc" });
+  assert.equal(r.claimed, true);
+  assert.equal(r.res.statusCode, 404);
+
+  // ...and a spoofed x-forwarded-host cannot shed that claim.
+  r = await call({ host: "nosuchslug.isolation.cc", "x-forwarded-host": "localhost" });
+  assert.equal(r.claimed, true, "sandbox-set x-forwarded-host must not escape the public plane");
+  assert.equal(r.res.statusCode, 404);
+
+  cfg.saveSandbox(undefined);
+  views.dropViewsForSandbox("sb-plane");
+  void v;
+});
+
+// The cloud's control proxy adds `Authorization: Bearer <master token>` to /api/servers/<id>/p/*
+// and forwards the caller's other headers verbatim — `x-forwarded-host` included. A caller could
+// therefore steer a master-token request onto the public plane, which proxies straight into the
+// sandbox's own app. The token that drives this server's control plane must never land there.
+test("the doorman strips OUR master token before handing a request to a sandbox", async () => {
+  const doorman = await import("../dist/doorman.js");
+  const cfgMod2 = await import("../dist/config.js");
+  const token = cfgMod2.getToken();
+  const strip = (headers) => (doorman.stripOurCredentials({ headers }), headers);
+
+  assert.equal(strip({ authorization: `Bearer ${token}` }).authorization, undefined);
+  assert.equal(strip({ cookie: `isolation-server_token=${token}` }).cookie, undefined);
+  assert.equal(
+    strip({ cookie: `a=1; isolation-server_token=${token}; b=2` }).cookie.replace(/\s+/g, ""),
+    "a=1;b=2",
+    "only our cookie goes; the app's own cookies ride through",
+  );
+  // A view app's own credentials are its business — never touched.
+  assert.equal(strip({ authorization: "Bearer someone-elses" }).authorization, "Bearer someone-elses");
+  assert.equal(strip({ cookie: "isolation-server_token=a-view-token" }).cookie, "isolation-server_token=a-view-token");
+  assert.equal(strip({ cookie: "%%%=1" }).cookie, "%%%=1", "a malformed escape is judged, not thrown on");
+});
