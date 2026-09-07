@@ -5,9 +5,9 @@
 // View tokens (ported contract from the isolation daemon): HMAC-signed with the
 // master token, so the browser never carries full authority. Format <body>.<mac>,
 // body = base64url(JSON {v: viewId, exp: unixSeconds}).
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
-import { VIEWS_FILE, ensureDataDir, getToken } from "./config.js";
+import { VIEWS_FILE, ensureDataDir, getPairing, getToken } from "./config.js";
 
 export type ViewType = "terminal" | "code" | "web" | "directory" | "agent";
 
@@ -34,6 +34,7 @@ export interface View {
   command?: string; // terminal: typed into the view's tmux session once, at creation
   style?: TerminalStyle; // terminal: the appearance ttyd was started with (restyle restarts ttyd)
   slug?: string; // web: the PUBLIC hostname label (unguessable, ≥128-bit) — the view's address on the sandbox plane
+  sshRouteId?: string; // the SSH username an end-user types: `ssh <sshRouteId>@<bastion>`. Stable across restarts.
 }
 
 let views: Record<string, View> = {};
@@ -86,6 +87,46 @@ export const newWebSlug = (): string => {
   return [...randomBytes(26)].map((b) => alphabet[b % 32]).join("");
 };
 export const viewsForSandbox = (sandboxId: string): View[] => Object.values(views).filter((v) => v.sandboxId === sandboxId);
+
+// The view's route id, minted once and PERSISTED: a user's saved `ssh <id>@host` has to keep
+// working across restarts of this server and of the bastion, so it can never be regenerated.
+//
+// Namespaced by a stable hash of our pairing connectionId, because the bastion is SHARED across
+// every server on the cloud: two servers minting the same id would collide there. The namespace
+// makes that impossible rather than improbable. Unpaired (self-host) → all-random, nothing to
+// collide with. This is a ROUTING key, not a secret — the edge still verifies the user's key.
+export function ensureRouteId(id: string): string | undefined {
+  const v = views[id];
+  if (!v) return undefined;
+  if (!v.sshRouteId) {
+    v.sshRouteId = `${connNamespace()}${randBase36(v.type === "web" ? 25 : 4)}`;
+    persist();
+  }
+  return v.sshRouteId;
+}
+
+export const viewByRouteId = (routeId: string): View | undefined => Object.values(views).find((v) => v.sshRouteId === routeId);
+
+const B36 = "0123456789abcdefghijklmnopqrstuvwxyz";
+// Uniform base36 by rejection sampling: `byte % 36` would bias toward 0-3 (256 = 7*36 + 4) and
+// shave entropy off an id that is also used as a public label.
+function randBase36(n: number): string {
+  let out = "";
+  while (out.length < n) {
+    for (const b of randomBytes(n - out.length + 8)) {
+      if (b >= 252) continue;
+      out += B36[b % 36];
+      if (out.length === n) break;
+    }
+  }
+  return out;
+}
+// A stable 6-char namespace derived from our connectionId (empty when unpaired).
+function connNamespace(): string {
+  const id = getPairing()?.connectionId;
+  if (!id) return "";
+  return BigInt(`0x${createHash("sha256").update(id).digest("hex")}`).toString(36).padStart(6, "0").slice(0, 6);
+}
 
 export function dropViewsForSandbox(sandboxId: string): void {
   for (const v of viewsForSandbox(sandboxId)) delete views[v.id];

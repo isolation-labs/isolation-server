@@ -76,6 +76,12 @@ export function ensureServerConfig(serverBin: string, log: (m: string) => void):
     writeFileSync(SANDBOX_TOML, toml, { mode: 0o600 });
     log(`egress sidecar configured (${EGRESS_IMAGE}, dns+nft) — the Credential Vault needs it`);
   }
+  const { toml: withSsh, changed: sshChanged } = ensureSshCapability(toml);
+  if (sshChanged) {
+    toml = withSsh;
+    writeFileSync(SANDBOX_TOML, toml, { mode: 0o600 });
+    log("AUDIT_WRITE un-dropped (Docker grants it by default) — sshd cannot open a pty without it, so `ssh` into a session needs it");
+  }
   const port = Number(/^\s*port\s*=\s*(\d+)/m.exec(toml)?.[1] ?? 8080);
   saveOsb({ url: `http://127.0.0.1:${port}`, apiKey });
   return { apiKey, port };
@@ -110,6 +116,33 @@ export function ensureEgressConfig(toml: string): { toml: string; changed: boole
   }
   if (!changed) return { toml, changed };
   return { toml: toml.slice(0, section.index) + `[egress]` + body + toml.slice(section.index + section[0].length), changed };
+}
+
+// AUDIT_WRITE has to stay OFF the drop list, or interactive ssh into a sandbox is impossible.
+//
+// OpenSSH writes a login record when — and only when — it allocates a PTY, and on Linux that record
+// includes a kernel audit entry. Without CAP_AUDIT_WRITE the write returns EPERM and sshd treats it
+// as fatal, so `ssh host` (and anything else wanting a terminal: tmux attach, VS Code Remote's
+// shell) dies the instant it authenticates, while pty-less uses — `ssh host cmd`, scp, `ssh -L` —
+// keep working. That asymmetry is exactly what makes the failure so confusing, and the sshd log is
+// the only place it is visible: "linux_audit_write_entry failed: Operation not permitted".
+//
+// Granting it back is not a widening of the sandbox: AUDIT_WRITE is in DOCKER'S OWN DEFAULT
+// capability set (it is there so that sshd and login work at all). It permits writing records to
+// the kernel audit log — not reading them, and nothing about escaping the container. The runtime's
+// example config drops it along with genuinely dangerous ones (SYS_ADMIN, SYS_MODULE, SYS_PTRACE);
+// this pulls back exactly one, and leaves every other drop in place.
+export function ensureSshCapability(toml: string): { toml: string; changed: boolean } {
+  const line = /^\s*drop_capabilities\s*=\s*\[([^\]]*)\]/m.exec(toml);
+  if (!line) return { toml, changed: false }; // nothing dropped at all — nothing to fix
+  const caps = line[1]
+    .split(",")
+    .map((c) => c.trim().replace(/^["']|["']$/g, ""))
+    .filter(Boolean);
+  if (!caps.includes("AUDIT_WRITE")) return { toml, changed: false };
+  const kept = caps.filter((c) => c !== "AUDIT_WRITE");
+  const replacement = `drop_capabilities = [${kept.map((c) => `"${c}"`).join(", ")}]`;
+  return { toml: toml.slice(0, line.index) + line[0].replace(/^\s*drop_capabilities\s*=\s*\[[^\]]*\]/m, replacement) + toml.slice(line.index + line[0].length), changed: true };
 }
 
 // Pre-pull the sidecar image so the first vault launch doesn't stall on a download.

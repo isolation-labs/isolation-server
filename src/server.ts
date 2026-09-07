@@ -4,7 +4,7 @@
 // is small enough that a framework would outweigh it.
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { GATE_VERSION } from "./version.js";
-import { HOST, PORT, getName, getPairing, getToken, isLoopbackOrigin, originAllowed, savePairing, tokenMatches, getMachineId } from "./config.js";
+import { HOST, PORT, getName, getPairing, getToken, isLoopbackOrigin, originAllowed, saveBastion, savePairing, tokenMatches, getMachineId } from "./config.js";
 import { beatOffline, detach, pairingStatus, startHeartbeat } from "./heartbeat.js";
 import { deleteSandbox, getSandbox, listSandboxes, osbHealthy, pauseSandbox, resumeSandbox, sandboxLogs } from "./opensandbox.js";
 import { handlePublicWebRequest, handlePublicWebUpgrade, handleViewRequest, handleViewUpgrade, invalidateEndpoints } from "./doorman.js";
@@ -25,11 +25,13 @@ import { pauseSession, resumeSession,
   sessionChanges,
   sessionJson,
   sessionViews,
+  syncRoutes,
   startSession,
   viewJson,
   type DaemonLaunchBody,
 } from "./sessions.js";
 import { sandboxTunnelManager, tunnelManager } from "./tunnel.js";
+import { bastion } from "./bastion.js";
 
 const VERSION = GATE_VERSION;
 const log = (...a: unknown[]) => console.log("[isolation-server]", ...a);
@@ -46,6 +48,38 @@ async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> 
     return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
   } catch {
     return {};
+  }
+}
+
+// Ask the cloud for the SSH bastion coords (POST /api/pair/bastion, authed by the per-connection
+// pairing secret) and store them, then dial. The credential it returns is per-connection —
+// HMAC(the cloud's signing key, our connectionId) — so it can only ever register OUR routes.
+async function fetchBastionConfig(backendUrl: string, connectionId: string, secret: string): Promise<void> {
+  try {
+    const r = await fetch(`${backendUrl}/api/pair/bastion`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ connectionId, secret }),
+    });
+    const body = (await r.json().catch(() => ({}))) as { bastion?: Record<string, unknown> | null };
+    const b = body.bastion;
+    if (!r.ok || !b || typeof b.controlHost !== "string" || typeof b.registerSecret !== "string") {
+      saveBastion(undefined);
+      return;
+    }
+    saveBastion({
+      controlHost: b.controlHost,
+      controlPort: Number(b.controlPort ?? 2200),
+      publicHost: typeof b.publicHost === "string" ? b.publicHost : b.controlHost,
+      edgePort: Number(b.edgePort ?? 22),
+      daemonLabel: typeof b.daemonLabel === "string" ? b.daemonLabel : connectionId,
+      ...(typeof b.smbHost === "string" ? { smbHost: b.smbHost } : {}),
+      registerSecret: b.registerSecret,
+    });
+    bastion.startIfConfigured();
+    log(`ssh bastion configured — users reach sessions at ${bastion.publicHost()}`);
+  } catch (e) {
+    log(`bastion config fetch failed (staying local-only): ${(e as Error)?.message ?? e}`);
   }
 }
 
@@ -83,6 +117,9 @@ export async function startConfigured(): Promise<void> {
   if (getSandboxConfig() && !sandboxTunnelManager.status().connected) {
     await sandboxTunnelManager.start().catch((e: Error) => log(`sandbox tunnel bring-up failed: ${e.message}`));
   }
+  // The SSH bastion: an outbound control connection that publishes `ssh <routeId>@<host>` for every
+  // ssh-shaped view. A server with no bastion config just stays on the local forwarder.
+  bastion.startIfConfigured();
 }
 
 // The cloud injects the public-web (sandbox) tunnel — at provision on a Cloud VM, or
@@ -158,6 +195,12 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       tunnel: t,
       sandbox: sandboxTunnelManager.status(),
       pairing: pairingStatus(),
+      // The ssh plane: whether the bastion is configured, whether its control connection is up
+      // right now, and the host users type. Routes are soft state — the count is what the bastion
+      // currently knows about, not a stored total.
+      bastion: bastion.enabled()
+        ? { configured: true, connected: bastion.isLive(), host: bastion.publicHost(), edgePort: bastion.edgePort(), routes: bastion.routeCount() }
+        : { configured: false },
     });
   }
 
@@ -191,6 +234,10 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       if (claim.connectionId && claim.secret) {
         savePairing({ backendUrl, connectionId: claim.connectionId, secret: claim.secret });
         startHeartbeat();
+        // The SSH bastion's coords come from the cloud, never hardcoded — same rule as the relay
+        // endpoints. Best-effort: a backend with no bastion configured answers `{bastion:null}`,
+        // and this server simply stays local-forwarder-only.
+        await fetchBastionConfig(backendUrl, claim.connectionId, claim.secret);
       }
       return json(res, 200, { ok: true, label: claim.label ?? label, url: myUrl });
     } catch (e) {
@@ -262,6 +309,16 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     return json(res, 200, sessionJson(startSession(body as DaemonLaunchBody)));
   }
 
+  // Re-fetch the SSH bastion coords for an ALREADY-paired server. Pairing does this too, but a
+  // bastion configured (or moved) after a server was paired would otherwise stay unreachable until
+  // someone re-paired — and re-pairing is not a thing to ask for a config refresh.
+  if (method === "POST" && url === "/bastion") {
+    const p = getPairing();
+    if (!p) return json(res, 409, { error: "not paired — nothing to fetch bastion coords from" });
+    await fetchBastionConfig(p.backendUrl, p.connectionId, p.secret);
+    return json(res, 200, { ok: true, bastion: bastion.enabled() ? { host: bastion.publicHost(), connected: bastion.isLive() } : null });
+  }
+
   // Configure the public-web tunnel out of band (self-hosters / the cloud on pairing).
   if (method === "POST" && url === "/sandbox") {
     applyInjectedSandbox(await readBody(req));
@@ -321,6 +378,8 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       // DELETE means "drop the view" and only ever applies to the bare /views/<id> —
       // a sub-path (…/view-token, …/messages) must never fall through into it.
       if (method === "DELETE" && !action) {
+        const gone = getView(vid);
+        if (gone?.sshRouteId) bastion.unregisterRoute(gone.sshRouteId);
         const v = dropView(vid);
         // Best-effort: stop the view's in-sandbox server so the port frees up.
         if (v) {
@@ -422,6 +481,8 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
           agentId,
         });
         if (!v) return json(res, 400, { error: "view spec not satisfiable" });
+        // A view added to a live session is reachable over ssh from the moment it exists.
+        if (s.sandboxId) syncRoutes(id, s.sandboxId);
         return json(res, 200, viewJson(v, id));
       }
       if (method === "POST" && action === "save") {

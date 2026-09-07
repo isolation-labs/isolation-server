@@ -353,3 +353,17 @@ test("authorizedKeysFile keeps real keys, one per line, and drops everything els
   // One bad entry must not take the good ones with it.
   assert.equal(authorizedKeysFile(["junk", ed, `${rsa}\nmore`]), `${ed}\n`);
 });
+
+const { ensureSshCapability } = await import("../dist/runtime.js");
+
+test("ensureSshCapability pulls AUDIT_WRITE back, keeps every other drop", () => {
+  const before = `[docker]\ndrop_capabilities = ["AUDIT_WRITE", "MKNOD", "SYS_ADMIN"]\nother = 1\n`;
+  const { toml, changed } = ensureSshCapability(before);
+  assert.equal(changed, true);
+  assert.match(toml, /drop_capabilities = \["MKNOD", "SYS_ADMIN"\]/);
+  assert.doesNotMatch(toml, /AUDIT_WRITE/, "sshd's pty login record needs the capability back");
+  assert.match(toml, /other = 1/, "the rest of the file is untouched");
+  // Idempotent, and a config that never dropped it is left exactly alone.
+  assert.equal(ensureSshCapability(toml).changed, false);
+  assert.equal(ensureSshCapability(`[docker]\nfoo = 1\n`).changed, false);
+});

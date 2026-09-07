@@ -56,6 +56,21 @@ export interface SandboxConfig {
   domain: string; // e.g. "<id>-web.run.isolation.cloud"
 }
 
+// The SSH bastion's coords, fetched from the cloud during `connect` (POST /api/pair/bastion) and
+// written here. It is what turns `ssh -p <port> root@<host>` into `ssh <routeId>@<publicHost>`: a
+// public edge that routes by SSH username, reached over an outbound control connection this server
+// parks — so no host IP and no port is ever handed to a user. Absent = no bastion; ssh then works
+// only through the local per-session forwarder (sshfwd.ts).
+export interface BastionConfig {
+  controlHost: string;
+  controlPort: number;
+  publicHost: string; // what users type: ssh <routeId>@<publicHost>
+  edgePort: number;
+  daemonLabel: string; // the control-plane username — our connectionId, so the edge can recompute our token
+  smbHost?: string;
+  registerSecret: string; // per-connection token: HMAC(cloud signing key, daemonLabel)
+}
+
 export interface OsbConfig {
   url: string; // the local opensandbox-server, loopback
   apiKey: string;
@@ -69,6 +84,7 @@ interface Config {
   enrollment?: Enrollment;
   osb?: OsbConfig;
   sandbox?: SandboxConfig;
+  bastion?: BastionConfig;
 }
 
 let cfg: Config = {};
@@ -144,6 +160,12 @@ export function saveSandbox(sb: SandboxConfig | undefined): void {
 
 export function saveOsb(o: OsbConfig): void {
   cfg.osb = o;
+  persist();
+}
+
+export const getBastion = (): BastionConfig | undefined => cfg.bastion;
+export function saveBastion(b: BastionConfig | undefined): void {
+  cfg.bastion = b;
   persist();
 }
 

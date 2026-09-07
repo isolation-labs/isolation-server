@@ -474,6 +474,9 @@ export const SSH_BRIDGE_PORT = 44773;
 const SSH_BRIDGE_PATH = "/tmp/.iso-ws-bridge.mjs";
 const SSH_BRIDGE_PID = "/tmp/.iso-ws-bridge.pid";
 const SSHD_PID = "/tmp/.iso-sshd.pid";
+// The bastion's agent key, home-relative because sshd resolves AuthorizedKeysFile against the
+// sandbox user's home — whoever that user turns out to be.
+const BASTION_KEYS_FILE = ".ssh/iso_bastion_keys";
 // Shipped verbatim into every sandbox, like the ACP bridge (build copies sandbox/ to dist/sandbox).
 const SSH_BRIDGE_SRC = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "sandbox", "iso-ws-bridge.mjs"), "utf8");
 
@@ -498,6 +501,9 @@ export async function startSshAccess(sandboxId: string, onPhase?: (p: string) =>
       "PubkeyAuthentication yes",
       "UsePAM no", // no PAM in a slim image; without this sshd refuses every login
       `PidFile ${SSHD_PID}`,
+      // TWO key files, so the bastion's agent key can be rewritten on every rotation without
+      // touching (or needing to remember) the member's own keys, and vice versa.
+      `AuthorizedKeysFile .ssh/authorized_keys ${BASTION_KEYS_FILE}`,
       "AcceptEnv LANG LC_*",
       "X11Forwarding no",
       "PrintMotd no",
@@ -565,6 +571,23 @@ export async function installAuthorizedKeys(sandboxId: string, keys: unknown, on
   }
 }
 
+// The bastion's per-connection agent public key. It goes in its OWN file (see BASTION_KEYS_FILE):
+// the key rotates on every bastion reconnect, and rewriting one file must never risk the member's
+// keys. Best-effort like every other ssh step — a session comes up regardless.
+export async function installBastionKey(sandboxId: string, publicKey: string): Promise<void> {
+  // Only the algorithm and the key body: a comment field arrives from the bastion and would
+  // otherwise ride into a file sshd parses line by line.
+  const parts = String(publicKey ?? "").trim().split(/\s+/);
+  if (parts.length < 2 || !/^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521))$/.test(parts[0])) return;
+  try {
+    await run(sandboxId, `mkdir -p ~/.ssh && chmod 700 ~/.ssh`);
+    await writeFile(sandboxId, "/tmp/.iso-bastion-key", `${parts[0]} ${parts[1]} iso-bastion\n`, 0o600);
+    await run(sandboxId, `cat /tmp/.iso-bastion-key > ~/${BASTION_KEYS_FILE} && chmod 600 ~/${BASTION_KEYS_FILE} && rm -f /tmp/.iso-bastion-key`);
+  } catch {
+    /* the bastion route degrades to unreachable; the session is fine */
+  }
+}
+
 export interface LaunchRequest {
   name?: string;
   image?: string;
@@ -581,6 +604,9 @@ export interface LaunchRequest {
   // into the sandbox as itself: it is a public key, so there is nothing to protect, and it only
   // has meaning inside — every other kind is fronted by the gateway.
   authorizedKeys?: string[];
+  // The bastion's agent public key, when this server is registered with one. Not a member's key:
+  // it is what lets the bastion jump inward after IT has verified the member at the edge.
+  bastionKey?: string;
   env?: Record<string, string>;
   metadata?: Record<string, string>;
   // Live progress callback — the session layer mirrors it into the record the web polls.
@@ -763,8 +789,10 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
     // direct sshd where one is running). One key per line, exactly what sshd expects; 0600 on the
     // file and 0700 on the directory, which sshd REFUSES to read if they are looser.
     await installAuthorizedKeys(sandbox.id, body.authorizedKeys, body.onPhase);
-    // sshd only earns its place once a key can actually open it.
-    sshUp = authorizedKeysFile(body.authorizedKeys) ? await startSshAccess(sandbox.id, body.onPhase) : false;
+    // The bastion's agent key is the OTHER way in (bastion.ts): the end user's key is verified at
+    // the edge, and this is what the container itself trusts. Either source justifies sshd.
+    if (body.bastionKey) await installBastionKey(sandbox.id, body.bastionKey);
+    sshUp = authorizedKeysFile(body.authorizedKeys) || body.bastionKey ? await startSshAccess(sandbox.id, body.onPhase) : false;
     // devcontainer lifecycle hooks (repository configs): postCreate runs once per fresh
     // sandbox, postStart every boot — inside the sandbox, in the owning repo's dir.
     const hooks = spec?.source === "repository" ? spec.devContainer.raw : undefined;

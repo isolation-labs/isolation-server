@@ -22,6 +22,7 @@
 // so `ssh -p <port> root@<server>` works from anywhere; a connected server behind NAT needs the
 // bastion in front, which is the same splice reached through a reverse tunnel.
 import { createServer, type Server, type Socket } from "node:net";
+import type { Duplex } from "node:stream";
 import { endpointWithHeaders } from "./opensandbox.js";
 import { SSH_BRIDGE_PORT } from "./launch.js";
 import { encodeFrame, FrameDecoder, wsConnect, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG } from "./wsframe.js";
@@ -120,14 +121,30 @@ export function closeSsh(sessionId: string): void {
 // payloads back into the socket. Either half ending ends the other; errors are expected (a client
 // hanging up mid-handshake is routine) and must never reach the process. Exported so the tests can
 // drive the real splice against the real bridge, with no sandbox in the way.
-export function spliceOverWs(client: Socket, ws: Socket, head: Buffer): void {
+//
+// `client` is a Duplex, not a Socket, because it is not always a TCP connection: the bastion
+// (bastion.ts) hands us an ssh2 channel off its reverse tunnel and it splices exactly the same way.
+// Shut one half down. An ssh2 channel (the bastion's) MUST be close()d: destroy() skips the
+// protocol's channel-close, and the peer answers a channel that vanished mid-stream by resetting
+// the whole connection — which on the bastion is every route this server has, not just this
+// session. A TCP socket has no close(), so destroy() is the right verb there.
+function shut(s: Duplex & { close?: () => void }): void {
+  try {
+    if (typeof s.close === "function") s.close();
+    else s.destroy();
+  } catch {
+    /* already gone */
+  }
+}
+
+export function spliceOverWs(client: Duplex, ws: Socket, head: Buffer): void {
   // Either end can already be gone: the WebSocket handshake is a round trip to the runtime, and an
   // ssh client that hangs up (or a `closeSsh` during it) has then ALREADY emitted 'close' — the
   // listeners below would never fire, so the surviving half would live on forever with its ping
   // timer, holding a proxy connection into the sandbox. One hung-up client per leak adds up fast on
   // a server that binds its public interface.
   if (client.destroyed || ws.destroyed) {
-    client.destroy();
+    shut(client);
     ws.destroy();
     return;
   }
@@ -143,7 +160,7 @@ export function spliceOverWs(client: Socket, ws: Socket, head: Buffer): void {
     if (closed) return;
     closed = true;
     clearInterval(ping);
-    client.destroy();
+    shut(client);
     ws.destroy();
   };
   const onWs = (chunk: Buffer) => {

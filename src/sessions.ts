@@ -13,9 +13,10 @@ import { DATA, PORT, ensureDataDir, getSandbox } from "./config.js";
 import { launch, scaffoldView, type LaunchRequest, type ViewSpec } from "./launch.js";
 import { deleteSandbox } from "./opensandbox.js";
 import { closeSsh, openSsh } from "./sshfwd.js";
+import { bastion, modeForView, sshCommandFor, CONTAINER_SSH_PORT } from "./bastion.js";
 import { run } from "./execd.js";
 import { dropSink, sinkFor } from "./persistence.js";
-import { dropViewsForSandbox, viewsForSandbox, type View, type ViewType } from "./views.js";
+import { dropViewsForSandbox, ensureRouteId, viewsForSandbox, type View, type ViewType } from "./views.js";
 import { dropSessionAgents, parseAgentSecrets, parseRoster, registerRoster, setAgentCredentials, type AgentDef } from "./agents.js";
 import { installVault, parseVaultManifest, vaultPresent, type VaultSummary } from "./vault.js";
 import { forgetThreads } from "./threads.js";
@@ -46,6 +47,9 @@ export interface SessionRecord {
   // The port `ssh -p` reaches this session on, when ssh is open for it (a key was installed AND
   // sshd came up). Absent = no ssh; the web shows the command only when this is set.
   sshPort?: number;
+  // The member's PUBLIC keys, kept so a bastion route can be registered (or re-registered on a
+  // reconnect) long after the launch body is gone. Public keys — nothing here is a secret.
+  authorizedKeys?: string[];
 }
 
 let sessions: Record<string, SessionRecord> = {};
@@ -94,6 +98,21 @@ for (const rec of Object.values(sessions)) {
     })();
   }
 }
+
+// The bastion mints a FRESH agent keypair per control connection, so on every (re)connect the
+// sandboxes already running trust a key that is no longer the one it will dial with. Install the
+// new one wherever a session is live — otherwise every existing session goes ssh-dark after a
+// bastion redeploy, which is exactly the reconnect the soft-state design is meant to survive.
+bastion.onAgentKeyRotated((publicKey) => {
+  void (async () => {
+    const { installBastionKey } = await import("./launch.js");
+    for (const rec of Object.values(sessions)) {
+      if (!rec.sandboxId || rec.state !== "ready") continue;
+      await installBastionKey(rec.sandboxId, publicKey).catch(() => undefined);
+      syncRoutes(rec.id, rec.sandboxId);
+    }
+  })();
+});
 
 function persist(): void {
   ensureDataDir();
@@ -183,6 +202,7 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
     workspaceName: body.workspace?.name,
     viewsPending: viewSpecsFrom(body).length,
     roster: parseRoster(body.agents),
+    ...(Array.isArray(body.workspace?.authorizedKeys) ? { authorizedKeys: body.workspace.authorizedKeys.filter((k) => typeof k === "string") } : {}),
     ...(typeof body.agentSecrets === "string" ? { agentSecretsSealed: body.agentSecrets } : {}),
   };
   sessions[id] = rec;
@@ -194,6 +214,9 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
     persistence: body.persistence,
     repos: (body.workspace?.repos ?? []).map((r) => ({ url: r.url, name: r.dir, branch: r.branch })),
     authorizedKeys: body.workspace?.authorizedKeys,
+    // What the SANDBOX trusts when a user arrives through the bastion (bastion.ts): their own key
+    // was already checked at the edge, so this is the only key the container needs.
+    bastionKey: bastion.agentPublicKey(),
     views: viewSpecsFrom(body),
     envConfig: body.envConfig,
     repoTokens: body.repoTokens,
@@ -220,6 +243,9 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
       // ssh rides a per-session TCP forwarder (sshfwd.ts) — opened only when the launch actually
       // brought sshd up, so `sshPort` present means "this really answers".
       const sshPort = out.ssh ? await openSsh(id, out.sandbox.id).catch(() => null) : null;
+      // The bastion's routes: one per ssh-shaped view, so a user types `ssh <routeId>@<host>` and
+      // never learns an address. Registered only when the sandbox really has an sshd to reach.
+      if (out.ssh) syncRoutes(id, out.sandbox.id);
       // `finishSession` can land while the launch is still finishing: it already closed a
       // forwarder that did not exist yet, so the one just bound is ours to take back down.
       if (sshPort && !sessions[id]) closeSsh(id);
@@ -250,8 +276,10 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
 export async function finishSession(id: string): Promise<void> {
   const s = sessions[id];
   if (!s) return;
-  // Before the sandbox goes: the listener would otherwise stay open on a port pointing at nothing.
+  // Before the sandbox goes: the listener would otherwise stay open on a port pointing at nothing,
+  // and the bastion would keep advertising routes into a sandbox that no longer exists.
   closeSsh(id);
+  if (s.sandboxId) bastion.unregisterSandbox(s.sandboxId);
   if (s.sandboxId) {
     await deleteSandbox(s.sandboxId).catch(() => undefined);
     dropViewsForSandbox(s.sandboxId);
@@ -263,11 +291,47 @@ export async function finishSession(id: string): Promise<void> {
   persist();
 }
 
+// Register a bastion route for every ssh-shaped view of a sandbox (terminal → its live tmux
+// session, code/directory → a transparent shell for VS Code Remote and scp). Idempotent: a route
+// id is minted once and persisted on the view, so re-running this re-asserts rather than churns,
+// and a saved `ssh <id>@host` keeps working across restarts of anything.
+// The tmux session a terminal view runs in — the bastion `attach`es exactly this, so an ssh user
+// and the browser terminal share one live screen rather than getting two separate shells.
+function tmuxTargetFor(v: View): string {
+  return `iso-view-${v.id}`;
+}
+
+export function syncRoutes(sessionId: string, sandboxId: string): void {
+  if (!bastion.enabled()) return;
+  const keys = sessions[sessionId]?.authorizedKeys ?? [];
+  for (const v of viewsForSandbox(sandboxId)) {
+    const mode = modeForView(v.type);
+    if (!mode) continue;
+    const routeId = ensureRouteId(v.id);
+    if (!routeId) continue;
+    bastion.registerRoute({
+      routeId,
+      // The bastion echoes this back as the reverse channel's srcIP, and what we need there is the
+      // SANDBOX id — that is what resolves to an endpoint.
+      sessionId: sandboxId,
+      viewId: v.id,
+      viewType: v.type,
+      mode,
+      ...(mode === "tmux" ? { tmuxTarget: tmuxTargetFor(v) } : {}),
+      ...(v.dir ? { dir: v.dir } : {}),
+      ...(v.label ? { label: v.label } : {}),
+      keys,
+      containerSshPort: CONTAINER_SSH_PORT,
+    });
+  }
+}
+
 // DELETE /sandboxes/:id kills a sandbox without going through `finishSession`, so the session's
 // ssh forwarder has to be torn down here too — otherwise it stays bound (holding one of a 100-wide
 // range) and the record keeps advertising an `sshPort` that answers nothing, which is exactly what
 // the field's "present means this really answers" contract promises it never does.
 export function dropSshForSandbox(sandboxId: string): void {
+  bastion.unregisterSandbox(sandboxId);
   const s = sessionForSandbox(sandboxId);
   if (!s) return;
   closeSsh(s.id);
@@ -366,7 +430,16 @@ export function viewJson(v: View, sessionId: string): Record<string, unknown> {
     ...(v.label ? { label: v.label } : {}),
     ...(v.specKey ? { specKey: v.specKey } : {}),
     ...(v.style ? { style: v.style } : {}),
+    // How to reach this view over ssh, when there is a bastion and the view is ssh-shaped. A
+    // routeId, never an address: the whole point is that no host IP or port reaches a user.
+    ...sshJson(v),
   };
+}
+
+function sshJson(v: View): Record<string, unknown> {
+  if (!v.sshRouteId || !modeForView(v.type)) return {};
+  const command = sshCommandFor(v.sshRouteId);
+  return command ? { ssh: { routeId: v.sshRouteId, command } } : {};
 }
 
 // A web view's public address: its slug as a hostname — on the wildcard sandbox domain
