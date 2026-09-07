@@ -23,13 +23,17 @@ export interface BeatStatus {
 }
 
 let timer: ReturnType<typeof setTimeout> | undefined;
+// Which tick chain owns `timer`. stopHeartbeat() bumps it, so a beat that was already in flight
+// when the chain was restarted (beatNow, startHeartbeat) retires instead of scheduling a SECOND
+// chain — two chains would each keep re-arming, and every further beatNow would double them again.
+let chain = 0;
 let lastSent: string | undefined;
 let lastTunnel: string | undefined;
 let lastBeat: BeatStatus | undefined;
 let goingOffline = false;
 let rejectStreak = 0;
 
-// On a private tunnel (docs/vpc-plan.md) the server's address IS its loopback ip — the Worker dials
+// On a private tunnel the server's address IS its loopback ip — the Worker dials
 // it over the binding — and there is no public URL to report. Otherwise the relay's quick-tunnel URL.
 const currentUrl = (): string => {
   const v = getVpc();
@@ -37,13 +41,39 @@ const currentUrl = (): string => {
   return tunnelManager.publicUrl() ?? `http://localhost:${PORT}`;
 };
 
+// Beats are serialized: web views scaffold in a loop and each one fires beatNow(), so several
+// POSTs could otherwise be in flight at once — and since the cloud REPLACES its slug list per beat,
+// an older, shorter list landing last would un-route the newest previews. One beat at a time, with
+// at most one follow-up queued (the next beat re-reads the whole state anyway).
+let inFlight: Promise<void> | undefined;
+let queued = false;
+
+function beatSerial(): Promise<void> {
+  if (inFlight) {
+    queued = true;
+    return inFlight;
+  }
+  inFlight = (async () => {
+    try {
+      await beat();
+    } finally {
+      inFlight = undefined;
+      if (queued) {
+        queued = false;
+        await beatSerial();
+      }
+    }
+  })();
+  return inFlight;
+}
+
 async function beat(): Promise<void> {
   if (goingOffline) return;
   const p = getPairing();
   if (!p) return;
   const url = currentUrl();
   const body: Record<string, unknown> = { connectionId: p.connectionId, secret: p.secret, version: GATE_VERSION, machineId: getMachineId() };
-  // Public web previews (docs/vpc-plan.md): every live web view's slug, so the Worker can route
+  // Public web previews: every live web view's slug, so the Worker can route
   // https://<slug>.<domain>/ to this server. The cloud replaces its list per beat.
   body.webSlugs = allWebSlugs();
   // Report the URL only when changed — and never report the loopback fallback to a
@@ -108,8 +138,10 @@ export function detach(): void {
   saveSandbox(undefined);
   void sandboxTunnelManager.stop();
   // And the private tunnel: the cloud minted it, the cloud revoked us — it must not keep a way in.
+  // The listener on the private ip goes with it (dynamic import: server.ts imports this module).
   saveVpc(undefined);
   void privateTunnelManager.stop();
+  void import("./server.js").then((m) => m.syncVpcListener()).catch(() => undefined);
 }
 
 export function pairingStatus(): { paired: boolean; backendUrl?: string; lastBeat?: BeatStatus } {
@@ -119,10 +151,10 @@ export function pairingStatus(): { paired: boolean; backendUrl?: string; lastBea
 
 const nextDelay = (): number => (lastTunnel === "connected" ? INTERVAL_OK_MS : INTERVAL_WARMUP_MS);
 
-async function tick(): Promise<void> {
-  await beat();
-  if (goingOffline || !getPairing()) return;
-  timer = setTimeout(() => void tick(), nextDelay());
+async function tick(mine: number): Promise<void> {
+  await beatSerial();
+  if (goingOffline || !getPairing() || mine !== chain) return;
+  timer = setTimeout(() => void tick(mine), nextDelay());
 }
 
 export function startHeartbeat(): void {
@@ -133,18 +165,20 @@ export function startHeartbeat(): void {
   lastBeat = undefined;
   lastTunnel = undefined;
   // Give a just-created tunnel ~10s to serve before the first probe.
-  timer = setTimeout(() => void tick(), INTERVAL_WARMUP_MS);
+  const mine = chain;
+  timer = setTimeout(() => void tick(mine), INTERVAL_WARMUP_MS);
 }
 
 export function stopHeartbeat(): void {
   if (timer) clearTimeout(timer);
   timer = undefined;
+  chain++;
 }
 
 export function beatNow(): void {
   if (goingOffline || !getPairing()) return;
   stopHeartbeat();
-  void tick();
+  void tick(chain);
 }
 
 // Final "going offline" beat on graceful shutdown, so the dot flips immediately.

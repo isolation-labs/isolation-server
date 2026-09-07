@@ -53,7 +53,7 @@ export interface Enrollment {
 export interface SandboxConfig {
   provider?: "cloudflared";
   // The named tunnel's run token — LEGACY: a per-server public wildcard tunnel. Absent when the web
-  // plane rides the private tunnel (docs/vpc-plan.md); then `domain` alone is the whole config.
+  // plane rides the private tunnel; then `domain` alone is the whole config.
   creds?: string;
   domain: string; // e.g. "isolation.cc" — web views are https://<slug>.<domain>/
 }
@@ -78,7 +78,7 @@ export interface BastionConfig {
   hostKey?: string;
 }
 
-// The server's PRIVATE named tunnel + its Workers VPC address (docs/vpc-plan.md). The cloud mints
+// The server's PRIVATE named tunnel + its Workers VPC address. The cloud mints
 // both at pairing (or seeds them on a Cloud VM); the server runs `cloudflared tunnel run --token
 // <creds>` and binds on `ip` (a loopback address unique to this server account-wide) as well as
 // 127.0.0.1. The server has NO public URL: the Worker reaches it over the binding at `ip`.

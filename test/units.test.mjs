@@ -368,7 +368,7 @@ test("ensureSshCapability pulls AUDIT_WRITE back, keeps every other drop", () =>
   assert.equal(ensureSshCapability(`[docker]\nfoo = 1\n`).changed, false);
 });
 
-// --- the private tunnel (docs/vpc-plan.md) -------------------------------------------------------
+// --- the private tunnel -------------------------------------------------------
 const cfgMod = await import("../dist/config.js");
 
 test("vpc config round-trips and a domain-only sandbox config is legal", () => {

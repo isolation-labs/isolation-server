@@ -164,7 +164,7 @@ class SandboxTunnelManager {
   async start(): Promise<void> {
     await this.stop();
     const sb = getSandbox();
-    // Domain-only (docs/vpc-plan.md): the Worker delivers previews over the private tunnel; there is
+    // Domain-only: the Worker delivers previews over the private tunnel; there is
     // no per-server public wildcard to run. Only the legacy creds-bearing config spawns anything.
     if (!sb?.creds) return;
     if (sb.provider !== "cloudflared") throw new Error(`unsupported sandbox provider '${sb.provider}'`);
@@ -214,7 +214,7 @@ class SandboxTunnelManager {
 
 export const sandboxTunnelManager = new SandboxTunnelManager();
 
-// The PRIVATE tunnel (docs/vpc-plan.md): the cloud-minted named tunnel with no ingress and no DNS,
+// The PRIVATE tunnel: the cloud-minted named tunnel with no ingress and no DNS,
 // reachable only by the Worker's cf1:network binding at this server's unique loopback ip. Nothing to
 // scan for — there is no URL. QUIC is required by Workers VPC. Same restart/backoff as the relay.
 class PrivateTunnelManager {
@@ -222,6 +222,8 @@ class PrivateTunnelManager {
   private up = false;
   private stopping = false;
   private restarts = 0;
+  private starting: Promise<void> | undefined;
+  private retry: ReturnType<typeof setTimeout> | undefined;
   lastError: string | undefined;
 
   status(): { connected: boolean; ip?: string } {
@@ -229,16 +231,30 @@ class PrivateTunnelManager {
     return { connected: this.up && !!this.child, ...(v ? { ip: v.ip } : {}) };
   }
 
+  // Idempotent: an already-running tunnel is left alone (POST /vpc is a repair path and must not
+  // churn a healthy one), and concurrent bring-ups share one attempt. Both matter for the same
+  // reason: only ONE cloudflared may ever be tracked, and an UNtracked one survives stop() and
+  // detach() — a revoked private tunnel still connected to a live origin.
   async start(): Promise<void> {
     if (this.child) return;
+    if (this.starting) return this.starting;
     this.stopping = false;
-    const bin = await ensureCloudflared(log);
-    this.spawnWith(bin);
+    this.starting = (async () => {
+      try {
+        const bin = await ensureCloudflared(log);
+        this.spawnWith(bin);
+      } finally {
+        this.starting = undefined;
+      }
+    })();
+    return this.starting;
   }
 
+  // The only place a child is spawned. Never spawn over a live one, and never after a stop:
+  // the second process would be unreachable by stop() forever.
   private spawnWith(bin: string): void {
     const v = getVpc();
-    if (!v?.creds) return;
+    if (!v?.creds || this.stopping || this.child) return;
     const child = spawn(bin, ["tunnel", "--no-autoupdate", "--protocol", "quic", "run", "--token", v.creds], { stdio: ["ignore", "pipe", "pipe"] });
     this.child = child;
     const watch = (chunk: Buffer) => {
@@ -255,27 +271,46 @@ class PrivateTunnelManager {
       log(`private tunnel spawn failed: ${e.message}`);
     });
     child.on("exit", (code) => {
+      // Only the CURRENT child drives state. A late exit from one we already replaced (or already
+      // stopped) must not clear the live child — that would strand it, untracked and unkillable —
+      // nor open a second restart chain racing the first.
+      if (this.child !== child) return;
       this.child = undefined;
       this.up = false;
       if (this.stopping) return;
       const delay = RESTART_BACKOFF_MS[Math.min(this.restarts++, RESTART_BACKOFF_MS.length - 1)];
       log(`private tunnel exited (code ${code}) — restarting in ${delay / 1000}s`);
-      setTimeout(() => {
-        if (!this.stopping) void ensureCloudflared(log).then((b) => this.spawnWith(b)).catch((e: Error) => log(e.message));
+      this.retry = setTimeout(() => {
+        this.retry = undefined;
+        void ensureCloudflared(log).then((b) => this.spawnWith(b)).catch((e: Error) => log(e.message));
       }, delay);
     });
   }
 
   async stop(): Promise<void> {
     this.stopping = true;
+    this.up = false;
+    if (this.retry) {
+      clearTimeout(this.retry);
+      this.retry = undefined;
+    }
     const c = this.child;
     this.child = undefined;
-    this.up = false;
-    if (c) {
-      c.kill("SIGTERM");
-      await new Promise((r) => setTimeout(r, 300));
-      if (c.exitCode === null) c.kill("SIGKILL");
-    }
+    if (!c) return;
+    c.kill("SIGTERM");
+    // WAIT for it to actually go (same as the other two managers). Returning while it is still
+    // alive would let the next start() spawn a second cloudflared onto the same tunnel, with only
+    // the newer one tracked — the older kept the revoked way in open.
+    await new Promise<void>((r) => {
+      const t = setTimeout(() => {
+        c.kill("SIGKILL");
+        r();
+      }, 3_000);
+      c.on("exit", () => {
+        clearTimeout(t);
+        r();
+      });
+    });
   }
 }
 export const privateTunnelManager = new PrivateTunnelManager();

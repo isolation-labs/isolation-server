@@ -121,9 +121,9 @@ function backendUrlSafe(u: string): boolean {
 // paired. Idempotent — the boot path and the pair path share it.
 import { getEnrollment, getSandbox as getSandboxConfig, saveEnrollment, saveSandbox } from "./config.js";
 export async function startConfigured(): Promise<void> {
-  // A server on a private tunnel has NO public surface: the relay quick tunnel is not started
-  // (docs/vpc-plan.md). Pairing still brings one up briefly — the claim needs a reachable URL before
-  // the vpc block exists — and fetchVpcConfig stops it the moment the private tunnel is configured.
+  // A server on a private tunnel has NO public surface: the relay quick tunnel is not started at
+  // all. Pairing still brings one up briefly — the claim needs a reachable URL before the vpc block
+  // exists — and fetchVpcConfig stops it the moment the private tunnel is configured.
   if (getEnrollment() && !getVpc() && !tunnelManager.status().connected) {
     try {
       await tunnelManager.start();
@@ -138,10 +138,10 @@ export async function startConfigured(): Promise<void> {
   // The SSH bastion: an outbound control connection that publishes `ssh <routeId>@<host>` for every
   // ssh-shaped view. A server with no bastion config just stays on the local forwarder.
   bastion.startIfConfigured();
-  // The private tunnel (docs/vpc-plan.md): the cloud's only way in. Bind the ip first so the first
+  // The private tunnel: the cloud's only way in. Bind the ip first so the first
   // request the Worker sends after "Registered tunnel connection" has something to land on.
   if (getVpc()) {
-    listenOnVpcIp();
+    syncVpcListener();
     await privateTunnelManager.start().catch((e: Error) => log(`private tunnel bring-up failed: ${e.message}`));
   }
 }
@@ -157,10 +157,13 @@ function applyInjectedSandbox(s: unknown): void {
   if (!domain) return;
   const cur = getSandboxConfig();
   if (cur && cur.domain === domain && (cur.creds ?? "") === creds) return;
-  // Domain only (docs/vpc-plan.md): web views are https://<slug>.<domain>/ and the Worker delivers
+  // Domain only: web views are https://<slug>.<domain>/ and the Worker delivers
   // them over the private tunnel — nothing to dial here. Creds = the legacy per-server public wildcard.
   saveSandbox(creds ? { provider: "cloudflared", creds, domain } : { domain });
   if (creds) void sandboxTunnelManager.start().catch((e: Error) => log(`sandbox tunnel (injected) failed: ${e.message}`));
+  // Migrating off the legacy wildcard: the creds are gone from disk, so the running cloudflared
+  // must go too — an inbound path the cloud has replaced may not stay dialed on a stale token.
+  else void sandboxTunnelManager.stop();
 }
 
 // The server's PRIVATE tunnel + address (POST /api/pair/vpc — same auth as the bastion coords).
@@ -173,18 +176,26 @@ async function fetchVpcConfig(backendUrl: string, connectionId: string, secret: 
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ connectionId, secret }),
     });
-    const body = (await r.json().catch(() => ({}))) as { vpc?: { creds?: string; ip?: string } | null };
+    const body = (await r.json().catch(() => ({}))) as { vpc?: { creds?: string; ip?: string; domain?: string } | null };
     if (!r.ok) return log(`vpc config fetch: HTTP ${r.status} — keeping the current one`);
     const v = body.vpc;
     if (!v || typeof v.creds !== "string" || typeof v.ip !== "string" || !/^127\.\d+\.\d+\.\d+$/.test(v.ip)) return;
+    // The preview domain: web views become https://<slug>.<domain>/, served by the Worker over this
+    // very tunnel. Domain only — no creds, nothing to dial (see applyInjectedSandbox).
+    if (typeof v.domain === "string" && v.domain) applyInjectedSandbox({ domain: v.domain });
     const cur = getVpc();
-    if (cur && cur.creds === v.creds && cur.ip === v.ip) return;
-    saveVpc({ creds: v.creds, ip: v.ip });
-    await privateTunnelManager.stop();
+    const unchanged = cur?.creds === v.creds && cur?.ip === v.ip;
+    // Unchanged coords still re-run the bring-up: POST /vpc is the repair path a user reaches for
+    // after fixing a failed bind (the missing lo0 alias), and both steps below are idempotent.
+    if (!unchanged) saveVpc({ creds: v.creds, ip: v.ip });
+    if (!unchanged) await privateTunnelManager.stop();
+    // Bind first, dial second — the first request the Worker sends after "Registered tunnel
+    // connection" has to land on something (same order as startConfigured).
+    syncVpcListener();
     await privateTunnelManager.start().catch((e: Error) => log(`private tunnel failed: ${e.message}`));
-    listenOnVpcIp();
     // The public quick tunnel has no job left: everything reaches this server through the Worker.
     if (!isLoopbackOrigin(backendUrl)) void tunnelManager.stop();
+    if (unchanged) return;
     log(`private tunnel configured — the cloud reaches this server at ${v.ip}:${PORT}`);
   } catch (e) {
     log(`vpc config fetch failed: ${(e as Error)?.message ?? e}`);
@@ -293,7 +304,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         // endpoints. Best-effort: a backend with no bastion configured answers `{bastion:null}`,
         // and this server simply stays local-forwarder-only.
         await fetchBastionConfig(backendUrl, claim.connectionId, claim.secret);
-        // And the private tunnel the Worker will drive this server through (docs/vpc-plan.md).
+        // And the private tunnel the Worker will drive this server through.
         await fetchVpcConfig(backendUrl, claim.connectionId, claim.secret);
       }
       return json(res, 200, { ok: true, label: claim.label ?? label, url: myUrl });
@@ -750,21 +761,32 @@ function makeServer() {
   return server;
 }
 
-// The private-tunnel listener (docs/vpc-plan.md): the same handlers on this server's unique loopback
+// The private-tunnel listener: the same handlers on this server's unique loopback
 // ip, which is what the Worker dials over the binding. Still loopback — nothing off-host can reach
-// it except through the tunnel. Idempotent; a bind failure on macOS means the lo0 alias is missing
-// (`isolation up` adds it) and is reported, not fatal: 127.0.0.1 keeps serving local dev.
+// it except through the tunnel. Idempotent, and it FOLLOWS the config: no vpc block (detached) tears
+// the listener down, a re-mint on a different ip rebinds — leaving the old socket up would both keep
+// a stale way in and silently leave the new address unserved. A bind failure on macOS means the lo0
+// alias is missing (`isolation up` adds it) and is reported, not fatal: 127.0.0.1 keeps serving.
 let vpcListener: ReturnType<typeof createServer> | undefined;
-export function listenOnVpcIp(): void {
-  const v = getVpc();
-  if (!v || vpcListener) return;
+let vpcListenerIp: string | undefined;
+export function syncVpcListener(): void {
+  const ip = getVpc()?.ip;
+  if (ip === vpcListenerIp) return;
+  vpcListener?.close();
+  vpcListener = undefined;
+  vpcListenerIp = undefined;
+  if (!ip) return;
   const s = makeServer();
   s.once("error", (e: NodeJS.ErrnoException) => {
-    vpcListener = undefined;
-    log(`cannot bind ${v.ip}:${PORT} (${e.code}) — on macOS run: sudo ifconfig lo0 alias ${v.ip}; then \`isolation up\``);
+    if (vpcListener === s) {
+      vpcListener = undefined;
+      vpcListenerIp = undefined;
+    }
+    log(`cannot bind ${ip}:${PORT} (${e.code}) — on macOS run: sudo ifconfig lo0 alias ${ip}; then \`isolation up\``);
   });
-  s.listen(PORT, v.ip, () => log(`listening on http://${v.ip}:${PORT} (private tunnel)`));
+  s.listen(PORT, ip, () => log(`listening on http://${ip}:${PORT} (private tunnel)`));
   vpcListener = s;
+  vpcListenerIp = ip;
 }
 
 export function startServer(): void {
@@ -776,6 +798,10 @@ export function startServer(): void {
     await beatOffline();
     await tunnelManager.stop();
     await sandboxTunnelManager.stop();
+    // The private tunnel is a spawned cloudflared: process.exit() below would orphan it, leaving the
+    // Worker's binding connected to a tunnel whose origin is gone — and a second one on the next `up`.
+    await privateTunnelManager.stop();
+    vpcListener?.close();
     server.close();
     process.exit(0);
   };

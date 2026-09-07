@@ -58,7 +58,7 @@ async function main(): Promise<void> {
     }
     // 2. The relay binary, pre-fetched so `connect` never waits on a download.
     await ensureCloudflared(say).catch((e: Error) => say(`(cloudflared not provisioned yet: ${e.message})`));
-    // 2b. The private tunnel's loopback ip (docs/vpc-plan.md). Linux serves any 127.x.y.z out of the
+    // 2b. The private tunnel's loopback ip. Linux serves any 127.x.y.z out of the
     //     box; macOS binds only 127.0.0.1 until lo0 gets an alias — one sudo, kept across restarts of
     //     the gate but not of the machine, so `up` re-checks every time.
     await ensureLoopbackAlias(say);
