@@ -413,13 +413,15 @@ function sameEndpoint(a: BastionConfig, b: BastionConfig): boolean {
 
 export const bastion = new BastionClient();
 
-// Which view types are reachable over ssh, and how. A terminal attaches the very tmux session the
-// browser shows, so the two are one live mirror; code views get a transparent shell, which is what
-// VS Code Remote and `ssh -L` need. Web and agent views are not ssh-shaped.
+// Which view types are reachable over ssh, and how.
+//
+// TERMINAL ONLY, deliberately. A terminal route attaches the very tmux session the browser shows,
+// so the two are one live screen — that is a feature you can explain in a sentence. The other types
+// would each be a plain shell wearing a different label, which is a worse thing to ship than
+// nothing: `code` promises VS Code Remote (its own setup story) and `directory` promises files
+// (which means SMB, not ssh). Neither is decided, so neither gets an address.
 export function modeForView(type: string): RouteMode | undefined {
-  if (type === "terminal") return "tmux";
-  if (type === "code" || type === "directory") return "shell";
-  return undefined;
+  return type === "terminal" ? "tmux" : undefined;
 }
 
 /** `ssh <routeId>@<host>` for a view, when the bastion is configured and the type is reachable. */
@@ -428,6 +430,32 @@ export function sshCommandFor(routeId: string): string | undefined {
   if (!host) return undefined;
   const port = bastion.edgePort() ?? 22;
   return `ssh ${routeId}@${host}${port === 22 ? "" : ` -p ${port}`}`;
+}
+
+/**
+ * Everything the web needs to open this route in a real terminal (the daemon's `nativeConnect`
+ * contract). Passwordless by construction: the member's key was checked at the edge, so there is
+ * no credential to hand out here and nothing secret in this payload.
+ */
+export function nativeConnectFor(routeId: string, sessionId: string, viewId: string): Record<string, unknown> | undefined {
+  const host = bastion.publicHost();
+  const command = sshCommandFor(routeId);
+  if (!host || !command) return undefined;
+  const port = bastion.edgePort() ?? 22;
+  return {
+    kind: "terminal",
+    host,
+    port,
+    user: routeId,
+    routeId,
+    sessionId,
+    viewId,
+    passwordless: true,
+    bastion: true,
+    command,
+    // `ssh://` is what makes it one click: the OS hands it to the default terminal.
+    sshUrl: `ssh://${routeId}@${host}${port === 22 ? "" : `:${port}`}`,
+  };
 }
 
 export const CONTAINER_SSH_PORT = SSHD_PORT;

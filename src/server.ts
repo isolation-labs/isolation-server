@@ -10,7 +10,7 @@ import { deleteSandbox, getSandbox, listSandboxes, osbHealthy, pauseSandbox, res
 import { handlePublicWebRequest, handlePublicWebUpgrade, handleViewRequest, handleViewUpgrade, invalidateEndpoints } from "./doorman.js";
 import { launch, restartTerminal, sanitizeStyle, type LaunchRequest } from "./launch.js";
 import { sinkFor, abortMerge, dropSink, saveWorkspace, syncWorkspace } from "./persistence.js";
-import { dropView, dropViewsForSandbox, getView, mintViewToken, updateView, viewsForSandbox, type View } from "./views.js";
+import { dropView, dropViewsForSandbox, ensureRouteId, getView, mintViewToken, updateView, viewsForSandbox, type View } from "./views.js";
 import { forgetExecd, run } from "./execd.js";
 import { agentJson, getAgent, listAgents, parseRoster, spawnAgent, startAgent, stopAgent } from "./agents.js";
 import { bridgePattern, connectorTurn, syncViewsFile } from "./acpview.js";
@@ -31,7 +31,7 @@ import { pauseSession, resumeSession,
   type DaemonLaunchBody,
 } from "./sessions.js";
 import { sandboxTunnelManager, tunnelManager } from "./tunnel.js";
-import { bastion } from "./bastion.js";
+import { bastion, modeForView, nativeConnectFor } from "./bastion.js";
 
 const VERSION = GATE_VERSION;
 const log = (...a: unknown[]) => console.log("[isolation-server]", ...a);
@@ -590,6 +590,26 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       }
     }
     return json(res, 200, viewJson(nv, id));
+  }
+
+  // "Open externally" (the daemon's nativeConnect contract): hand the web a ready-to-run `ssh`
+  // command for this view. TERMINAL ONLY — it lands in the very tmux session the browser shows,
+  // which is the whole point; every other view type is deliberately not connectable (bastion.ts).
+  const nc = /^\/sessions\/(s-[a-z0-9]+)\/views\/([a-zA-Z0-9-]+)\/connect$/.exec(url);
+  if (nc && method === "POST") {
+    const [, id, vid] = nc;
+    const s2 = getSessionRecord(id);
+    const v = getView(vid);
+    if (!s2 || !v || v.sandboxId !== s2.sandboxId) return json(res, 404, { error: "unknown view" });
+    if (!modeForView(v.type)) return json(res, 400, { error: `${v.type} views cannot be opened externally` });
+    if (!bastion.enabled()) return json(res, 503, { error: "this server has no ssh bastion configured" });
+    // Mint the route id now if the view predates the bastion, and make sure it is actually
+    // registered — the answer must not be a command that nothing at the edge would recognize.
+    const routeId = ensureRouteId(vid);
+    if (!routeId || !s2.sandboxId) return json(res, 503, { error: "ssh is not available for this session" });
+    syncRoutes(id, s2.sandboxId);
+    const out = nativeConnectFor(routeId, id, vid);
+    return out ? json(res, 200, out) : json(res, 503, { error: "the ssh bastion is not reachable right now" });
   }
 
   const nested = /^\/sessions\/(s-[a-z0-9]+)\/(.+)$/.exec(url);
