@@ -99,7 +99,14 @@ export function ensureRouteId(id: string): string | undefined {
   const v = views[id];
   if (!v) return undefined;
   if (!v.sshRouteId) {
-    v.sshRouteId = `${connNamespace()}${randBase36(v.type === "web" ? 25 : 4)}`;
+    // Never hand two views the same id. The bastion keys its route table on it, so a duplicate
+    // would replace the older route outright: one view's saved `ssh <id>@host` would land in the
+    // other view's shell, governed by the other view's key allow-list.
+    let candidate = "";
+    do {
+      candidate = `${connNamespace()}${randBase36(v.type === "web" ? 25 : 4)}`;
+    } while (viewByRouteId(candidate));
+    v.sshRouteId = candidate;
     persist();
   }
   return v.sshRouteId;

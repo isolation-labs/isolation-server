@@ -2,9 +2,10 @@
 // backend needs no changes): a paired gate periodically reports its CURRENT reachable
 // URL + proves liveness. The backend probes that URL inbound (the same path a browser
 // takes) and drives the server's liveness dot from the verdict. Daemon→backend only.
-import { PORT, getPairing, isLoopbackOrigin, savePairing, saveEnrollment, getMachineId } from "./config.js";
+import { PORT, getPairing, isLoopbackOrigin, savePairing, saveEnrollment, saveBastion, getMachineId } from "./config.js";
 import { GATE_VERSION } from "./version.js";
 import { tunnelManager } from "./tunnel.js";
+import { bastion } from "./bastion.js";
 
 const log = (...a: unknown[]) => console.log("[heartbeat]", ...a);
 const INTERVAL_OK_MS = 60_000;
@@ -82,6 +83,13 @@ export function detach(): void {
   savePairing(undefined);
   saveEnrollment(undefined);
   void tunnelManager.stop();
+  // The ssh plane goes with the relay tunnel, for the same reason: both are INBOUND paths the
+  // cloud handed us, and a server the cloud no longer recognizes must not keep either one open.
+  // Left alone, the bastion connection would go on publishing routes into every live sandbox —
+  // still spliceable by anyone on a route's allow-list — using a credential that has been revoked,
+  // and the register secret would sit on disk waiting for the next restart to dial back out.
+  saveBastion(undefined);
+  bastion.disable();
 }
 
 export function pairingStatus(): { paired: boolean; backendUrl?: string; lastBeat?: BeatStatus } {

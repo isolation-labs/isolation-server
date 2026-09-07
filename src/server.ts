@@ -4,7 +4,7 @@
 // is small enough that a framework would outweigh it.
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { GATE_VERSION } from "./version.js";
-import { HOST, PORT, getName, getPairing, getToken, isLoopbackOrigin, originAllowed, saveBastion, savePairing, tokenMatches, getMachineId } from "./config.js";
+import { HOST, PORT, getBastion, getName, getPairing, getToken, isLoopbackOrigin, originAllowed, saveBastion, savePairing, tokenMatches, getMachineId } from "./config.js";
 import { beatOffline, detach, pairingStatus, startHeartbeat } from "./heartbeat.js";
 import { deleteSandbox, getSandbox, listSandboxes, osbHealthy, pauseSandbox, resumeSandbox, sandboxLogs } from "./opensandbox.js";
 import { handlePublicWebRequest, handlePublicWebUpgrade, handleViewRequest, handleViewUpgrade, invalidateEndpoints } from "./doorman.js";
@@ -63,18 +63,32 @@ async function fetchBastionConfig(backendUrl: string, connectionId: string, secr
     });
     const body = (await r.json().catch(() => ({}))) as { bastion?: Record<string, unknown> | null };
     const b = body.bastion;
-    if (!r.ok || !b || typeof b.controlHost !== "string" || typeof b.registerSecret !== "string") {
+    // A transient failure is NOT an answer: a 502 from the backend (or a deploy window) must never
+    // wipe coords that work, or the ssh plane would go dark until someone re-paired the server.
+    // Only a healthy backend saying "no bastion" tears it down.
+    if (!r.ok) return log(`bastion config fetch: HTTP ${r.status} — keeping the current coords`);
+    if (!b || typeof b.controlHost !== "string" || typeof b.registerSecret !== "string") {
+      if (getBastion()) log("the cloud reports no ssh bastion for this server — falling back to the local forwarder");
       saveBastion(undefined);
+      bastion.disable();
       return;
     }
+    const controlPort = Number(b.controlPort ?? 2200);
+    // The pinned host key survives a coords refresh: the cloud does not (yet) serve one, so
+    // dropping it here would silently re-TOFU on the very next dial and reopen the window the pin
+    // exists to close. A key served by the cloud always wins; a MOVED bastion starts over.
+    const prev = getBastion();
+    const carried = prev?.controlHost === b.controlHost && prev?.controlPort === controlPort ? prev.hostKey : undefined;
+    const hostKey = typeof b.hostKey === "string" && b.hostKey ? b.hostKey : carried;
     saveBastion({
       controlHost: b.controlHost,
-      controlPort: Number(b.controlPort ?? 2200),
+      controlPort,
       publicHost: typeof b.publicHost === "string" ? b.publicHost : b.controlHost,
       edgePort: Number(b.edgePort ?? 22),
       daemonLabel: typeof b.daemonLabel === "string" ? b.daemonLabel : connectionId,
       ...(typeof b.smbHost === "string" ? { smbHost: b.smbHost } : {}),
       registerSecret: b.registerSecret,
+      ...(hostKey ? { hostKey } : {}),
     });
     bastion.startIfConfigured();
     log(`ssh bastion configured — users reach sessions at ${bastion.publicHost()}`);

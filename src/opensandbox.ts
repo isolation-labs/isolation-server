@@ -117,7 +117,10 @@ export async function endpointFor(sandboxId: string, port: number): Promise<Endp
 // Same, plus the auth headers the runtime hands out for a port that needs them (the egress
 // sidecar's API on 18080 answers only with its per-sandbox `OPENSANDBOX-EGRESS-AUTH`).
 export async function endpointWithHeaders(sandboxId: string, port: number): Promise<Endpoint & { headers: Record<string, string> }> {
-  const { endpoint, headers } = await call<{ endpoint: string; headers?: Record<string, string> }>("GET", `/v1/sandboxes/${sandboxId}/endpoints/${port}`);
+  // Encoded, not interpolated raw: this is the one endpoint resolution driven by an id that
+  // arrives from OFF this host (the bastion names a sandbox on its reverse channels), and a path
+  // segment carrying `/` or `..` would otherwise aim the runtime call somewhere else entirely.
+  const { endpoint, headers } = await call<{ endpoint: string; headers?: Record<string, string> }>("GET", `/v1/sandboxes/${encodeURIComponent(sandboxId)}/endpoints/${port}`);
   const slash = endpoint.indexOf("/");
   const h = headers ?? {};
   if (slash === -1) return { host: endpoint, basePath: "", headers: h };

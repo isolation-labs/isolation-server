@@ -10,7 +10,7 @@ import { randomBytes } from "node:crypto";
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DATA, PORT, ensureDataDir, getSandbox } from "./config.js";
-import { launch, scaffoldView, type LaunchRequest, type ViewSpec } from "./launch.js";
+import { authorizedKeysFile, launch, scaffoldView, type LaunchRequest, type ViewSpec } from "./launch.js";
 import { deleteSandbox } from "./opensandbox.js";
 import { closeSsh, openSsh } from "./sshfwd.js";
 import { bastion, modeForView, sshCommandFor, CONTAINER_SSH_PORT } from "./bastion.js";
@@ -247,8 +247,13 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
       // never learns an address. Registered only when the sandbox really has an sshd to reach.
       if (out.ssh) syncRoutes(id, out.sandbox.id);
       // `finishSession` can land while the launch is still finishing: it already closed a
-      // forwarder that did not exist yet, so the one just bound is ours to take back down.
-      if (sshPort && !sessions[id]) closeSsh(id);
+      // forwarder that did not exist yet, so the one just bound is ours to take back down. Same
+      // for the routes just published — the record is gone, so nothing else will ever unregister
+      // them, and the bastion would go on advertising ssh into a sandbox nobody owns.
+      if (!sessions[id]) {
+        bastion.unregisterSandbox(out.sandbox.id);
+        if (sshPort) closeSsh(id);
+      }
       update(id, { sandboxId: out.sandbox.id, state: "ready", phase: undefined, viewsPending: 0, ...(out.vault ? { vault: out.vault } : {}), ...(sshPort ? { sshPort } : {}) });
       log(`${id} ready (sandbox ${out.sandbox.id.slice(0, 8)})${rec.roster?.length ? `, ${rec.roster.length} agent(s)` : ""}`);
     })
@@ -260,6 +265,9 @@ export function startSession(body: DaemonLaunchBody): SessionRecord {
       update(id, { state: "error", error: e.message, phase: undefined, viewsPending: 0 });
       closeSsh(id);
       if (dead) {
+        // A view added while the launch was still running registered its bastion route already;
+        // the views go below, and a route whose view is gone can never be unregistered by id.
+        bastion.unregisterSandbox(dead);
         dropViewsForSandbox(dead);
         dropSink(dead);
         forgetThreads(dead);
@@ -303,7 +311,11 @@ function tmuxTargetFor(v: View): string {
 
 export function syncRoutes(sessionId: string, sandboxId: string): void {
   if (!bastion.enabled()) return;
-  const keys = sessions[sessionId]?.authorizedKeys ?? [];
+  // The SAME wire-input treatment the in-sandbox authorized_keys file gets, for the same reason:
+  // this list is an authentication allow-list, and a "key" carrying a newline would smuggle extra
+  // entries into whatever the bastion writes it into. The bastion is SHARED across every server on
+  // the cloud, so a bad entry there is not even our own tenant's problem — never send one.
+  const keys = authorizedKeysFile(sessions[sessionId]?.authorizedKeys).split("\n").filter(Boolean);
   for (const v of viewsForSandbox(sandboxId)) {
     const mode = modeForView(v.type);
     if (!mode) continue;

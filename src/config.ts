@@ -69,6 +69,11 @@ export interface BastionConfig {
   daemonLabel: string; // the control-plane username — our connectionId, so the edge can recompute our token
   smbHost?: string;
   registerSecret: string; // per-connection token: HMAC(cloud signing key, daemonLabel)
+  // The bastion's SSH host public key, base64 of the raw blob — PINNED. ssh2 accepts any host key
+  // unless told otherwise, and this is the connection that carries our register credential and is
+  // trusted to push an agent key into every sandbox, so it is pinned on first sight (or to what
+  // the cloud handed down) and anything else is refused. See bastion.ts.
+  hostKey?: string;
 }
 
 export interface OsbConfig {

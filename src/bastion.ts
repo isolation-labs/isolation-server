@@ -22,8 +22,9 @@
 //                        it rotates on every reconnect, and it only opens this server's sandboxes.
 // The user's own key is never what the container trusts — it is checked at the edge.
 import ssh2 from "ssh2";
+import { createHash, timingSafeEqual } from "node:crypto";
 import type { Duplex } from "node:stream";
-import { getBastion, type BastionConfig } from "./config.js";
+import { getBastion, saveBastion, type BastionConfig } from "./config.js";
 import { endpointWithHeaders } from "./opensandbox.js";
 import { wsConnect } from "./wsframe.js";
 import { spliceOverWs } from "./sshfwd.js";
@@ -31,6 +32,9 @@ import { SSH_BRIDGE_PORT, SSHD_PORT } from "./launch.js";
 
 const { Client } = ssh2;
 const log = (...a: unknown[]) => console.log("[bastion]", ...a);
+// A control line is one JSON op; the largest realistic one is a register carrying a route's key
+// allow-list. 256 KiB is orders of magnitude past that, and bounds what an unframed peer can grow.
+const MAX_CTRL_LINE = 256 * 1024;
 
 export type RouteMode = "tmux" | "shell";
 
@@ -122,19 +126,46 @@ class BastionClient {
     }
   }
 
+  /**
+   * The cloud says this server has no bastion any more. Drop the connection AND the local state:
+   * leaving `settings` behind would keep `/status` reporting a configured ssh plane, and leaving
+   * the routes behind would replay them at whatever bastion is configured next.
+   */
+  disable(): void {
+    this.stop();
+    this.settings = undefined;
+    this.routes.clear();
+    this.agentKey = undefined;
+  }
+
   private dial(): void {
     const s = this.settings;
     if (!s) return;
+    // A retry may already be armed (a redial on a config change, say). Letting it fire on top of
+    // this connection would leave two control connections racing to own the same route table.
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
     const c = new Client();
     this.conn = c;
+    // EVERY handler below ignores a connection that is no longer the live one. `startIfConfigured`
+    // swaps the client out on a config change, and the old client's 'close' lands AFTER the new one
+    // is in place: unguarded, it would null out the live connection's state and schedule a
+    // reconnect on top of it — two connections, and a route table nobody is replaying into.
+    const mine = () => this.conn === c;
     c.on("ready", () => {
-      this.backoff = 1000;
-      this.onReady();
+      if (!mine()) return;
+      this.onReady(c); // the backoff resets only once the control channel is actually open
     });
     // The bastion opening a channel back to us: one end user's ssh session.
-    c.on("tcp connection", (info, accept) => this.onReverseChannel(info, accept));
-    c.on("error", (e: Error) => log(`connection error: ${e?.message ?? e}`));
+    c.on("tcp connection", (info, accept, reject) => {
+      if (!mine()) return void reject(); // a superseded connection has no sandboxes to offer
+      this.onReverseChannel(info, accept);
+    });
+    c.on("error", (e: Error) => {
+      if (mine()) log(`connection error: ${e?.message ?? e}`);
+    });
     c.on("close", () => {
+      if (!mine()) return;
       this.connected = false;
       this.control = undefined;
       this.conn = undefined;
@@ -148,36 +179,103 @@ class BastionClient {
         // HMAC(the cloud's signing key, that id). A leaked one can register only our routes.
         username: s.daemonLabel,
         password: s.registerSecret,
+        // ssh2 accepts ANY host key when no verifier is given, and this connection is the one that
+        // presents our register credential AND is trusted to push an agent public key we install
+        // in every sandbox — so an on-path impostor of the bastion would own every session on this
+        // server. Pin it instead (see verifyHostKey).
+        hostVerifier: (key: Buffer) => this.verifyHostKey(c, key),
         keepaliveInterval: 20_000,
         readyTimeout: 15_000,
       });
     } catch (e) {
       log(`connect threw: ${(e as Error)?.message ?? e}`);
-      this.scheduleReconnect();
+      if (mine()) {
+        this.conn = undefined;
+        this.scheduleReconnect();
+      }
     }
   }
 
-  private onReady(): void {
-    const c = this.conn;
-    if (!c) return;
+  /**
+   * Trust-on-first-use pinning of the bastion's host key, upgraded to a hard pin the moment the
+   * cloud hands one down (`hostKey` in the coords, fetched over HTTPS). Without this, anyone on the
+   * path — a hijacked DNS answer for the control host is enough — can impersonate the bastion,
+   * collect our register credential, push their own agent public key (which we then install in
+   * every live sandbox) and ssh into all of them. A mismatch is fatal for the dial, never papered
+   * over: the reconnect loop retries, and the log says exactly what happened.
+   */
+  private verifyHostKey(c: ssh2.Client, key: Buffer): boolean {
+    if (this.conn !== c) return false; // a superseded dial has nothing left to pin for
+    const s = this.settings;
+    if (!s) return false; // disabled mid-handshake
+    const offered = Buffer.from(key);
+    if (s.hostKey) {
+      const pinned = Buffer.from(s.hostKey, "base64");
+      const ok = pinned.length === offered.length && timingSafeEqual(pinned, offered);
+      if (!ok) {
+        log(`REFUSED ${s.controlHost}: host key ${fingerprint(offered)} does not match the pinned one. Either something is impersonating the bastion, or its key was rotated — re-pair this server to accept a new one.`);
+      }
+      return ok;
+    }
+    s.hostKey = offered.toString("base64");
+    saveBastion(s);
+    log(`pinned the bastion host key on first connect (${fingerprint(offered)})`);
+    return true;
+  }
+
+  /**
+   * A connection that is up at the TCP/SSH layer but useless above it — no reverse tunnel, or no
+   * control channel — must be TORN DOWN, not merely noted.
+   *
+   * ssh2's keepalive holds such a connection open indefinitely, and `startIfConfigured` refuses to
+   * dial while `this.conn` is set, so anything that only flipped `connected` to false would leave
+   * this server permanently ssh-dark: routes queued in the map and never replayed, `send()` a
+   * silent no-op, and nothing left that ever retries. Ending it lets the 'close' handler run the
+   * ordinary reconnect loop, which is the one path that recovers.
+   */
+  private redial(c: ssh2.Client, why: string): void {
+    if (this.conn !== c) return; // a superseded connection is already someone else's problem
+    log(`${why} — dropping the connection so the reconnect loop can retry`);
+    try {
+      c.end();
+    } catch {
+      /* already gone; the 'close' handler still fires */
+    }
+  }
+
+  private onReady(c: ssh2.Client): void {
     // Park the reverse tunnel — this is what lets the bastion open channels back to us at all.
     // The bastion answers with a VIRTUAL port and keys its forwarding table on it; without this
     // the edge has no way back to us and every session dies with "daemon offline".
     c.forwardIn("127.0.0.1", 0, (e, port) => {
-      if (e) log(`forwardIn failed — no session can reach this server: ${e.message}`);
+      if (e) this.redial(c, `forwardIn failed — no session could reach this server (${e.message})`);
       else log(`reverse tunnel parked (bound port ${port})`);
     });
     c.exec("iso-control", (err, stream) => {
-      if (err) return log(`control channel failed: ${err.message}`);
+      if (err) return this.redial(c, `control channel failed (${err.message})`);
+      // The exec is a round trip: this connection can have been replaced (or stopped) meanwhile,
+      // and adopting its channel would point `this.control` at a client nobody else knows about.
+      if (this.conn !== c) return void stream.close();
       this.control = stream;
       this.connected = true;
       this.ctrlBuf = "";
+      // Only a WORKING control channel counts as a good connection. Resetting the backoff on
+      // 'ready' alone would turn a bastion that authenticates but never accepts `iso-control` into
+      // a one-second reconnect loop against a public host.
+      this.backoff = 1000;
       stream.on("data", (d: Buffer) => this.onControlData(d));
       stream.on("close", () => {
+        if (this.conn !== c) return;
         this.connected = false;
+        this.control = undefined;
+        // The bastion only logs a closed control channel; it does not drop the connection. So this
+        // is the common way to end up connected-but-unregistered, and the redial is what fixes it.
+        this.redial(c, "the bastion closed the control channel");
       });
       for (const r of this.routes.values()) this.send({ op: "register", ...r });
-      log(`connected to ${this.settings!.controlHost} — ${this.routes.size} route(s) replayed`);
+      // `settings` can be gone by now (a `disable()` that raced this round trip); an exception
+      // raised inside an ssh2 callback has nothing above it to catch and would end the process.
+      log(`connected to ${this.settings?.controlHost ?? "the bastion"} — ${this.routes.size} route(s) replayed`);
     });
   }
 
@@ -202,7 +300,14 @@ class BastionClient {
       }
     };
     ch.on("error", drop);
-    if (!sandboxId) return drop();
+    // The bastion NAMES the sandbox it wants, and that name goes straight into a runtime API path.
+    // Honor it only for a sandbox we ourselves published a route for: an unregistered id (a stale
+    // route, a confused edge, a crafted one carrying `../`) must never reach the runtime, which
+    // answers on loopback with our API key and knows every sandbox on this host.
+    if (!sandboxId || !this.hasSandbox(sandboxId)) {
+      if (sandboxId) log(`refused a channel for an unregistered sandbox`);
+      return drop();
+    }
     ch.pause();
     endpointWithHeaders(sandboxId, SSH_BRIDGE_PORT)
       .then(({ host, basePath, headers }) => wsConnect({ host, path: `${basePath}/`, headers }))
@@ -236,6 +341,16 @@ class BastionClient {
         /* a malformed ack is the bastion's problem, never ours */
       }
     }
+    // What is left is one PARTIAL line. The control channel is line-delimited JSON from a remote
+    // peer, so a peer that never sends a newline (a bug, or a bastion someone else has taken over)
+    // would grow this string without limit until the process dies. No legitimate op comes close to
+    // the cap, so an oversized fragment is garbage: drop it and resynchronize on the next newline.
+    if (this.ctrlBuf.length > MAX_CTRL_LINE) {
+      // The tail of the dropped line still arrives and parses as invalid JSON — which the loop
+      // above already swallows — so there is nothing further to suppress.
+      log(`control line over ${MAX_CTRL_LINE} bytes — discarding it`);
+      this.ctrlBuf = "";
+    }
   }
 
   private send(o: Record<string, unknown>): void {
@@ -265,6 +380,11 @@ class BastionClient {
   unregisterRoute(routeId: string): void {
     if (this.routes.delete(routeId)) this.send({ op: "unregister", routeId });
   }
+  /** Do we currently publish a route into this sandbox? The gate on every inbound channel. */
+  private hasSandbox(sandboxId: string): boolean {
+    for (const r of this.routes.values()) if (r.sessionId === sandboxId) return true;
+    return false;
+  }
   unregisterSandbox(sandboxId: string): void {
     for (const [id, r] of this.routes) if (r.sessionId === sandboxId) this.unregisterRoute(id);
   }
@@ -279,6 +399,11 @@ class BastionClient {
   routeCount(): number {
     return this.routes.size;
   }
+}
+
+// OpenSSH's own fingerprint shape, so an operator can compare it against `ssh-keyscan` output.
+function fingerprint(key: Buffer): string {
+  return `SHA256:${createHash("sha256").update(key).digest("base64").replace(/=+$/, "")}`;
 }
 
 // Same bastion, same credential? Only these decide whether a live connection can be kept.
