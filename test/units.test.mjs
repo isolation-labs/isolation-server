@@ -521,12 +521,17 @@ test("a chat binds to one session; the thread key is stable per (chat, agent) an
   assert.equal(ch.bindingForThread("s-1", ch.channelThreadKey("slack", "C123", "ag-nobody")), undefined);
   assert.equal(ch.bindingForThread("s-2", ch.channelThreadKey("slack", "C123", "ag-isla")), undefined, "another session's thread is not yours");
 
-  // The envelope of the message being answered: remembered per thread, read by chat_context.
+  // The envelope of the message being answered: remembered per (session, thread), read by
+  // chat_context. The session is part of the key because the thread key is not — the same chat and
+  // agent produce the same key in every session, and one member's "who said this" is not another's.
   const env = { connector: "slack", channel: "C123", channelName: "#build", sender: "U9", senderName: "Dani", thread: "1699.1" };
-  ch.rememberEnvelope(key, env);
-  assert.deepEqual(ch.envelopeFor(key), env);
-  ch.rememberEnvelope(key, undefined);
-  assert.deepEqual(ch.envelopeFor(key), env, "an envelope-less turn does not erase where the conversation is");
+  ch.rememberEnvelope("s-1", key, env);
+  assert.deepEqual(ch.envelopeFor("s-1", key), env);
+  assert.equal(ch.envelopeFor("s-2", key), undefined, "another session in the same chat reads its own message, not this one");
+  ch.rememberEnvelope("s-1", key, undefined);
+  assert.deepEqual(ch.envelopeFor("s-1", key), env, "an envelope-less turn does not erase where the conversation is");
+  ch.forgetEnvelopesFor("s-2");
+  assert.deepEqual(ch.envelopeFor("s-1", key), env, "and forgetting another session's envelopes leaves it alone");
 
   assert.equal(ch.detachChannel(a.id), true);
   assert.equal(ch.detachChannel(a.id), false, "detaching twice is not an error the second time either");

@@ -49,8 +49,14 @@ export interface ChannelBinding {
 }
 
 const bindings = new Map<string, ChannelBinding>(); // id → binding
-/** The envelope of the turn currently being handled, per thread key — what `chat_context` answers. */
+/**
+ * The envelope of the turn currently being handled, per (session, thread key) — what `chat_context`
+ * answers. Keyed by SESSION as well as thread: a thread key is deterministic (the same chat and
+ * agent produce the same one), so two sessions of the same channel — two different members — would
+ * otherwise read and erase each other's "who said this to me".
+ */
 const envelopes = new Map<string, ChatEnvelope>();
+const envelopeKey = (sessionId: string, threadKey: string) => `${sessionId}\u0000${threadKey}`;
 
 const mintId = () => `ch-${randomBytes(6).toString("hex")}`;
 // A channel id comes from OUTSIDE and ends up in a thread key, which ends up in a filename. Dots
@@ -107,19 +113,23 @@ export function bindingForThread(sessionId: string, threadKey: string): ChannelB
  * — but it says so and its agents stop answering. A new launch re-attaches to the same chat.
  */
 export async function endChannelsFor(sessionId: string): Promise<void> {
-  for (const b of channelsForSession(sessionId)) {
-    if (b.status === "ended") continue;
-    bindings.set(b.id, { ...b, status: "ended" });
-    await postToChannel(b.id, { text: "This session has ended. Ask again to start a new one." }).catch(() => undefined);
-  }
+  await Promise.all(
+    channelsForSession(sessionId).map(async (b) => {
+      if (b.status === "ended") return;
+      bindings.set(b.id, { ...b, status: "ended" });
+      await postToChannel(b.id, { text: "This session has ended. Ask again to start a new one." }).catch(() => undefined);
+    }),
+  );
 }
 
-export function rememberEnvelope(threadKey: string, envelope: ChatEnvelope | undefined): void {
-  if (envelope) envelopes.set(threadKey, envelope);
+export function rememberEnvelope(sessionId: string, threadKey: string, envelope: ChatEnvelope | undefined): void {
+  if (envelope) envelopes.set(envelopeKey(sessionId, threadKey), envelope);
 }
-export const envelopeFor = (threadKey: string): ChatEnvelope | undefined => envelopes.get(threadKey);
+export const envelopeFor = (sessionId: string, threadKey: string): ChatEnvelope | undefined => envelopes.get(envelopeKey(sessionId, threadKey));
+/** Every envelope of a session, whether or not its binding is still attached. */
 export function forgetEnvelopesFor(sessionId: string): void {
-  for (const b of channelsForSession(sessionId)) for (const a of b.agents) envelopes.delete(channelThreadKey(b.connector, b.channel, a));
+  const prefix = envelopeKey(sessionId, "");
+  for (const k of envelopes.keys()) if (k.startsWith(prefix)) envelopes.delete(k);
 }
 
 // ── Reaching the chat ──────────────────────────────────────────────────────────────────────────

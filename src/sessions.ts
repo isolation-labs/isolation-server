@@ -292,7 +292,7 @@ export function startSession(body: DaemonLaunchBody, owner?: string): SessionRec
       update(id, { sandboxId: out.sandbox.id, state: "ready", phase: undefined, viewsPending: 0, sshd: Boolean(out.ssh), ...(out.vault ? { vault: out.vault } : {}), ...(sshPort ? { sshPort } : {}) });
       log(`${id} ready (sandbox ${out.sandbox.id.slice(0, 8)})${rec.roster?.length ? `, ${rec.roster.length} agent(s)` : ""}`);
     })
-    .catch((e: Error) => {
+    .catch(async (e: Error) => {
       // The record carries a sandboxId from onSandbox, so the failure path owes the same
       // cleanup finishSession does: views scaffolded before the failure would otherwise stay
       // addressable (and listed to the web) pointing at a sandbox the launch already deleted.
@@ -303,7 +303,10 @@ export function startSession(body: DaemonLaunchBody, owner?: string): SessionRec
         // A view added while the launch was still running registered its bastion route already;
         // the views go below, and a route whose view is gone can never be unregistered by id.
         bastion.unregisterSandbox(dead);
-        void stopPumps(dead); // before the views go — the pumps are keyed by view id
+        // AWAITED: a pump is keyed by VIEW id and `stopToolPumpsFor` finds them THROUGH the
+        // sandbox's views — the lazy import yields, so a fire-and-forget call would run after
+        // `dropViewsForSandbox` had already emptied the list and would stop nothing at all.
+        await stopPumps(dead);
         dropViewsForSandbox(dead);
         dropSink(dead);
         forgetThreads(dead);
@@ -331,8 +334,12 @@ export async function finishSession(id: string): Promise<void> {
   if (!s) return;
   // A chat bound to this session OUTLIVES it (PLAN §1 I3, owner call): it says the session ended
   // and its agents stop answering, rather than the channel vanishing with the compute. Best-effort
-  // and first — a chat we cannot reach must not hold up the teardown.
-  await (await import("./channels.js")).endChannelsFor(id).catch(() => undefined);
+  // and NOT awaited: the goodbye is a call to the cloud with a 20s timeout, and a chat we cannot
+  // reach must not hold up the teardown. (channels.ts reads session records, so the import is
+  // dynamic — which means the bindings flip to "ended" a tick from now, not synchronously.)
+  void import("./channels.js")
+    .then((m) => m.endChannelsFor(id))
+    .catch(() => undefined);
   // Before the sandbox goes: the listener would otherwise stay open on a port pointing at nothing,
   // and the bastion would keep advertising routes into a sandbox that no longer exists.
   closeSsh(id);

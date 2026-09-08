@@ -14,7 +14,7 @@ import { dropView, dropViewsForSandbox, ensureRouteId, getView, isSlugPrefix, mi
 import { forgetExecd, run } from "./execd.js";
 import { agentJson, getAgent, listAgents, parseRoster, spawnAgent, startAgent, stopAgent } from "./agents.js";
 import { bridgePattern, connectorTurn, syncViewsFile } from "./acpview.js";
-import { attachChannel, channelThreadKey, channelsForSession, detachChannel, rememberEnvelope, type ChatEnvelope } from "./channels.js";
+import { attachChannel, channelBinding, channelThreadKey, channelsForSession, detachChannel, rememberEnvelope, type ChatEnvelope } from "./channels.js";
 import { listHarnesses } from "./harness.js";
 import { pauseSession, resumeSession,
   actorFrom,
@@ -530,6 +530,10 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       if (method === "DELETE" && !action) {
         const gone = getView(vid);
         if (gone?.sshRouteId) bastion.unregisterRoute(gone.sshRouteId);
+        // AWAITED, and before the view is dropped: the control-channel pump for an agent view is
+        // keyed by view id, and view ports are recycled. A pump left running would keep polling
+        // the port this delete frees and could be handed the NEXT view's tool calls (PLAN §1 I3).
+        await import("./toolpump.js").then((m) => m.stopToolPump(vid));
         const v = dropView(vid);
         // Best-effort: stop the view's in-sandbox server so the port frees up.
         if (v) {
@@ -583,7 +587,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       // `chat_reply` answers in the same thread. Remembered per thread key — one live envelope per
       // conversation, which is exactly what "the message I am answering" means.
       const envelope = parseEnvelope(b.envelope);
-      rememberEnvelope(key, envelope);
+      rememberEnvelope(sid, key, envelope);
       const from = typeof b.from === "string" ? b.from : envelope ? `${envelope.connector}:${envelope.senderName ?? envelope.sender ?? "someone"}` : "channel";
       // A connector that cannot hold a request open for a turn that takes minutes (Slack must ack
       // in three seconds) asks for the reply to be delivered instead: we answer at once and the
@@ -592,12 +596,18 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         const view = v;
         void connectorTurn(view, text, from)
           .then(async (out) => {
-            if ("error" in out) return;
-            const { postToChannel } = await import("./channels.js");
-            const bind = (await import("./channels.js")).bindingForThread(sid, key);
-            if (bind && out.reply.text.trim()) await postToChannel(bind.id, { text: out.reply.text, ...(envelope?.thread ? { thread: envelope.thread } : {}), asAgent: view.agentId }).catch(() => undefined);
+            // The caller already has its 202, so a failure here reaches nobody unless it is
+            // logged: an async turn that dies (or answers into a chat this session was never
+            // bound to) would otherwise be indistinguishable from one still thinking.
+            if ("error" in out) return log(`${sid}/${key}: async turn failed — ${out.error}`);
+            const { bindingForThread, postToChannel } = await import("./channels.js");
+            const bind = bindingForThread(sid, key);
+            if (!bind) return log(`${sid}/${key}: async turn answered but no chat is bound to this thread — the reply was dropped`);
+            if (out.reply.text.trim()) {
+              await postToChannel(bind.id, { text: out.reply.text, ...(envelope?.thread ? { thread: envelope.thread } : {}), asAgent: view.agentId }).catch((e: Error) => log(`${sid}/${key}: could not deliver the async reply — ${e?.message ?? e}`));
+            }
           })
-          .catch(() => undefined);
+          .catch((e: Error) => log(`${sid}/${key}: async turn threw — ${e?.message ?? e}`));
         return json(res, 202, { accepted: true, viewId: v.id });
       }
       const out = await connectorTurn(v, text, from);
@@ -629,6 +639,10 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       return json(res, 201, { ...bind, threads: agents.map((a) => ({ agentId: a, threadKey: channelThreadKey(connector, channel, a) })) });
     }
     if (method === "DELETE" && bindingId) {
+      // A binding id is only ever detachable through the session it belongs to: the id is the
+      // only thing the caller supplies, and `mayOpen` above answers for THIS session — not for
+      // whichever session the id happens to name.
+      if (channelBinding(bindingId)?.sessionId !== sid) return json(res, 404, { error: "unknown binding" });
       const gone = detachChannel(bindingId);
       return gone ? json(res, 200, { ok: true }) : json(res, 404, { error: "unknown binding" });
     }
@@ -860,6 +874,9 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       if (method === "DELETE" && !action) {
         await deleteSandbox(id);
         dropSshForSandbox(id);
+        // Before the views go, not after: `stopToolPumpsFor` finds its pumps THROUGH the
+        // sandbox's views, so a call placed below would have nothing left to stop (PLAN §1 I3).
+        await import("./toolpump.js").then((m) => m.stopToolPumpsFor(id));
         dropViewsForSandbox(id);
         invalidateEndpoints(id);
         forgetExecd(id);
@@ -867,6 +884,9 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         return json(res, 200, { ok: true });
       }
       if (method === "POST" && action === "pause") {
+        // Same rule as pauseSession: the bridges stop with the sandbox, and a pump left polling
+        // one would burn its retry budget and give up FOR GOOD — the raw resume below re-arms it.
+        await import("./toolpump.js").then((m) => m.stopToolPumpsFor(id));
         await pauseSandbox(id);
         return json(res, 200, { ok: true });
       }
@@ -874,6 +894,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         await resumeSandbox(id);
         invalidateEndpoints(id); // published ports may move across a resume
         forgetExecd(id);
+        await import("./toolpump.js").then((m) => m.startToolPumpsFor(id)); // the agents can reach out again
         return json(res, 200, { ok: true });
       }
       if (method === "GET" && action === "logs") {

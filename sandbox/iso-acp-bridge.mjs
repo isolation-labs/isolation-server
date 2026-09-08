@@ -522,20 +522,39 @@ function parkTool(tool, args) {
       resolve,
       timer: setTimeout(() => {
         pendingTools.delete(id);
+        // …and out of the queue with it. A call nobody is waiting for must never be handed to a
+        // later poll: `view_create` would publish a public address and `chat_post` would say
+        // something in a channel minutes after the agent was told the call timed out, with no one
+        // left to receive the answer.
+        const q = toolQueue.indexOf(call);
+        if (q >= 0) toolQueue.splice(q, 1);
         resolve({ error: `${tool} timed out — the Isolation server did not answer` });
       }, TOOL_TIMEOUT_MS),
     };
     pendingTools.set(id, entry);
-    const waiter = toolWaiters.shift();
-    if (waiter) waiter(call);
-    else toolQueue.push(call);
+    deliverTool(call);
   });
+}
+
+// Hand a call to a poll that is already waiting, or queue it for the next one. `front` puts a call
+// BACK where it was (a poll that vanished before its call could be written): it has waited longest.
+function deliverTool(call, front = false) {
+  if (!pendingTools.has(call.id)) return; // it timed out while a poll was holding it — drop it
+  const waiter = toolWaiters.shift();
+  if (waiter) waiter(call);
+  else if (front) toolQueue.unshift(call);
+  else toolQueue.push(call);
 }
 
 function takeTool(waitMs) {
   lastPumpPoll = Date.now();
-  const queued = toolQueue.shift();
-  if (queued) return Promise.resolve(queued);
+  // Skip anything that stopped being pending while it sat here — it timed out, or the poll that
+  // held it handed it back after its requester had already given up. Running it would be a side
+  // effect with no consumer.
+  while (toolQueue.length) {
+    const queued = toolQueue.shift();
+    if (pendingTools.has(queued.id)) return Promise.resolve(queued);
+  }
   return new Promise((resolve) => {
     const done = (call) => {
       clearTimeout(timer);
@@ -605,7 +624,19 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname.startsWith("/iso-tool")) {
     if (req.method === "GET" && url.pathname === "/iso-tool/next") {
       const wait = Math.min(Math.max(Number(url.searchParams.get("wait")) || 25_000, 1_000), 55_000);
+      let gone = false;
+      res.on("close", () => {
+        gone = true;
+      });
       const call = await takeTool(wait);
+      // The poll can be gone by the time a call arrives — a stopped pump, a dropped proxy
+      // connection. Writing the call into a socket nobody reads would LOSE it (the agent then
+      // waits out its 60s timeout for an answer no server ever saw), so hand it back to the queue
+      // for the next poll instead.
+      if (call && gone) {
+        deliverTool(call, true);
+        return;
+      }
       return json(200, call ? { call } : {});
     }
     let body = {};

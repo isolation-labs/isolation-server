@@ -21,7 +21,7 @@
 import { HOST, PORT, getToken } from "./config.js";
 import { endpointFor } from "./opensandbox.js";
 import { getSessionRecord, sessionForSandbox } from "./sessions.js";
-import { viewsForSandbox, type View } from "./views.js";
+import { getView, viewsForSandbox, type View } from "./views.js";
 import { threadKeyOf } from "./agents.js";
 import { bindingForThread, channelHistory, channelMembers, channelsForSession, envelopeFor, notifyOwner, postToChannel } from "./channels.js";
 
@@ -48,15 +48,31 @@ export const pumpRunning = (viewId: string): boolean => pumps.has(viewId);
 export function startToolPump(view: View): void {
   if (pumps.has(view.id) || view.type !== "agent" || !view.port) return;
   let stopped = false;
-  pumps.set(view.id, {
+  // Only ever remove OUR OWN entry: a pump stopped mid-poll can still fall out of its request a
+  // moment after a replacement was armed, and deleting the map entry blindly would orphan the new
+  // pump (and let a third one start alongside it).
+  const forget = () => {
+    if (pumps.get(view.id) === self) pumps.delete(view.id);
+  };
+  const self = {
     stop: () => {
       stopped = true;
-      pumps.delete(view.id);
+      forget();
     },
-  });
+  };
+  pumps.set(view.id, self);
   void (async () => {
     let failures = 0;
     while (!stopped) {
+      // The view can go out from under a pump (DELETE /views/<id>, a spec change the SPA makes by
+      // delete-then-recreate). View ports are RECYCLED — nextFree only avoids LIVE views — so a
+      // pump still polling a dropped view's port can be handed the NEXT view's parked tool calls
+      // and answer them against the WRONG thread (`threadKeyOf(view)` is the old view's). The
+      // view registry is the authority on whether this pump still has a subject.
+      if (!getView(view.id)) {
+        forget();
+        return;
+      }
       let call: ToolCall | undefined;
       try {
         const ep = await endpointFor(view.sandboxId, view.port);
@@ -69,13 +85,20 @@ export function startToolPump(view: View): void {
         // again. Only a persistent failure gives up — the bridge is then gone or being replaced.
         if (++failures >= MAX_FAILURES) {
           log(`${view.id}: bridge unreachable (${String((e as Error)?.message ?? e)}) — pump stopped`);
-          pumps.delete(view.id);
+          forget();
           return;
         }
         await new Promise((r) => setTimeout(r, 1_000 * failures));
         continue;
       }
       if (!call) continue;
+      // Same check once more: the poll parks for 25s, and the view can have been dropped (and its
+      // port re-issued) while it was waiting. Better the caller's 60s timeout than an answer built
+      // from a stale view's session and thread.
+      if (stopped || !getView(view.id)) {
+        forget();
+        return;
+      }
       let payload: { result?: unknown; error?: string };
       try {
         payload = { result: await runTool(view, call) };
@@ -146,9 +169,29 @@ async function api(sessionId: string, path: string, init: { method?: string; bod
 function brief(v: { id: string; type: string; label?: string | null; target?: { url?: string; appPort?: number } }): Record<string, unknown> {
   const url = v.target?.url;
   // Only a WEB view's url is an address someone else can open: it lives on the sandbox plane and
-  // its random hostname IS the access secret. A localhost url is what the sandbox serves, not a link.
-  const shareable = v.type === "web" && typeof url === "string" && !/^https?:\/\/(localhost|127\.|\[?::1)/i.test(url);
-  return { id: v.id, type: v.type, label: v.label ?? null, shareable, ...(shareable ? { publicUrl: url } : {}), ...(v.target?.appPort ? { appPort: v.target.appPort } : {}) };
+  // its random hostname IS the access secret. Judged on the HOST, not a prefix match: a server the
+  // cloud has served no preview domain to falls back to `<slug>.localhost` (views.ts webUrl), which
+  // resolves on this machine and nowhere else — telling an agent to hand that to a colleague is
+  // handing out a dead link.
+  let host = "";
+  try {
+    host = typeof url === "string" ? new URL(url).hostname.toLowerCase() : "";
+  } catch {
+    host = "";
+  }
+  const local = !host || host === "localhost" || host.endsWith(".localhost") || host.startsWith("127.") || host === "::1" || host === "[::1]";
+  const shareable = v.type === "web" && !local;
+  return {
+    id: v.id,
+    type: v.type,
+    label: v.label ?? null,
+    shareable,
+    ...(shareable ? { publicUrl: url } : {}),
+    // A web view that is NOT shareable still has an address — it just only works on the machine
+    // running this server. Say so rather than answering as if the window had no link at all.
+    ...(!shareable && v.type === "web" && url ? { localUrl: url } : {}),
+    ...(v.target?.appPort ? { appPort: v.target.appPort } : {}),
+  };
 }
 
 async function runTool(view: View, call: ToolCall): Promise<unknown> {
@@ -185,7 +228,9 @@ async function runTool(view: View, call: ToolCall): Promise<unknown> {
         ...b,
         note: b.shareable
           ? "Anyone with that link can open it — the random part of the hostname is the only thing protecting it."
-          : "This window opens on the session screen, which needs a signed-in browser.",
+          : b.localUrl
+            ? "This server has no public preview domain yet, so that address only opens on the machine running it. The window is on the session screen either way."
+            : "This window opens on the session screen, which needs a signed-in browser.",
       };
     }
 
@@ -226,7 +271,10 @@ async function runTool(view: View, call: ToolCall): Promise<unknown> {
     case "session_logs": {
       const tail = Math.min(Math.max(typeof args.tail === "number" ? args.tail : 100, 1), 500);
       const out = await api(s.id, `/sessions/${id}/logs?tail=${tail}`);
-      return out?.available ? { available: true, lines: (out.lines ?? []).map((l: { line: string }) => l.line) } : { available: false, note: "the container is gone — there is nothing left to read" };
+      // The route always answers with its own last-500 window (it ignores the query), so the
+      // `tail` the agent asked for is applied HERE — otherwise every call floods the turn with 500
+      // lines whatever it requested.
+      return out?.available ? { available: true, lines: (out.lines ?? []).slice(-tail).map((l: { line: string }) => l.line) } : { available: false, note: "the container is gone — there is nothing left to read" };
     }
 
     // ── The chat this agent was spoken to in (PLAN §1 I3) ──────────────────────────────────────
@@ -236,7 +284,7 @@ async function runTool(view: View, call: ToolCall): Promise<unknown> {
 
     case "chat_context": {
       const key = threadKeyOf(view);
-      const env = envelopeFor(key);
+      const env = envelopeFor(s.id, key);
       const b = bindingForThread(s.id, key);
       if (!env && !b) return { inChat: false, note: "This conversation is not connected to a chat — you are being talked to from the Isolation session screen." };
       return {
@@ -268,7 +316,7 @@ async function runTool(view: View, call: ToolCall): Promise<unknown> {
       if (!b) throw new Error("this conversation is not connected to a chat");
       const text = str(args.text, 8_000);
       if (!text) throw new Error("text is required");
-      const env = envelopeFor(key);
+      const env = envelopeFor(s.id, key);
       await postToChannel(b.id, { text, ...(env?.thread ? { thread: env.thread } : {}), asAgent: view.agentId });
       return { posted: true, in: b.channelName ?? b.channel };
     }

@@ -151,7 +151,13 @@ export function ensureBridge(view: View): Promise<boolean> {
     p = healBridge(view).finally(() => heals.delete(view.id));
     heals.set(view.id, p);
   }
-  return p;
+  // A healthy bridge is NOT restarted, so nothing else would re-arm a control channel that gave
+  // up on a transient blip — and a chat-driven session has no page whose reload would fix it.
+  // Idempotent, so arming here costs nothing when the pump is already running (PLAN §1 I3).
+  return p.then((ok) => {
+    if (ok) void import("./toolpump.js").then((m) => m.startToolPump(view));
+    return ok;
+  });
 }
 
 async function healBridge(view: View): Promise<boolean> {
