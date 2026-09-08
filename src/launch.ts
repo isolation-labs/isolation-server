@@ -14,7 +14,7 @@ import { restoreWorkspace, type WorkspaceSink } from "./persistence.js";
 import { analyzeLaunch, cleanScratch, fetchDetectionFiles, type AnalysisRepo, type LaunchSpec } from "./analysis.js";
 import { cacheKey, dependencyHash, workspaceHash } from "./hashes.js";
 import { buildDependencyCacheInBackground, cacheImageAvailable, cacheImageTag, reposWithDeps } from "./cache.js";
-import { dockerAvailable, ensureSpecImage, type ImageRegistry } from "./images.js";
+import { dockerAvailable, ensureSpecImage, ensureToolingImage, TOOLING_IMAGE, type ImageRegistry } from "./images.js";
 import { addView, type TerminalStyle, mintViewToken, newWebSlug, viewsForSandbox, type View, type ViewType } from "./views.js";
 import { cloneTarget, installVault, parseVaultManifest, sidecarCreateSpec, vaultCoversHost, type VaultManifest, type VaultSummary } from "./vault.js";
 import { startAgentBridge, syncViewsFile } from "./acpview.js";
@@ -46,7 +46,7 @@ function parseWorkspaceSink(body: LaunchRequest): WorkspaceSink | undefined {
 
 const log = (...a: unknown[]) => console.log("[launch]", ...a);
 
-export const TOOLING_IMAGE = "isolation-server/tooling:0.7"; // 0.6: claude + codex CLIs; 0.7: ACP adapters + goose (PLAN §5d)
+export { TOOLING_IMAGE }; // defined next to the Dockerfile it is built from (images.ts)
 const TERMINAL_PORT = 7681;
 const DIRECTORY_PORT = 8055;
 const AGENT_PORT = 7820; // the in-sandbox ACP bridge behind an agent view (PLAN §5d)
@@ -718,7 +718,9 @@ export async function launch(body: LaunchRequest): Promise<LaunchResult> {
       if (!keepScratch) cleanScratch(scratchId);
     }
   }
-  if (!image) image = TOOLING_IMAGE;
+  // The fallback is BUILT on first use, not assumed: a stale hand-built tag here is how sessions
+  // came up without sshd for two days (images.ts TOOLING_IMAGE).
+  if (!image) image = dockerAvailable() ? await ensureToolingImage((l) => body.onPhase?.(`preparing image · ${l}`)) : TOOLING_IMAGE;
 
   const sandbox = await createSandbox({
     image,

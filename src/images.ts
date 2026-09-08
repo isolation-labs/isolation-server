@@ -83,6 +83,15 @@ export function pushImageInBackground(r: ImageRegistry, localTag: string): void 
 // Multi-arch, apt-based, git + a non-root user: what a workspace with no detectable
 // language gets. Batteries (Node/Python) come from analysis-picked images, not here.
 export const DEFAULT_BASE = "mcr.microsoft.com/devcontainers/base:ubuntu";
+
+// The static fallback image: the tooling layer on DEFAULT_BASE, used when the per-workspace image
+// pipeline cannot run (no docker CLI) or fails. Nothing built it since the spec pipeline landed —
+// the 0.7 on this Mac was a hand-made leftover from 2026-09-04 and predated openssh-server, so
+// every fallback launch silently came up without ssh. Now `ensureToolingImage` builds it from the
+// same Dockerfile as every spec image, and the tag is BUMPED whenever specDockerfile changes.
+//   0.6: claude + codex CLIs; 0.7: ACP adapters + goose (PLAN §5d); 0.8: openssh-server (added to
+//   the Dockerfile 2026-09-06 without a bump — every 0.7 sandbox had no sshd).
+export const TOOLING_IMAGE = "isolation-server/tooling:0.8";
 const NODE_VERSION = "22.14.0";
 const TTYD_VERSION = "1.7.7";
 const FILEBROWSER_VERSION = "2.63.16";
@@ -192,18 +201,46 @@ export async function ensureSpecImage(spec: LaunchSpec, repos: AnalysisRepo[], w
     if (await pullImage(registry, tag)) return tag;
   }
   const base = (await buildDevcontainerBase(spec, repos, wsHash, onLine)) ?? spec.devContainer.image ?? DEFAULT_BASE;
+  await buildToolingLayer(tag, base, onLine, "session image");
+  if (registry) pushImageInBackground(registry, tag);
+  return tag;
+}
+
+// `docker build` the tooling Dockerfile on `base` under `tag`. Build output streams to `onLine`
+// (the launch phase) AND the last lines are kept for the failure log: the phase string is gone
+// the moment the launch moves on, which left "session image build failed" with no trace of WHY.
+async function buildToolingLayer(tag: string, base: string, onLine: ((l: string) => void) | undefined, what: string): Promise<void> {
   const ctx = mkdtempSync(join(tmpdir(), "isolation-server-spec-"));
+  const tail: string[] = [];
   try {
     writeFileSync(join(ctx, "Dockerfile"), specDockerfile(base));
-    onLine?.(`building session image from ${base}`);
-    const ok = await runLogged("docker", ["build", "-t", tag, ctx], onLine);
-    if (!ok || !imageExists(tag)) throw new Error(`session image build failed (base ${base})`);
+    onLine?.(`building ${what} from ${base}`);
+    const ok = await runLogged("docker", ["build", "-t", tag, ctx], (l) => {
+      tail.push(l);
+      if (tail.length > 25) tail.shift();
+      onLine?.(l);
+    });
+    if (!ok || !imageExists(tag)) {
+      log(`${what} build FAILED (${tag} from ${base}) — last build output:\n  ${tail.join("\n  ")}`);
+      throw new Error(`${what} build failed (base ${base})`);
+    }
     log(`built ${tag} from ${base}`);
-    if (registry) pushImageInBackground(registry, tag);
-    return tag;
   } finally {
     rmSync(ctx, { recursive: true, force: true });
   }
+}
+
+// The fallback image, built on first use (see TOOLING_IMAGE). Returns the tag either way: when the
+// build itself fails there is nothing better to hand the runtime, and the launch will report the
+// missing image instead of dying here.
+export async function ensureToolingImage(onLine?: (l: string) => void): Promise<string> {
+  if (imageExists(TOOLING_IMAGE)) return TOOLING_IMAGE;
+  try {
+    await buildToolingLayer(TOOLING_IMAGE, DEFAULT_BASE, onLine, "tooling image");
+  } catch (e) {
+    log(`tooling image unavailable: ${String((e as Error)?.message ?? e)}`);
+  }
+  return TOOLING_IMAGE;
 }
 
 export const dockerAvailable = (): boolean => existsSync("/var/run/docker.sock") || spawnSync("docker", ["version"], { stdio: "ignore" }).status === 0;

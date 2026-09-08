@@ -724,6 +724,10 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!s2 || !v || v.sandboxId !== s2.sandboxId || !mayOpen(actor, s2)) return json(res, 404, { error: "unknown view" });
     if (!modeForView(v.type)) return json(res, 400, { error: `${v.type} views cannot be opened externally` });
     if (!bastion.enabled()) return json(res, 503, { error: "this server has no ssh bastion configured" });
+    // sshd never came up in this sandbox (an image without openssh-server — the bring-up is
+    // best-effort, launch.ts). The bastion would accept the connection and then fail the hop with a
+    // 502 nobody can act on; say so here instead. Not temporary, so not a 503.
+    if (!s2.sshPort) return json(res, 409, { error: "ssh is not available in this session — its image has no sshd. Start a new session (the tooling image rebuilds with openssh-server)" });
     // A route the bastion holds with an EMPTY allow-list is one nobody can open — and that is the
     // normal state for a member with no ssh public key, because sshd still comes up for the
     // bastion's own agent key. Same rule as the dark-bastion case below: never hand out a command
