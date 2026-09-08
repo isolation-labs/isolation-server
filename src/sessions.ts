@@ -30,6 +30,11 @@ export type SessionState = "creating" | "ready" | "stopped" | "error";
 export interface SessionRecord {
   id: string; // s-xxxxxx — what the web sees
   sandboxId?: string; // set once the sandbox exists
+  // WHO launched it — the actor id the Worker proxy stamped on the POST /sessions (x-isolation-actor).
+  // A session is its launcher's: every session/view/sandbox call is answered for the owner only, and
+  // an org owner/admin may just list + delete (mayOpen / mayTearDown below). Absent on a session
+  // launched without the proxy (local / direct use) — such a session is open to the token holder.
+  owner?: string;
   workspaceId?: string;
   environmentId?: string;
   environmentName?: string;
@@ -129,6 +134,29 @@ export const listSessionRecords = (workspaceId?: string): SessionRecord[] =>
 export const sessionForSandbox = (sandboxId: string): SessionRecord | undefined =>
   Object.values(sessions).find((s) => s.sandboxId === sandboxId);
 
+// --- who is asking (2026-09-08) --------------------------------------------------------
+// The master token says "some member of the org this server belongs to"; the Worker proxy adds
+// WHICH one (`x-isolation-actor`) and their org role (`x-isolation-actor-role`). Only the proxy can
+// set them — the server has no public URL, and the proxy drops any copy a client sends — so they
+// are trusted as-is. No header at all = the token holder is using the server directly (local
+// mode, self-host), which stays as open as it always was.
+export interface Actor {
+  id: string;
+  manages: boolean; // org owner/admin — may list + tear down anyone's session, never open it
+}
+export function actorFrom(headers: Record<string, string | string[] | undefined>): Actor | undefined {
+  const id = headers["x-isolation-actor"];
+  if (typeof id !== "string" || !id) return undefined;
+  const role = headers["x-isolation-actor-role"];
+  return { id, manages: role === "owner" || role === "admin" };
+}
+// May this actor OPEN the session — read its state, mint its view tokens, drive its sandbox?
+// Only its launcher (or anyone, when the session or the request carries no identity).
+export const mayOpen = (actor: Actor | undefined, s: SessionRecord | undefined): boolean => !actor || !s?.owner || s.owner === actor.id;
+// May this actor SEE it in a list and DELETE it? The launcher, plus the org's owners/admins — the
+// ops right that lets whoever pays for a metered server stop a forgotten session on it.
+export const mayTearDown = (actor: Actor | undefined, s: SessionRecord | undefined): boolean => mayOpen(actor, s) || !!actor?.manages;
+
 function update(id: string, patch: Partial<SessionRecord>): void {
   const s = sessions[id];
   if (!s) return;
@@ -187,10 +215,11 @@ function viewSpecsFrom(body: DaemonLaunchBody): ViewSpec[] {
 // Launch is minutes-long (image pull, clones); the daemon contract returns the
 // record IMMEDIATELY in state "creating" and the web polls `GET /sessions/:id`,
 // rendering `phase`. The work continues in the background here.
-export function startSession(body: DaemonLaunchBody): SessionRecord {
+export function startSession(body: DaemonLaunchBody, owner?: string): SessionRecord {
   const id = `s-${randomBytes(3).toString("hex")}`;
   const rec: SessionRecord = {
     id,
+    ...(owner ? { owner } : {}),
     workspaceId: body.workspaceId,
     environmentId: body.environmentId,
     environmentName: body.environmentName,
@@ -373,6 +402,7 @@ export function renameSession(id: string, name: string): SessionRecord | undefin
 export function sessionJson(s: SessionRecord): Record<string, unknown> {
   return {
     id: s.id,
+    ...(s.owner ? { owner: s.owner } : {}), // so an admin's org-wide list can say whose it is
     workspaceId: s.workspaceId ?? "",
     ...(s.environmentId ? { environmentId: s.environmentId } : {}),
     ...(s.environmentName ? { environmentName: s.environmentName } : {}),

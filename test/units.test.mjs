@@ -473,3 +473,23 @@ test("the doorman strips OUR master token before handing a request to a sandbox"
   assert.equal(strip({ cookie: "isolation-server_token=a-view-token" }).cookie, "isolation-server_token=a-view-token");
   assert.equal(strip({ cookie: "%%%=1" }).cookie, "%%%=1", "a malformed escape is judged, not thrown on");
 });
+
+// Per-member tenancy (2026-09-08): the Worker proxy says WHO holds the master token; a session is
+// its launcher's, and an org owner/admin gets exactly list + delete on everyone else's.
+test("a session answers its launcher; an org admin may only list + tear down; no identity = open", async () => {
+  const { actorFrom, mayOpen, mayTearDown } = await import("../dist/sessions.js");
+  const mine = { id: "s-1", owner: "u1", state: "ready", createdAt: 0 };
+  const legacy = { id: "s-0", state: "ready", createdAt: 0 }; // launched without the proxy — no owner
+  const u1 = actorFrom({ "x-isolation-actor": "u1", "x-isolation-actor-role": "member" });
+  const u2 = actorFrom({ "x-isolation-actor": "u2", "x-isolation-actor-role": "member" });
+  const admin = actorFrom({ "x-isolation-actor": "u3", "x-isolation-actor-role": "admin" });
+  assert.equal(actorFrom({}), undefined, "no header → no actor");
+  assert.equal(actorFrom({ "x-isolation-actor": "u9", "x-isolation-actor-role": "owner" })?.manages, true);
+  assert.equal(u1?.manages, false);
+
+  assert.ok(mayOpen(u1, mine) && mayTearDown(u1, mine), "the launcher does everything");
+  assert.ok(!mayOpen(u2, mine) && !mayTearDown(u2, mine), "a teammate does nothing");
+  assert.ok(!mayOpen(admin, mine) && mayTearDown(admin, mine), "an admin lists + deletes, never opens");
+  assert.ok(mayOpen(u2, legacy) && mayOpen(undefined, mine), "no owner on the session, or no identity on the request → open");
+  assert.ok(mayOpen(u2, undefined), "a sandbox with no session behind it is not gated here");
+});

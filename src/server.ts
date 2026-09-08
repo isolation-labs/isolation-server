@@ -16,12 +16,16 @@ import { agentJson, getAgent, listAgents, parseRoster, spawnAgent, startAgent, s
 import { bridgePattern, connectorTurn, syncViewsFile } from "./acpview.js";
 import { listHarnesses } from "./harness.js";
 import { pauseSession, resumeSession,
+  actorFrom,
   createSessionView,
   dropSshForSandbox,
   finishSession,
   getSessionRecord,
   listSessionRecords,
+  mayOpen,
+  mayTearDown,
   renameSession,
+  sessionForSandbox,
   sessionChanges,
   sessionJson,
   sessionViews,
@@ -261,6 +265,9 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
 
   // Everything below is the control plane: master token required.
   if (!tokenMatches(bearer(req))) return json(res, 401, { error: "unauthorized" });
+  // …and, through the Worker proxy, WHICH member holds it (sessions.ts: a session is its
+  // launcher's; a foreign one is a 404 everywhere except the list + DELETE an org admin gets).
+  const actor = actorFrom(req.headers);
 
   // The gate's own log tail — the DAEMON's wire shape ({entries, cursor, dropped}),
   // so the web's server-card Logs modal renders it unchanged.
@@ -370,7 +377,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     try {
       const items = await listSandboxes();
       return json(res, 200, {
-        items: items.map((s) => ({ ...s, views: viewsForSandbox(s.id) })),
+        items: items.filter((s) => mayTearDown(actor, sessionForSandbox(s.id))).map((s) => ({ ...s, views: viewsForSandbox(s.id) })),
       });
     } catch (e) {
       return json(res, 502, { error: String((e as Error)?.message ?? e) });
@@ -410,7 +417,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (method === "POST" && url === "/sessions") {
     const body = await readBody(req);
     applyInjectedSandbox(body.sandbox);
-    return json(res, 200, sessionJson(startSession(body as DaemonLaunchBody)));
+    return json(res, 200, sessionJson(startSession(body as DaemonLaunchBody, actor?.id)));
   }
 
   // Re-fetch the SSH bastion coords for an ALREADY-paired server. Pairing does this too, but a
@@ -445,7 +452,8 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     let all = listSessionRecords(q.get("workspace") ?? undefined);
     if (origin === "local") all = all.filter((r) => r.origin === "local");
     else if (origin !== "all") all = all.filter((r) => r.origin !== "local");
-    return json(res, 200, all.map(sessionJson));
+    // The member's own — plus everyone's for an org owner/admin (the ops list; `owner` names whose).
+    return json(res, 200, all.filter((r) => mayTearDown(actor, r)).map(sessionJson));
   }
 
   if (method === "GET" && url === "/credentials") {
@@ -457,7 +465,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (ag) {
     const [, agentId, , act] = ag;
     const rec = getAgent(agentId);
-    if (!rec) return json(res, 404, { error: "unknown agent" });
+    if (!rec || !mayOpen(actor, getSessionRecord(rec.sessionId))) return json(res, 404, { error: "unknown agent" });
     if (method === "GET" && !act) return json(res, 200, agentJson(rec));
     // Conversations are per VIEW now (a view is the thread) — talk through /views/:id/messages.
     if (act === "messages") return json(res, 410, { error: "conversations are per view now — use /views/<viewId>/messages" });
@@ -469,6 +477,9 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const vm = /^\/views\/([a-zA-Z0-9-]+)(\/(view-token|messages))?$/.exec(url);
     if (vm) {
       const [, vid, , action] = vm;
+      // A view is content: reachable by its session's launcher only (a view token IS access).
+      const owning = getView(vid);
+      if (owning && !mayOpen(actor, sessionForSandbox(owning.sandboxId))) return json(res, 404, { error: "unknown view" });
       if (method === "POST" && action === "view-token") {
         if (!getView(vid)) return json(res, 404, { error: "unknown view" });
         return json(res, 200, { token: mintViewToken(vid) });
@@ -525,7 +536,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (th) {
     const [, sid, key] = th;
     const s = getSessionRecord(sid);
-    if (!s?.sandboxId) return json(res, 404, { error: "session not ready" });
+    if (!s?.sandboxId || !mayOpen(actor, s)) return json(res, 404, { error: "session not ready" });
     let v = viewsForSandbox(s.sandboxId).find((x) => x.type === "agent" && x.specKey === key);
     if (method === "GET") return v ? json(res, 200, { messages: [] }) : json(res, 200, { messages: [] });
     if (method === "POST") {
@@ -553,6 +564,10 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const [, id, , action] = sess;
     const s = getSessionRecord(id);
     if (!s) return json(res, 404, { error: "unknown session" });
+    // The bare GET (the list card's poll) and the bare DELETE are the ops pair an org admin gets
+    // on anyone's session; every other action opens it and is the launcher's alone.
+    const ops = !action && (method === "GET" || method === "DELETE");
+    if (!(ops ? mayTearDown(actor, s) : mayOpen(actor, s))) return json(res, 404, { error: "unknown session" });
     try {
       if (method === "GET" && !action) return json(res, 200, sessionJson(s));
       if (method === "DELETE" && !action) {
@@ -671,7 +686,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const [, id, vid] = pv;
     const s = getSessionRecord(id);
     const v = getView(vid);
-    if (!s || !v || v.sandboxId !== s.sandboxId) return json(res, 404, { error: "unknown view" });
+    if (!s || !v || v.sandboxId !== s.sandboxId || !mayOpen(actor, s)) return json(res, 404, { error: "unknown view" });
     const b = await readBody(req);
     const restyling = "style" in b;
     if (restyling && v.type !== "terminal") return json(res, 400, { error: "only terminal views can be restyled" });
@@ -700,7 +715,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const [, id, vid] = nc;
     const s2 = getSessionRecord(id);
     const v = getView(vid);
-    if (!s2 || !v || v.sandboxId !== s2.sandboxId) return json(res, 404, { error: "unknown view" });
+    if (!s2 || !v || v.sandboxId !== s2.sandboxId || !mayOpen(actor, s2)) return json(res, 404, { error: "unknown view" });
     if (!modeForView(v.type)) return json(res, 400, { error: `${v.type} views cannot be opened externally` });
     if (!bastion.enabled()) return json(res, 503, { error: "this server has no ssh bastion configured" });
     // A route the bastion holds with an EMPTY allow-list is one nobody can open — and that is the
@@ -725,6 +740,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const nested = /^\/sessions\/(s-[a-z0-9]+)\/(.+)$/.exec(url);
   if (nested) {
     const sub = nested[2];
+    if (!mayOpen(actor, getSessionRecord(nested[1]))) return json(res, 404, { error: "unknown session" });
     if (method === "POST" && sub === "merge/abort") {
       const s2 = getSessionRecord(nested[1]);
       if (!s2?.sandboxId) return json(res, 404, { error: "unknown session" });
@@ -739,6 +755,10 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const sb = /^\/sandboxes\/([a-zA-Z0-9-]+)(\/(pause|resume|save|sync|logs))?$/.exec(url);
   if (sb) {
     const [, id, , action] = sb;
+    // A sandbox that backs a session is that session's: same launcher-only rule, same
+    // admin-may-delete exception (a raw sandbox with no session stays as open as before).
+    const backing = sessionForSandbox(id);
+    if (backing && !(method === "DELETE" && !action ? mayTearDown(actor, backing) : mayOpen(actor, backing))) return json(res, 404, { error: "unknown sandbox" });
     try {
       if (method === "POST" && (action === "save" || action === "sync")) {
         try {
