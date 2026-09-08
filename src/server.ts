@@ -724,10 +724,19 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!s2 || !v || v.sandboxId !== s2.sandboxId || !mayOpen(actor, s2)) return json(res, 404, { error: "unknown view" });
     if (!modeForView(v.type)) return json(res, 400, { error: `${v.type} views cannot be opened externally` });
     if (!bastion.enabled()) return json(res, 503, { error: "this server has no ssh bastion configured" });
-    // sshd never came up in this sandbox (an image without openssh-server — the bring-up is
-    // best-effort, launch.ts). The bastion would accept the connection and then fail the hop with a
-    // 502 nobody can act on; say so here instead. Not temporary, so not a 503.
-    if (!s2.sshPort) return json(res, 409, { error: "ssh is not available in this session — its image has no sshd. Start a new session (the tooling image rebuilds with openssh-server)" });
+    // sshd never came up in this sandbox. Two causes, both settled at launch time: the image had no
+    // openssh-server, or the launch carried neither an authorized key nor a bastion key, so
+    // `startSshAccess` was never called (launch.ts). The bastion would accept the connection and
+    // then fail the hop with a 502 nobody can act on; say so here instead. Not temporary, so not a
+    // 503. The signal is the record's `sshd`, NOT its `sshPort`: the port belongs to a local
+    // forwarder this process binds, and it is dropped and re-bound on every restart (sessions.ts)
+    // while the bastion hop never touches it — reading the port here would tell a member with a
+    // perfectly healthy session to throw it away. And it is only settled once the launch IS: views
+    // are scaffolded (and listed to the web) while the session is still `creating`, so answer
+    // "not yet" until then. `sshd` undefined on a finished session = a record from before the
+    // field existed: unknown, so fall through rather than refuse.
+    if (s2.state === "creating") return json(res, 503, { error: "this session is still starting — ssh is not up yet" });
+    if (s2.sshd === false) return json(res, 409, { error: "ssh was never brought up in this session — start a new session (its sandbox has no sshd running)" });
     // A route the bastion holds with an EMPTY allow-list is one nobody can open — and that is the
     // normal state for a member with no ssh public key, because sshd still comes up for the
     // bastion's own agent key. Same rule as the dark-bastion case below: never hand out a command

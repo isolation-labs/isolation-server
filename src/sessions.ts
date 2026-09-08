@@ -52,6 +52,12 @@ export interface SessionRecord {
   // The port `ssh -p` reaches this session on, when ssh is open for it (a key was installed AND
   // sshd came up). Absent = no ssh; the web shows the command only when this is set.
   sshPort?: number;
+  // Whether sshd really came up INSIDE the sandbox (launch.ts `out.ssh`). Distinct from `sshPort`,
+  // which records a forwarder THIS process binds and therefore drops on every restart: the bastion
+  // hop does not use that forwarder at all, so "can this session be reached over ssh?" has to be
+  // answered from something that survives a restart. `undefined` = a record written before the
+  // field existed, i.e. unknown — never read as "no".
+  sshd?: boolean;
   // The member's PUBLIC keys, kept so a bastion route can be registered (or re-registered on a
   // reconnect) long after the launch body is gone. Public keys — nothing here is a secret.
   authorizedKeys?: string[];
@@ -283,7 +289,7 @@ export function startSession(body: DaemonLaunchBody, owner?: string): SessionRec
         bastion.unregisterSandbox(out.sandbox.id);
         if (sshPort) closeSsh(id);
       }
-      update(id, { sandboxId: out.sandbox.id, state: "ready", phase: undefined, viewsPending: 0, ...(out.vault ? { vault: out.vault } : {}), ...(sshPort ? { sshPort } : {}) });
+      update(id, { sandboxId: out.sandbox.id, state: "ready", phase: undefined, viewsPending: 0, sshd: Boolean(out.ssh), ...(out.vault ? { vault: out.vault } : {}), ...(sshPort ? { sshPort } : {}) });
       log(`${id} ready (sandbox ${out.sandbox.id.slice(0, 8)})${rec.roster?.length ? `, ${rec.roster.length} agent(s)` : ""}`);
     })
     .catch((e: Error) => {

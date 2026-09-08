@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { hostClone, type AnalysisRepo, type LaunchSpec } from "./analysis.js";
 import { HOME } from "./config.js";
+import { TOOLING_VERSION } from "./hashes.js";
 
 const log = (...a: unknown[]) => console.log("[images]", ...a);
 
@@ -86,12 +87,22 @@ export const DEFAULT_BASE = "mcr.microsoft.com/devcontainers/base:ubuntu";
 
 // The static fallback image: the tooling layer on DEFAULT_BASE, used when the per-workspace image
 // pipeline cannot run (no docker CLI) or fails. Nothing built it since the spec pipeline landed —
-// the 0.7 on this Mac was a hand-made leftover from 2026-09-04 and predated openssh-server, so
+// the `0.7` on this Mac was a hand-made leftover from 2026-09-04 and predated openssh-server, so
 // every fallback launch silently came up without ssh. Now `ensureToolingImage` builds it from the
-// same Dockerfile as every spec image, and the tag is BUMPED whenever specDockerfile changes.
-//   0.6: claude + codex CLIs; 0.7: ACP adapters + goose (PLAN §5d); 0.8: openssh-server (added to
-//   the Dockerfile 2026-09-06 without a bump — every 0.7 sandbox had no sshd).
-export const TOOLING_IMAGE = "isolation-server/tooling:0.8";
+// same Dockerfile as every spec image, and the tag reuses the version spec images ALREADY key on
+// (hashes.ts TOOLING_VERSION) instead of a second one bumped by hand: two knobs for one Dockerfile
+// is exactly how the stale image happened — spec images rebuilt for openssh-server, the fallback
+// tag didn't move, and it kept resolving to an sshd-less layer built two versions earlier.
+//
+// SINGLE-SEGMENT NAME, deliberately — same shape as `specImageTag`, and it is a security property,
+// not a style choice. This tag is built locally and never pushed or pulled, but the runtime is
+// handed it as a plain image uri, so a name docker cannot find locally is one docker RESOLVES: a
+// two-part `isolation-server/tooling` means `docker.io/isolation-server/tooling`, a Hub namespace
+// anyone may register, and this image is now expected to be absent (a failed build returns the tag
+// anyway) — exactly the case that would reach for it. One segment resolves under `library/`, which
+// only Docker publishes, so a missing fallback fails closed instead of running a stranger's image
+// as the sandbox.
+export const TOOLING_IMAGE = `isolation-server-tooling:v${TOOLING_VERSION}`;
 const NODE_VERSION = "22.14.0";
 const TTYD_VERSION = "1.7.7";
 const FILEBROWSER_VERSION = "2.63.16";
