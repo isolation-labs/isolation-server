@@ -537,3 +537,32 @@ test("a chat binds to one session; the thread key is stable per (chat, agent) an
   assert.equal(ch.detachChannel(a.id), false, "detaching twice is not an error the second time either");
   assert.equal(ch.bindingForThread("s-1", key), undefined);
 });
+
+// The pump's tool list is offered in one file (sandbox/iso-mcp.mjs, which the agent sees) and
+// handled in another (src/toolpump.ts, which answers). They are edited at different times, and a
+// tool that is offered but unhandled reads to an agent as a broken product rather than a missing
+// feature — so the claim that they cannot drift is made true here rather than in a comment.
+test("every tool the in-sandbox MCP offers over the control channel is one the server handles", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { PUMP_TOOLS } = await import("../dist/toolpump.js");
+  const root = new URL("..", import.meta.url).pathname;
+
+  // What iso-mcp forwards, and what it advertises to the harness.
+  const mcp = readFileSync(join(root, "sandbox", "iso-mcp.mjs"), "utf8");
+  const forwarded = new Set([...mcp.matchAll(/const SERVER_TOOLS = new Set\(\[([\s\S]*?)\]\)/g)].flatMap((m) => [...m[1].matchAll(/"([a-z_]+)"/g)].map((x) => x[1])));
+  const advertised = new Set([...mcp.matchAll(/name: "([a-z_]+)"/g)].map((m) => m[1]));
+
+  // What the server's switch actually answers.
+  const pump = readFileSync(join(root, "src", "toolpump.ts"), "utf8");
+  const handled = new Set([...pump.matchAll(/^\s{4}case "([a-z_]+)": \{/gm)].map((m) => m[1]));
+
+  const declared = new Set(PUMP_TOOLS);
+  for (const t of declared) {
+    assert.ok(forwarded.has(t), `${t} is declared but iso-mcp does not forward it`);
+    assert.ok(advertised.has(t), `${t} is declared but iso-mcp does not offer it to the harness`);
+    assert.ok(handled.has(t), `${t} is declared but the server has no handler`);
+  }
+  for (const t of forwarded) assert.ok(declared.has(t), `iso-mcp forwards ${t}, which is not in PUMP_TOOLS`);
+  for (const t of handled) assert.ok(declared.has(t), `the server handles ${t}, which is not in PUMP_TOOLS`);
+  assert.ok(declared.size >= 13);
+});

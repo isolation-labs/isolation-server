@@ -350,5 +350,24 @@ async function runTool(view: View, call: ToolCall): Promise<unknown> {
   }
 }
 
-/** The tool names the in-sandbox MCP offers over the pump. One list, so the two cannot drift. */
-export const PUMP_TOOLS = ["views_list", "view_create", "view_link", "view_delete", "ssh_command", "session_logs", "session_save", "chat_context", "chat_history", "chat_members", "chat_reply", "chat_post", "chat_notify_owner"] as const;
+/**
+ * The tools the in-sandbox MCP offers over the pump. This list is LOAD-BEARING: a unit test reads
+ * `sandbox/iso-mcp.mjs` and this file and fails if either drifts from it, because the three places
+ * are edited at different times and a tool that is offered but unhandled reads to an agent as a
+ * broken product rather than a missing feature.
+ */
+export const PUMP_TOOLS = [
+  "views_list",
+  "view_create",
+  "view_link",
+  "view_delete",
+  "ssh_command",
+  "session_logs",
+  "session_save",
+  "chat_context",
+  "chat_history",
+  "chat_members",
+  "chat_reply",
+  "chat_post",
+  "chat_notify_owner",
+] as const;
