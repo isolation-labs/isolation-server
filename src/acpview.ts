@@ -66,6 +66,9 @@ export async function startAgentBridge(view: View): Promise<void> {
     ISO_VIEW_ID: view.id,
     ISO_MEMORY_PATH: memoryPath(rec.def.id),
     ISO_VIEWS_FILE: VIEWS_FILE,
+    // The bridge's own port: `iso-mcp` parks its outward tool calls there and the server picks
+    // them up (PLAN §1 I3). Loopback only — the agent still cannot dial anything else.
+    ISO_BRIDGE_PORT: String(view.port ?? ""),
   };
   let m;
   try {
@@ -107,6 +110,10 @@ export async function startAgentBridge(view: View): Promise<void> {
   await run(view.sandboxId, `mkdir -p ${JSON.stringify(home)} ${JSON.stringify(dirname(threadPath(key)))}; pkill -f ${JSON.stringify(bridgePattern(view))} || true`).catch(() => undefined);
   // execd's background mode owns the process's lifetime — no nohup/& wrappers.
   await run(view.sandboxId, `${NODE} ${BRIDGE_PATH} ${view.port} ${cfgPath}`, { cwd: WORKSPACE, background: true });
+  // The control channel follows the bridge: a restarted bridge has an empty queue and no poller,
+  // and the pump may have given up while it was down (PLAN §1 I3). Idempotent. Lazily imported —
+  // toolpump reaches into sessions.ts, which reaches back here through launch.ts.
+  void import("./toolpump.js").then((m) => m.startToolPump(view));
   log(`${view.id}: bridge on :${view.port} for "${rec.def.name}" (${rec.def.harness}${sessionId ? `, resuming ${sessionId.slice(0, 8)}` : ""})`);
 }
 

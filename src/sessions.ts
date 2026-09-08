@@ -303,6 +303,7 @@ export function startSession(body: DaemonLaunchBody, owner?: string): SessionRec
         // A view added while the launch was still running registered its bastion route already;
         // the views go below, and a route whose view is gone can never be unregistered by id.
         bastion.unregisterSandbox(dead);
+        void stopPumps(dead); // before the views go — the pumps are keyed by view id
         dropViewsForSandbox(dead);
         dropSink(dead);
         forgetThreads(dead);
@@ -316,6 +317,15 @@ export function startSession(body: DaemonLaunchBody, owner?: string): SessionRec
   return rec;
 }
 
+// The control channel's pumps (PLAN §1 I3) are stopped whenever a sandbox stops existing or
+// pauses. Imported lazily on purpose: toolpump reads THIS module's session records, and a static
+// import both ways is a module cycle — which is exactly how bastion's constants ended up being
+// read before they were initialized.
+const stopPumps = async (sandboxId: string): Promise<void> => {
+  const { stopToolPumpsFor } = await import("./toolpump.js");
+  stopToolPumpsFor(sandboxId);
+};
+
 export async function finishSession(id: string): Promise<void> {
   const s = sessions[id];
   if (!s) return;
@@ -324,6 +334,7 @@ export async function finishSession(id: string): Promise<void> {
   closeSsh(id);
   if (s.sandboxId) bastion.unregisterSandbox(s.sandboxId);
   if (s.sandboxId) {
+    await stopPumps(s.sandboxId); // stop polling a bridge that is about to stop existing
     await deleteSandbox(s.sandboxId).catch(() => undefined);
     dropViewsForSandbox(s.sandboxId);
     dropSink(s.sandboxId);
@@ -440,6 +451,9 @@ export async function pauseSession(id: string): Promise<SessionRecord | undefine
   if (!s?.sandboxId) return undefined;
   if (s.state !== "stopped") {
     const { pauseSandbox } = await import("./opensandbox.js");
+    // The bridges stop with the sandbox, so polling them would only burn retries until the pumps
+    // gave up. They come back on resume.
+    await stopPumps(s.sandboxId);
     await pauseSandbox(s.sandboxId);
     update(id, { state: "stopped" });
   }
@@ -457,6 +471,7 @@ export async function resumeSession(id: string, vaultBlob?: unknown): Promise<Se
     const { resumeSandbox } = await import("./opensandbox.js");
     await resumeSandbox(s.sandboxId);
     update(id, { state: "ready" });
+    await (await import("./toolpump.js")).startToolPumpsFor(s.sandboxId); // the agents can reach out again (PLAN §1 I3)
   }
   const manifest = vaultBlob !== undefined ? parseVaultManifest(sealedOrInline(vaultBlob)) : undefined;
   if (manifest) {

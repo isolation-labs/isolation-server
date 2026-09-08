@@ -223,3 +223,83 @@ test("bridge: an adapter that cannot spawn fails the start instead of hanging", 
     b.stop();
   }
 });
+
+// ── The control channel (PLAN §1, I3) ───────────────────────────────────────────────────────────
+// `iso-mcp` inside the sandbox can only reach loopback, and the sandbox cannot dial the server. So
+// the server polls the bridge for parked tool calls and posts the answers back. What is worth
+// proving is the shape of that inversion: a call waits for its own answer, a call made while
+// nobody is polling fails fast instead of hanging an agent's turn, and a poll with nothing to do
+// comes back empty rather than never.
+
+const post = async (port, path, body) =>
+  (await fetch(`http://127.0.0.1:${port}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })).json();
+
+test("control channel: a parked tool call waits for the server's answer, and comes back with it", async () => {
+  const b = await startBridge();
+  try {
+    // The server's poll arms the channel. Without one the call is refused (next test).
+    const first = fetch(`http://127.0.0.1:${b.port}/iso-tool/next?wait=5000`).then((r) => r.json());
+    await new Promise((r) => setTimeout(r, 50));
+
+    const call = post(b.port, "/iso-tool", { tool: "view_create", args: { type: "web", url: "http://localhost:3000/" } });
+    const taken = await first;
+    assert.equal(taken.call.tool, "view_create");
+    assert.deepEqual(taken.call.args, { type: "web", url: "http://localhost:3000/" });
+    assert.ok(taken.call.id, "a call is addressable, so its answer can find it");
+
+    const delivered = await post(b.port, "/iso-tool/result", { id: taken.call.id, result: { publicUrl: "https://abc.isolation.cc/" } });
+    assert.equal(delivered.delivered, true);
+    assert.deepEqual((await call).result, { publicUrl: "https://abc.isolation.cc/" });
+
+    // An error travels the same way, and reads as an error to the agent.
+    const poll2 = fetch(`http://127.0.0.1:${b.port}/iso-tool/next?wait=5000`).then((r) => r.json());
+    await new Promise((r) => setTimeout(r, 50));
+    const call2 = post(b.port, "/iso-tool", { tool: "ssh_command", args: {} });
+    const taken2 = await poll2;
+    await post(b.port, "/iso-tool/result", { id: taken2.call.id, error: "this session has no terminal" });
+    assert.equal((await call2).error, "this session has no terminal");
+
+    // An answer for a call nobody is waiting on is reported, not thrown.
+    assert.equal((await post(b.port, "/iso-tool/result", { id: "t999", result: {} })).delivered, false);
+  } finally {
+    b.stop();
+  }
+});
+
+test("control channel: with no server polling, a tool call fails at once instead of hanging the agent", async () => {
+  const b = await startBridge();
+  try {
+    const r = await fetch(`http://127.0.0.1:${b.port}/iso-tool`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tool: "views_list", args: {} }),
+    });
+    assert.equal(r.status, 503);
+    assert.match((await r.json()).error, /not connected/);
+
+    const health = await (await fetch(`http://127.0.0.1:${b.port}/health`)).json();
+    assert.equal(health.pump.connected, false, "health says whether anything is listening");
+  } finally {
+    b.stop();
+  }
+});
+
+test("control channel: a poll with nothing to do returns empty, and a queued call is picked up by the next poll", async () => {
+  const b = await startBridge();
+  try {
+    // Arm the channel, let that poll expire with nothing queued.
+    const started = Date.now();
+    const empty = await (await fetch(`http://127.0.0.1:${b.port}/iso-tool/next?wait=1000`)).json();
+    assert.deepEqual(empty, {});
+    assert.ok(Date.now() - started >= 900, "it waited rather than answering immediately");
+
+    // A call parked between polls is queued and handed to the NEXT one.
+    const call = post(b.port, "/iso-tool", { tool: "session_logs", args: { tail: 5 } });
+    const taken = await (await fetch(`http://127.0.0.1:${b.port}/iso-tool/next?wait=2000`)).json();
+    assert.equal(taken.call.tool, "session_logs");
+    await post(b.port, "/iso-tool/result", { id: taken.call.id, result: { lines: ["ok"] } });
+    assert.deepEqual((await call).result, { lines: ["ok"] });
+  } finally {
+    b.stop();
+  }
+});

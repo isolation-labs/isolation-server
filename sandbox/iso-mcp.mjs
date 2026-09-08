@@ -4,13 +4,20 @@
 // the views (windows) of the session, its own memory note, and a way to hand a message to
 // another agent's thread (the bridge's POST /prompt). Env, all set by isolation-server:
 //   ISO_AGENT_ID ISO_AGENT_NAME ISO_HARNESS ISO_SESSION_ID ISO_WORKSPACE_ID ISO_VIEW_ID
-//   ISO_MEMORY_PATH ISO_VIEWS_FILE
+//   ISO_MEMORY_PATH ISO_VIEWS_FILE ISO_BRIDGE_PORT
+//
+// Tools split in two by WHERE the answer lives. The first group is inside the sandbox (files, other
+// agents' bridges on loopback). The second group — the session's windows, its public preview links,
+// its ssh command, its logs — is known only to isolation-server, which the sandbox cannot dial. Those
+// are parked on the bridge and answered by the server, which long-polls for them (PLAN §1 I3): the
+// agent gets a plain tool call, and no credential or route out of the sandbox is created for it.
 import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
 
 const env = process.env;
 const MEMORY_PATH = env.ISO_MEMORY_PATH || "/workspace/.isolation/agents/unknown/memory.md";
+const BRIDGE_PORT = Number(env.ISO_BRIDGE_PORT || 0);
 const VIEWS_FILE = env.ISO_VIEWS_FILE || "/tmp/.iso-views.json";
 const MAX_MEMORY = 32 * 1024;
 
@@ -49,12 +56,97 @@ const TOOLS = [
     description: "Send a message to another agent's thread in this session and wait for its reply. Address it by agent name or agent view id (see `views`). Use this to delegate or ask; coordinate through the shared files otherwise.",
     inputSchema: { type: "object", properties: { to: { type: "string", description: "agent name or view id" }, text: { type: "string" } }, required: ["to", "text"], additionalProperties: false },
   },
+  // ── The session, from outside the sandbox (answered by isolation-server) ──────────────────────
+  {
+    name: "views_list",
+    description: "The session's windows and their links: which are terminals, editors, file browsers or web previews, and which of them have a public address you can share.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "view_create",
+    description:
+      "Open a window on this session. A 'web' view with a url like http://localhost:3000 publishes what you are serving on that port at a PUBLIC address — this is how you show someone the preview of what you built. 'terminal' opens a shell (optionally running a command), 'code' an editor, 'directory' a file browser.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        type: { type: "string", enum: ["web", "terminal", "code", "directory"] },
+        url: { type: "string", description: "web only: what you serve inside the sandbox, e.g. http://localhost:3000/" },
+        dir: { type: "string", description: "a directory under /workspace to start in" },
+        command: { type: "string", description: "terminal only: a command to run in it" },
+        label: { type: "string", description: "a name for the window" },
+      },
+      required: ["type"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "view_link",
+    description: "The address of one window. A web view's link is public — anyone who has it can open it. Everything else opens only in a signed-in browser.",
+    inputSchema: { type: "object", properties: { viewId: { type: "string" } }, required: ["viewId"], additionalProperties: false },
+  },
+  {
+    name: "view_delete",
+    description: "Close a window. The session keeps running; a web view's public address stops working.",
+    inputSchema: { type: "object", properties: { viewId: { type: "string" } }, required: ["viewId"], additionalProperties: false },
+  },
+  {
+    name: "ssh_command",
+    description: "The command someone types to get into this sandbox from their own terminal. It only works for a person whose ssh public key is on the account that launched this session.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "session_logs",
+    description: "This sandbox's own boot and lifecycle output — how it started, what the clone did, why something failed.",
+    inputSchema: { type: "object", properties: { tail: { type: "number", description: "how many lines (default 100, max 500)" } }, additionalProperties: false },
+  },
+  {
+    name: "session_save",
+    description: "Commit and merge this session's files back into the workspace, so the work survives the session ending.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
 ];
+
+// Tools whose answer lives on the host: forwarded verbatim over the control channel.
+const SERVER_TOOLS = new Set(["views_list", "view_create", "view_link", "view_delete", "ssh_command", "session_logs", "session_save"]);
+
+// One outward tool call: park it on the bridge, wait for the server's answer. The bridge fails it
+// fast when no server is polling, so an agent is never left hanging on a session nobody is watching.
+function viaServer(tool, args = {}) {
+  return new Promise((resolve) => {
+    if (!BRIDGE_PORT) return resolve(fail("this session's control channel is not available"));
+    const payload = JSON.stringify({ tool, args });
+    const req = http.request(
+      { host: "127.0.0.1", port: BRIDGE_PORT, path: "/iso-tool", method: "POST", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) }, timeout: 90_000 },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          const raw = Buffer.concat(chunks).toString("utf8");
+          let j;
+          try {
+            j = JSON.parse(raw);
+          } catch {
+            return resolve(fail(`${tool}: unreadable answer`));
+          }
+          if (j.error) return resolve(fail(j.error));
+          resolve(text(JSON.stringify(j.result ?? {}, null, 2)));
+        });
+      },
+    );
+    req.on("error", (e) => resolve(fail(`${tool}: ${e.message}`)));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(fail(`${tool}: the Isolation server did not answer in time`));
+    });
+    req.end(payload);
+  });
+}
 
 const text = (t) => ({ content: [{ type: "text", text: t }] });
 const fail = (t) => ({ content: [{ type: "text", text: t }], isError: true });
 
 async function callTool(name, args) {
+  if (SERVER_TOOLS.has(name)) return viaServer(name, args ?? {});
   switch (name) {
     case "session_info":
       return text(

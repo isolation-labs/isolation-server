@@ -406,6 +406,10 @@ async function startViewProcess(sandboxId: string, view: View): Promise<void> {
     // The ACP bridge: materializes the agent (its HOME, harness files, credential) and holds
     // the harness session; the page speaks ACP to it through the doorman (PLAN §5d).
     await startAgentBridge(view);
+    // …and the control channel that lets the agent reach back OUT of the sandbox (PLAN §1 I3):
+    // the server polls this bridge for the tool calls `iso-mcp` parks there. (startAgentBridge
+    // arms it too; this covers a view whose bridge was already running.)
+    void import("./toolpump.js").then((m) => m.startToolPump(view));
   } else if (view.type === "directory") {
     // filebrowser emits absolute asset paths, so it must own its public base URL —
     // the doorman forwards the UNSTRIPPED path for directory views to match.

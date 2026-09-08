@@ -490,6 +490,75 @@ async function onClientMessage(c, msg) {
   }
 }
 
+// --- the CONTROL CHANNEL (PLAN §1, I3) --------------------------------------------
+//
+// `iso-mcp` runs INSIDE the sandbox and can only reach loopback; isolation-server runs on the host
+// and the sandbox cannot dial it (no host.docker.internal on Linux, no unix socket on Docker
+// Desktop — the finding that shaped the old daemon's tool pump). So the direction is inverted: the
+// SERVER long-polls this bridge for work, runs it, and posts the answer back. Both legs are
+// requests the server makes, which is the only direction that works.
+//
+// Three endpoints, all loopback:
+//   POST /iso-tool          (from iso-mcp)  park a call, wait for its answer
+//   GET  /iso-tool/next     (from server)   take the next parked call, or nothing after a wait
+//   POST /iso-tool/result   (from server)   answer one
+//
+// A call made while no server is polling fails fast rather than hanging an agent's turn: an agent
+// that cannot reach the outside should be told so in one second, not in five minutes.
+const pendingTools = new Map(); // id → { call, resolve, timer }
+const toolQueue = [];
+const toolWaiters = [];
+let lastPumpPoll = 0;
+let toolSeq = 0;
+const PUMP_STALE_MS = 90_000;
+const TOOL_TIMEOUT_MS = 60_000;
+
+function parkTool(tool, args) {
+  return new Promise((resolve) => {
+    const id = `t${++toolSeq}`;
+    const call = { id, tool, args };
+    const entry = {
+      call,
+      resolve,
+      timer: setTimeout(() => {
+        pendingTools.delete(id);
+        resolve({ error: `${tool} timed out — the Isolation server did not answer` });
+      }, TOOL_TIMEOUT_MS),
+    };
+    pendingTools.set(id, entry);
+    const waiter = toolWaiters.shift();
+    if (waiter) waiter(call);
+    else toolQueue.push(call);
+  });
+}
+
+function takeTool(waitMs) {
+  lastPumpPoll = Date.now();
+  const queued = toolQueue.shift();
+  if (queued) return Promise.resolve(queued);
+  return new Promise((resolve) => {
+    const done = (call) => {
+      clearTimeout(timer);
+      const i = toolWaiters.indexOf(done);
+      if (i >= 0) toolWaiters.splice(i, 1);
+      resolve(call ?? null);
+    };
+    const timer = setTimeout(() => done(null), waitMs);
+    toolWaiters.push(done);
+  });
+}
+
+function answerTool(id, payload) {
+  const entry = pendingTools.get(id);
+  if (!entry) return false;
+  pendingTools.delete(id);
+  clearTimeout(entry.timer);
+  entry.resolve(payload);
+  return true;
+}
+
+const pumpConnected = () => Date.now() - lastPumpPoll < PUMP_STALE_MS;
+
 // --- HTTP + WebSocket server ------------------------------------------------------
 
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -501,7 +570,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify(body));
   };
   if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
-    return json(200, { ok: true, viewId: cfg.viewId, agent: cfg.agent, phase, error: lastError || undefined, sessionId: sessionId ?? null, alive, clients: clients.size, turn: turnInfo(), buffered: buffer.length });
+    return json(200, { ok: true, viewId: cfg.viewId, agent: cfg.agent, phase, error: lastError || undefined, sessionId: sessionId ?? null, alive, clients: clients.size, turn: turnInfo(), buffered: buffer.length, pump: { connected: pumpConnected(), pending: pendingTools.size } });
   }
   if (req.method === "POST" && url.pathname === "/prompt") {
     // A connector turn (Slack, Buzz, another agent's thread_send): one prompt, the reply text.
@@ -532,6 +601,39 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
+  // The control channel (above). Read the body once for both POSTs.
+  if (url.pathname.startsWith("/iso-tool")) {
+    if (req.method === "GET" && url.pathname === "/iso-tool/next") {
+      const wait = Math.min(Math.max(Number(url.searchParams.get("wait")) || 25_000, 1_000), 55_000);
+      const call = await takeTool(wait);
+      return json(200, call ? { call } : {});
+    }
+    let body = {};
+    if (req.method === "POST") {
+      const chunks = [];
+      for await (const ch of req) {
+        chunks.push(ch);
+        if (chunks.reduce((n, b) => n + b.length, 0) > 1024 * 1024) return json(413, { error: "too large" });
+      }
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+      } catch {
+        return json(400, { error: "bad json" });
+      }
+    }
+    if (req.method === "POST" && url.pathname === "/iso-tool/result") {
+      return json(200, { delivered: answerTool(String(body.id ?? ""), body) });
+    }
+    if (req.method === "POST" && url.pathname === "/iso-tool") {
+      const tool = typeof body.tool === "string" ? body.tool : "";
+      if (!tool) return json(400, { error: "tool required" });
+      if (!pumpConnected()) return json(503, { error: "the Isolation server is not connected to this session right now — try again in a moment" });
+      const out = await parkTool(tool, body.args && typeof body.args === "object" ? body.args : {});
+      return json(200, out);
+    }
+    return json(404, { error: "not found" });
+  }
+
   json(404, { error: "not found" });
 });
 
