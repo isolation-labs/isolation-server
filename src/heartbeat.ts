@@ -40,8 +40,9 @@ const currentUrl = (): string => {
   return tunnelManager.publicUrl() ?? `http://localhost:${PORT}`;
 };
 
-// One beat at a time: beatNow() (pairing, `up`, POST /vpc) can land while a scheduled beat is in
-// flight; the follow-up is queued rather than raced, and re-reads the whole state anyway.
+// One beat at a time: beatNow() (a quick-tunnel reconnect minting a new URL) can land while a
+// scheduled beat is in flight; the follow-up is queued rather than raced, and re-reads the whole
+// state anyway — so the LAST beat always carries the current URL, never a stale one landing late.
 let inFlight: Promise<void> | undefined;
 let queued = false;
 

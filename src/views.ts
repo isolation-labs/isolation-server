@@ -87,10 +87,10 @@ export const viewBySlug = (slug: string): View | undefined => Object.values(view
 // routes `<slug>.<domain>` from the label alone — no lookup, no table, nothing for the heartbeat to
 // report, and the slot number itself never appears. Only THIS server's doorman knows the tail, so a
 // recycled slot or a guessed prefix reaches a doorman that answers "unknown app" (404).
-// The tail is the whole secret: 16 base32 chars = 80 bits, far beyond what can be enumerated
-// through the Worker one hostname at a time, and short enough to paste. No prefix (unpaired, or a
+// The tail is the whole secret: 26 base32 chars = 130 bits, preserving the minimum 128-bit
+// public-address invariant independently of the shared routing prefix. No prefix (unpaired, or a
 // backend without a pool) → the bare tail, reachable at `<tail>.localhost` only.
-export const SLUG_TAIL_LEN = 16;
+export const SLUG_TAIL_LEN = 26;
 const PREFIX_RE = /^[a-z2-7]{6,16}$/;
 export const newWebSlug = (prefix: string | undefined = getVpc()?.previewPrefix): string => {
   const alphabet = "abcdefghijklmnopqrstuvwxyz234567";

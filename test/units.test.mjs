@@ -54,12 +54,12 @@ test("applyAiCred replaces the whole pair — no leftover env var out-ranks or r
   assert.deepEqual(env2, { ANTHROPIC_API_KEY: "isogw_abc" });
 });
 
-test("web slugs: `<prefix>-<16 base32>` when the cloud handed this server a preview prefix, the bare tail otherwise", () => {
+test("web slugs preserve at least 128 secret bits independently of the routing prefix", () => {
   const bare = views.newWebSlug(undefined);
-  assert.match(bare, /^[a-z2-7]{16}$/);
+  assert.match(bare, /^[a-z2-7]{26}$/);
   assert.notEqual(views.newWebSlug(undefined), bare);
-  assert.match(views.newWebSlug("k7mq2xa4wz"), /^k7mq2xa4wz-[a-z2-7]{16}$/);
-  assert.match(views.newWebSlug("NOT a prefix"), /^[a-z2-7]{16}$/, "a malformed prefix is ignored, never a broken label");
+  assert.match(views.newWebSlug("k7mq2xa4wz"), /^k7mq2xa4wz-[a-z2-7]{26}$/);
+  assert.match(views.newWebSlug("NOT a prefix"), /^[a-z2-7]{26}$/, "a malformed prefix is ignored, never a broken label");
 });
 
 test("parseRoster: shapes, defaults, and garbage rejection", () => {

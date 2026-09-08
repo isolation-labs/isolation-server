@@ -150,6 +150,17 @@ export async function startConfigured(opts?: { forceRelay?: boolean }): Promise<
   if (getVpc()) {
     syncVpcListener();
     await privateTunnelManager.start().catch((e: Error) => log(`private tunnel bring-up failed: ${e.message}`));
+    // A server paired BEFORE the cloud handed out preview prefixes has creds on disk but no
+    // `previewPrefix`, and nothing else ever re-fetches the block: its new web views would mint a
+    // bare slug the Worker cannot route (previews only, and silently). One re-fetch at boot in
+    // exactly that case — the same idempotent repair POST /vpc runs — and the prefix persists after.
+    // NOT on the pair path (`forceRelay`): there the vpc block on disk still belongs to the PREVIOUS
+    // pairing, so this would query the old backend and could land its answer — a revocation, even —
+    // on top of the fresh one the claim is about to fetch. That path fetches the block itself.
+    const paired = getPairing();
+    if (!opts?.forceRelay && paired && !getVpc()?.previewPrefix) {
+      void fetchVpcConfig(paired.backendUrl, paired.connectionId, paired.secret);
+    }
   }
 }
 
