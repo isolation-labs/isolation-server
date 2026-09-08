@@ -819,6 +819,12 @@ let vpcListener: ReturnType<typeof createServer> | undefined;
 let vpcListenerIp: string | undefined;
 let vpcRetry: NodeJS.Timeout | undefined;
 let vpcNagged: string | undefined; // the ip we already complained about — say it once, retry quietly
+// Why the private ip is not bound, when it is not. The cloud reaches this server ONLY at that
+// address, so an unbound ip means "up but unreachable" — and after a reboot (macOS drops lo0
+// aliases, and launchd starts the gate with no terminal to prompt in) nobody would otherwise learn
+// why. The heartbeat is outbound and still works, so this rides it to the web UI.
+let vpcBindError: string | undefined;
+export const vpcStatusDetail = (): string | undefined => vpcBindError;
 export function syncVpcListener(): void {
   const ip = getVpc()?.ip;
   if (ip === vpcListenerIp) return;
@@ -837,6 +843,10 @@ export function syncVpcListener(): void {
     // macOS binds nothing but 127.0.0.1 until lo0 gets the alias. Keep retrying: the moment the
     // alias exists the bind succeeds, with no restart of anything — the alias is the only step
     // a person has to take, and it must never also require a second one.
+    vpcBindError =
+      e.code === "EADDRNOTAVAIL" && process.platform === "darwin"
+        ? `the loopback alias for ${ip} is missing (macOS drops them on reboot) — run \`isolation up\` on that machine, or: sudo ifconfig lo0 alias ${ip}`
+        : `cannot bind ${ip}:${PORT} (${e.code})`;
     if (vpcNagged !== ip) {
       vpcNagged = ip;
       log(`cannot bind ${ip}:${PORT} (${e.code}) — on macOS run: sudo ifconfig lo0 alias ${ip}  (retrying every 15s until it binds)`);
@@ -846,6 +856,7 @@ export function syncVpcListener(): void {
   });
   s.listen(PORT, ip, () => {
     vpcNagged = undefined;
+    vpcBindError = undefined;
     log(`listening on http://${ip}:${PORT} (private tunnel)`);
   });
   vpcListener = s;

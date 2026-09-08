@@ -5,6 +5,7 @@
 import { PORT, getPairing, getVpc, isLoopbackOrigin, savePairing, saveEnrollment, saveBastion, saveSandbox, saveVpc, getMachineId } from "./config.js";
 import { GATE_VERSION } from "./version.js";
 import { privateTunnelManager, sandboxTunnelManager, tunnelManager } from "./tunnel.js";
+import { vpcStatusDetail } from "./server.js";
 import { allWebSlugs } from "./views.js";
 import { bastion } from "./bastion.js";
 
@@ -76,6 +77,10 @@ async function beat(): Promise<void> {
   // Public web previews: every live web view's slug, so the Worker can route
   // https://<slug>.<domain>/ to this server. The cloud replaces its list per beat.
   body.webSlugs = allWebSlugs();
+  // "Up, but the cloud cannot reach me, and here is the fix." The private ip is the ONLY way in, so
+  // an unbound one is invisible from the outside — this is the only channel that still works.
+  const detail = vpcStatusDetail();
+  if (detail) body.unreachable = detail;
   // Report the URL only when changed — and never report the loopback fallback to a
   // REMOTE cloud (a beat racing the tunnel dial would clobber a still-valid tunnel URL).
   if (url !== lastSent && (isLoopbackOrigin(p.backendUrl) || !isLoopbackOrigin(url))) body.url = url;
