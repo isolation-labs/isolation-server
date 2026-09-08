@@ -329,6 +329,10 @@ const stopPumps = async (sandboxId: string): Promise<void> => {
 export async function finishSession(id: string): Promise<void> {
   const s = sessions[id];
   if (!s) return;
+  // A chat bound to this session OUTLIVES it (PLAN §1 I3, owner call): it says the session ended
+  // and its agents stop answering, rather than the channel vanishing with the compute. Best-effort
+  // and first — a chat we cannot reach must not hold up the teardown.
+  await (await import("./channels.js")).endChannelsFor(id).catch(() => undefined);
   // Before the sandbox goes: the listener would otherwise stay open on a port pointing at nothing,
   // and the bastion would keep advertising routes into a sandbox that no longer exists.
   closeSsh(id);
@@ -341,6 +345,7 @@ export async function finishSession(id: string): Promise<void> {
     forgetThreads(s.sandboxId);
   }
   dropSessionAgents(id);
+  (await import("./channels.js")).forgetEnvelopesFor(id);
   delete sessions[id];
   persist();
 }

@@ -22,6 +22,8 @@ import { HOST, PORT, getToken } from "./config.js";
 import { endpointFor } from "./opensandbox.js";
 import { getSessionRecord, sessionForSandbox } from "./sessions.js";
 import { viewsForSandbox, type View } from "./views.js";
+import { threadKeyOf } from "./agents.js";
+import { bindingForThread, channelHistory, channelMembers, channelsForSession, envelopeFor, notifyOwner, postToChannel } from "./channels.js";
 
 const log = (...a: unknown[]) => console.log("[toolpump]", ...a);
 
@@ -227,6 +229,68 @@ async function runTool(view: View, call: ToolCall): Promise<unknown> {
       return out?.available ? { available: true, lines: (out.lines ?? []).map((l: { line: string }) => l.line) } : { available: false, note: "the container is gone — there is nothing left to read" };
     }
 
+    // ── The chat this agent was spoken to in (PLAN §1 I3) ──────────────────────────────────────
+    // Agnostic by construction: the connector is a field on the envelope, never a different tool.
+    // Every one of these is scoped to the CALLING view's own thread, so an agent can only read and
+    // answer the conversation it is part of.
+
+    case "chat_context": {
+      const key = threadKeyOf(view);
+      const env = envelopeFor(key);
+      const b = bindingForThread(s.id, key);
+      if (!env && !b) return { inChat: false, note: "This conversation is not connected to a chat — you are being talked to from the Isolation session screen." };
+      return {
+        inChat: true,
+        connector: env?.connector ?? b?.connector,
+        channel: { id: env?.channel ?? b?.channel, name: env?.channelName ?? b?.channelName, direct: env?.direct ?? false },
+        lastMessage: env ? { from: { id: env.sender, name: env.senderName }, messageId: env.messageId, thread: env.thread } : null,
+        agentsHere: b?.agents ?? [],
+      };
+    }
+
+    case "chat_history": {
+      const b = bindingForThread(s.id, threadKeyOf(view));
+      if (!b) throw new Error("this conversation is not connected to a chat");
+      const limit = typeof args.limit === "number" ? args.limit : 30;
+      return { messages: await channelHistory(b.id, limit) };
+    }
+
+    case "chat_members": {
+      const b = bindingForThread(s.id, threadKeyOf(view));
+      if (!b) throw new Error("this conversation is not connected to a chat");
+      return { members: await channelMembers(b.id) };
+    }
+
+    // Answer in the same place the question came from — in-thread when the connector threads.
+    case "chat_reply": {
+      const key = threadKeyOf(view);
+      const b = bindingForThread(s.id, key);
+      if (!b) throw new Error("this conversation is not connected to a chat");
+      const text = str(args.text, 8_000);
+      if (!text) throw new Error("text is required");
+      const env = envelopeFor(key);
+      await postToChannel(b.id, { text, ...(env?.thread ? { thread: env.thread } : {}), asAgent: view.agentId });
+      return { posted: true, in: b.channelName ?? b.channel };
+    }
+
+    // Say something nobody asked for — a build finished, a test broke.
+    case "chat_post": {
+      const b = bindingForThread(s.id, threadKeyOf(view));
+      if (!b) throw new Error("this conversation is not connected to a chat");
+      const text = str(args.text, 8_000);
+      if (!text) throw new Error("text is required");
+      await postToChannel(b.id, { text, asAgent: view.agentId });
+      return { posted: true, in: b.channelName ?? b.channel };
+    }
+
+    // Reach the person who launched this session, wherever they are.
+    case "chat_notify_owner": {
+      const text = str(args.text, 4_000);
+      if (!text) throw new Error("text is required");
+      const b = bindingForThread(s.id, threadKeyOf(view)) ?? channelsForSession(s.id).find((x) => x.status === "live");
+      return await notifyOwner(s.id, text, b?.connector);
+    }
+
     // Commit the session's file tree back into the workspace, so the work survives the session.
     case "session_save": {
       const out = await api(s.id, `/sessions/${id}/save`, { method: "POST", body: {} });
@@ -239,4 +303,4 @@ async function runTool(view: View, call: ToolCall): Promise<unknown> {
 }
 
 /** The tool names the in-sandbox MCP offers over the pump. One list, so the two cannot drift. */
-export const PUMP_TOOLS = ["views_list", "view_create", "view_link", "view_delete", "ssh_command", "session_logs", "session_save"] as const;
+export const PUMP_TOOLS = ["views_list", "view_create", "view_link", "view_delete", "ssh_command", "session_logs", "session_save", "chat_context", "chat_history", "chat_members", "chat_reply", "chat_post", "chat_notify_owner"] as const;

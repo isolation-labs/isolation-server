@@ -481,3 +481,54 @@ test("a session answers its launcher; an org admin may only list + tear down; no
   assert.ok(mayOpen(u2, legacy) && mayOpen(undefined, mine), "no owner on the session, or no identity on the request → open");
   assert.ok(mayOpen(u2, undefined), "a sandbox with no session behind it is not gated here");
 });
+
+// Channels (PLAN §1 I3): a chat bound to a session, connector-agnostic by construction. The
+// binding is what makes an inbound mention find a thread and an outbound post find a channel, so
+// what is worth pinning is the KEY (stable across sessions), the re-attach rule, and the envelope
+// each agent's tools read.
+test("a chat binds to one session; the thread key is stable per (chat, agent) and re-attaching is the same binding", async () => {
+  const ch = await import("../dist/channels.js");
+
+  const key = ch.channelThreadKey("slack", "C123", "ag-isla");
+  assert.equal(key, "chan-slack-C123-ag-isla");
+  assert.equal(ch.channelThreadKey("slack", "C123", "ag-isla"), key, "the same chat and agent is the same conversation, always");
+  assert.notEqual(ch.channelThreadKey("slack", "C123", "ag-other"), key, "each agent keeps its own thread in one channel");
+  assert.notEqual(ch.channelThreadKey("buzz", "C123", "ag-isla"), key, "and the connector is part of the identity");
+  // A channel id from outside cannot smuggle a path, a separator or a `..` into the key — it
+  // becomes a filename, and the key is the only thing standing between the two.
+  const hostile = ch.channelThreadKey("slack", "../../etc/passwd", "a");
+  assert.ok(!/[./\\]/.test(hostile), hostile);
+
+  const a = ch.attachChannel({ sessionId: "s-1", connector: "slack", channel: "C123", channelName: "#build", agents: ["ag-isla"] });
+  assert.equal(a.status, "live");
+  assert.equal(ch.channelBinding(a.id)?.channelName, "#build");
+
+  // Attaching the same chat again is the SAME binding (a retry must not double-deliver), and it
+  // takes the new agent list.
+  const again = ch.attachChannel({ sessionId: "s-1", connector: "slack", channel: "C123", agents: ["ag-isla", "ag-two"] });
+  assert.equal(again.id, a.id);
+  assert.deepEqual(again.agents, ["ag-isla", "ag-two"]);
+  assert.equal(ch.channelsForSession("s-1").length, 1);
+
+  // A different chat, or the same chat on another session, is a different binding.
+  const b = ch.attachChannel({ sessionId: "s-1", connector: "buzz", channel: "grp1", agents: ["ag-isla"] });
+  assert.notEqual(b.id, a.id);
+  assert.equal(ch.channelsForSession("s-1").length, 2);
+  assert.equal(ch.channelsForSession("s-2").length, 0, "bindings are per session");
+
+  // A thread key resolves back to its binding — this is how a tool call finds the chat to answer.
+  assert.equal(ch.bindingForThread("s-1", ch.channelThreadKey("slack", "C123", "ag-two"))?.id, a.id);
+  assert.equal(ch.bindingForThread("s-1", ch.channelThreadKey("slack", "C123", "ag-nobody")), undefined);
+  assert.equal(ch.bindingForThread("s-2", ch.channelThreadKey("slack", "C123", "ag-isla")), undefined, "another session's thread is not yours");
+
+  // The envelope of the message being answered: remembered per thread, read by chat_context.
+  const env = { connector: "slack", channel: "C123", channelName: "#build", sender: "U9", senderName: "Dani", thread: "1699.1" };
+  ch.rememberEnvelope(key, env);
+  assert.deepEqual(ch.envelopeFor(key), env);
+  ch.rememberEnvelope(key, undefined);
+  assert.deepEqual(ch.envelopeFor(key), env, "an envelope-less turn does not erase where the conversation is");
+
+  assert.equal(ch.detachChannel(a.id), true);
+  assert.equal(ch.detachChannel(a.id), false, "detaching twice is not an error the second time either");
+  assert.equal(ch.bindingForThread("s-1", key), undefined);
+});

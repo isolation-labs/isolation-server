@@ -14,6 +14,7 @@ import { dropView, dropViewsForSandbox, ensureRouteId, getView, isSlugPrefix, mi
 import { forgetExecd, run } from "./execd.js";
 import { agentJson, getAgent, listAgents, parseRoster, spawnAgent, startAgent, stopAgent } from "./agents.js";
 import { bridgePattern, connectorTurn, syncViewsFile } from "./acpview.js";
+import { attachChannel, channelThreadKey, channelsForSession, detachChannel, rememberEnvelope, type ChatEnvelope } from "./channels.js";
 import { listHarnesses } from "./harness.js";
 import { pauseSession, resumeSession,
   actorFrom,
@@ -578,8 +579,58 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         v = await scaffoldView(s.sandboxId, { type: "agent", specKey: key, agentId: rec.def.id, label: typeof b.label === "string" ? b.label : rec.def.name });
         if (!v) return json(res, 502, { error: "could not create the thread's view" });
       }
-      const out = await connectorTurn(v, text, typeof b.from === "string" ? b.from : "channel");
+      // WHERE this message came from (PLAN §1 I3): the agent asks for it with `chat_context`, and
+      // `chat_reply` answers in the same thread. Remembered per thread key — one live envelope per
+      // conversation, which is exactly what "the message I am answering" means.
+      const envelope = parseEnvelope(b.envelope);
+      rememberEnvelope(key, envelope);
+      const from = typeof b.from === "string" ? b.from : envelope ? `${envelope.connector}:${envelope.senderName ?? envelope.sender ?? "someone"}` : "channel";
+      // A connector that cannot hold a request open for a turn that takes minutes (Slack must ack
+      // in three seconds) asks for the reply to be delivered instead: we answer at once and the
+      // agent's own `chat_reply` carries the answer back when the turn ends.
+      if (b.async === true) {
+        const view = v;
+        void connectorTurn(view, text, from)
+          .then(async (out) => {
+            if ("error" in out) return;
+            const { postToChannel } = await import("./channels.js");
+            const bind = (await import("./channels.js")).bindingForThread(sid, key);
+            if (bind && out.reply.text.trim()) await postToChannel(bind.id, { text: out.reply.text, ...(envelope?.thread ? { thread: envelope.thread } : {}), asAgent: view.agentId }).catch(() => undefined);
+          })
+          .catch(() => undefined);
+        return json(res, 202, { accepted: true, viewId: v.id });
+      }
+      const out = await connectorTurn(v, text, from);
       return "error" in out ? json(res, 502, out) : json(res, 200, { ...out, viewId: v.id });
+    }
+  }
+
+  // A chat bound to this session (PLAN §1 I3): the cloud attaches a channel with the agents that
+  // are in it, and detaches when it is disconnected. The binding is what makes an inbound mention
+  // find its thread and an outbound `chat_post` find its channel.
+  const ch = /^\/sessions\/(s-[a-z0-9]+)\/channels(\/([A-Za-z0-9-]+))?$/.exec(url);
+  if (ch) {
+    const [, sid, , bindingId] = ch;
+    const s = getSessionRecord(sid);
+    if (!s || !mayOpen(actor, s)) return json(res, 404, { error: "unknown session" });
+    if (method === "GET") return json(res, 200, { channels: channelsForSession(sid) });
+    if (method === "POST" && !bindingId) {
+      const b = await readBody(req);
+      const connector = typeof b.connector === "string" ? b.connector.trim().slice(0, 30) : "";
+      const channel = typeof b.channel === "string" ? b.channel.trim().slice(0, 200) : "";
+      if (!connector || !channel) return json(res, 400, { error: "connector and channel required" });
+      const wanted = Array.isArray(b.agents) ? b.agents.filter((a: unknown): a is string => typeof a === "string") : [];
+      // Only agents this session actually runs — a binding naming a stranger would route a
+      // mention into a thread with nobody in it.
+      const roster = listAgents(sid);
+      const agents = (wanted.length ? wanted : roster.map((a) => a.def.id)).filter((id) => roster.some((a) => a.def.id === id));
+      if (!agents.length) return json(res, 400, { error: "none of those agents are in this session" });
+      const bind = attachChannel({ sessionId: sid, connector, channel, channelName: typeof b.channelName === "string" ? b.channelName.slice(0, 200) : undefined, agents });
+      return json(res, 201, { ...bind, threads: agents.map((a) => ({ agentId: a, threadKey: channelThreadKey(connector, channel, a) })) });
+    }
+    if (method === "DELETE" && bindingId) {
+      const gone = detachChannel(bindingId);
+      return gone ? json(res, 200, { ok: true }) : json(res, 404, { error: "unknown binding" });
     }
   }
 
@@ -881,4 +932,25 @@ export function startServer(): void {
   };
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
+}
+
+// The chat envelope a connector sends with an inbound turn. Bounded and shape-checked here because
+// it comes from OUTSIDE (the cloud relays what a chat app said), and it is shown to an agent.
+function parseEnvelope(raw: unknown): ChatEnvelope | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const o = raw as Record<string, unknown>;
+  const str = (v: unknown, max = 200): string | undefined => (typeof v === "string" && v.trim() ? v.trim().slice(0, max) : undefined);
+  const connector = str(o.connector, 30);
+  const channel = str(o.channel);
+  if (!connector || !channel) return undefined;
+  return {
+    connector,
+    channel,
+    ...(str(o.channelName) ? { channelName: str(o.channelName)! } : {}),
+    ...(o.direct === true ? { direct: true } : {}),
+    ...(str(o.sender) ? { sender: str(o.sender)! } : {}),
+    ...(str(o.senderName) ? { senderName: str(o.senderName)! } : {}),
+    ...(str(o.messageId) ? { messageId: str(o.messageId)! } : {}),
+    ...(str(o.thread) ? { thread: str(o.thread)! } : {}),
+  };
 }

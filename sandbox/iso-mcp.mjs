@@ -104,10 +104,57 @@ const TOOLS = [
     description: "Commit and merge this session's files back into the workspace, so the work survives the session ending.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
+  // ── The chat you were spoken to in (Slack, Buzz, …) ───────────────────────────────────────────
+  {
+    name: "chat_context",
+    description:
+      "Where this conversation is happening: which chat app, which channel or direct message, and who sent the message you are answering. Call this first when someone refers to 'here', 'this channel', or a person by name — and to find out whether you are in a chat at all.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "chat_history",
+    description: "The recent messages of this chat, oldest first — what was said before you were brought in. Read it when the request depends on earlier context you were not given.",
+    inputSchema: { type: "object", properties: { limit: { type: "number", description: "how many messages (default 30, max 100)" } }, additionalProperties: false },
+  },
+  {
+    name: "chat_members",
+    description: "Who is in this chat — the people and the other agents, with the names to address them by.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "chat_reply",
+    description:
+      "Say something in the chat right now, in the same thread the message came from. Your normal answer is already delivered when your turn ends — use this only to say something BEFORE you finish, like 'this will take a few minutes'.",
+    inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"], additionalProperties: false },
+  },
+  {
+    name: "chat_post",
+    description: "Post to the channel unprompted — a build finished, a test broke, the preview is ready. Use it sparingly: every message notifies people.",
+    inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"], additionalProperties: false },
+  },
+  {
+    name: "chat_notify_owner",
+    description: "Send a direct message to the person who launched this session, wherever they are. For something they need to know and nobody else does.",
+    inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"], additionalProperties: false },
+  },
 ];
 
 // Tools whose answer lives on the host: forwarded verbatim over the control channel.
-const SERVER_TOOLS = new Set(["views_list", "view_create", "view_link", "view_delete", "ssh_command", "session_logs", "session_save"]);
+const SERVER_TOOLS = new Set([
+  "views_list",
+  "view_create",
+  "view_link",
+  "view_delete",
+  "ssh_command",
+  "session_logs",
+  "session_save",
+  "chat_context",
+  "chat_history",
+  "chat_members",
+  "chat_reply",
+  "chat_post",
+  "chat_notify_owner",
+]);
 
 // One outward tool call: park it on the bridge, wait for the server's answer. The bridge fails it
 // fast when no server is polling, so an agent is never left hanging on a session nobody is watching.
