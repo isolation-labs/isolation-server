@@ -388,6 +388,14 @@ async function startViewProcess(sandboxId: string, view: View): Promise<void> {
       `c="$ISO_VIEW_CMD"; unset ISO_VIEW_CMD; cd "${dir}" 2>/dev/null || cd /workspace; ` +
       `if ! tmux has-session -t ${s} 2>/dev/null; then tmux new-session -d -s ${s} -c "$PWD"; tmux set-option -t ${s} window-size latest; ` +
       `if [ -n "$c" ]; then tmux send-keys -t ${s} -l "$c"; tmux send-keys -t ${s} Enter; fi; fi; ` +
+      // Mouse mode, or the scroll wheel does not scroll: tmux holds the terminal's ALTERNATE screen,
+      // and a browser terminal with no scrollback of its own translates wheel events into cursor
+      // keys — so scrolling back through output typed ^[[A^[[B into whatever was running. With mouse
+      // on, tmux receives the wheel itself and scrolls its own history, which is what a user means.
+      // Set GLOBALLY (-g) and outside the has-session branch so sessions created before this — and
+      // the `new -A` fallback below — pick it up too. (Native text selection then needs Shift held,
+      // the standard trade in every ttyd+tmux setup.)
+      `tmux set-option -g mouse on 2>/dev/null || true; ` +
       `exec ttyd --writable -p ${view.port}${tt.args} tmux new -A -s ${s}`;
     await run(sandboxId, script, {
       cwd: "/workspace",
