@@ -372,8 +372,10 @@ test("ensureSshCapability pulls AUDIT_WRITE back, keeps every other drop", () =>
 const cfgMod = await import("../dist/config.js");
 
 test("vpc config round-trips and a domain-only sandbox config is legal", () => {
-  cfgMod.saveVpc({ creds: "tok", ip: "127.9.9.9" });
-  assert.deepEqual(cfgMod.getVpc(), { creds: "tok", ip: "127.9.9.9" });
+  // The block is CREDS ONLY: a pool slot's tunnel is the selector, so there is no per-server
+  // address to persist (an `ip` from a pre-slot build on disk is inert — nothing reads it).
+  cfgMod.saveVpc({ creds: "tok" });
+  assert.deepEqual(cfgMod.getVpc(), { creds: "tok" });
   cfgMod.saveVpc(undefined);
   assert.equal(cfgMod.getVpc(), undefined);
   // The web plane no longer needs creds: the Worker delivers previews over the private tunnel.

@@ -220,9 +220,10 @@ class SandboxTunnelManager {
 
 export const sandboxTunnelManager = new SandboxTunnelManager();
 
-// The PRIVATE tunnel: the cloud-minted named tunnel with no ingress and no DNS,
-// reachable only by the Worker's cf1:network binding at this server's unique loopback ip. Nothing to
-// scan for — there is no URL. QUIC is required by Workers VPC. Same restart/backoff as the relay.
+// The PRIVATE tunnel: the cloud-minted named tunnel with no ingress and no DNS, reachable only by
+// the Worker's cf1:network binding for this server's pool slot — the tunnel IS the selector, and
+// behind it the server is plain 127.0.0.1:8090. Nothing to scan for — there is no URL. QUIC is
+// required by Workers VPC. Same restart/backoff as the relay.
 class PrivateTunnelManager {
   private child: ChildProcess | undefined;
   private up = false;

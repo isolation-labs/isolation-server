@@ -233,7 +233,7 @@ function claimFor(host: string): { slug: string; claimed: boolean } | undefined 
 //
 // When the cloud's Worker proxies a public web preview to us over the private tunnel it cannot
 // rely on forwarding the real Host: `Host` is a forbidden header for fetch(), so a `headers.set`
-// can be silently dropped and we would see the tunnel's own address (127.x.y.z:8090) instead of
+// can be silently dropped and we would see the address it dialled (127.0.0.1:8090) instead of
 // `<slug>.<domain>`. The Worker sends `x-forwarded-host` for exactly this. It is a LIST header and
 // arrives as a comma-joined string (or repeated); the first entry is the original client's.
 const forwardedHost = (req: IncomingMessage): string => {
@@ -250,7 +250,7 @@ function publicSlug(req: IncomingMessage): { slug: string; claimed: boolean } | 
   const direct = claimFor(hostOnly(req.headers.host));
   if (direct) return direct;
   // A forwarded host, by contrast, claims ONLY a label that names a live web view. The cloud dials
-  // the VIEW plane by this server's private address on purpose (preview.ts serveView: the public
+  // the VIEW plane at the loopback address behind the tunnel on purpose (preview.ts serveView: the public
   // plane would otherwise 404 it) while still forwarding the browser's `v--<serverId>.<domain>`
   // — so a label that is not a preview slug MUST fall through to `/v/` and its per-view token
   // gate rather than being answered with "unknown app".

@@ -141,8 +141,8 @@ export async function startConfigured(opts?: { forceRelay?: boolean }): Promise<
   // The SSH bastion: an outbound control connection that publishes `ssh <routeId>@<host>` for every
   // ssh-shaped view. A server with no bastion config just stays on the local forwarder.
   bastion.startIfConfigured();
-  // The private tunnel: the cloud's only way in. Bind the ip first so the first
-  // request the Worker sends after "Registered tunnel connection" has something to land on.
+  // The private tunnel: the cloud's only way in. The main listener is already up by the time this
+  // runs, so the first request the Worker sends after "Registered tunnel connection" lands.
   if (getVpc()) {
     syncVpcListener();
     await privateTunnelManager.start().catch((e: Error) => log(`private tunnel bring-up failed: ${e.message}`));
@@ -170,7 +170,7 @@ function applyInjectedSandbox(s: unknown): void {
 }
 
 // The server's PRIVATE tunnel (POST /api/pair/vpc — same auth as the bastion coords).
-// The cloud mints it once and returns the same pair after; we run the tunnel and bind on the ip.
+// The cloud claims a pool slot once and returns the same one after; we just run its tunnel.
 // A backend with no managed tier answers `{vpc: null}` and this server stays loopback-only.
 async function fetchVpcConfig(backendUrl: string, connectionId: string, secret: string): Promise<void> {
   try {
@@ -801,7 +801,7 @@ function makeServer() {
 // binding pinned to its pool tunnel, and everything behind that tunnel is just 127.0.0.1:8090 — the
 // binding is the selector, so no per-server address exists to bind. (Until 2026-09-08 the cloud
 // allocated one loopback ip per server and this bound it too, which needed `sudo ifconfig lo0 alias`
-// on macOS and silently broke on every reboot. docs/vpc-plan.md has the measurements.)
+// on macOS and silently broke on every reboot.)
 //
 // Kept as a no-op so the call sites that follow config changes (pairing, POST /vpc, detach) do not
 // have to care, and so an older config with a stale `ip` cannot resurrect the old behaviour.

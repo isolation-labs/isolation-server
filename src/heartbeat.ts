@@ -138,7 +138,8 @@ export function detach(): void {
   saveSandbox(undefined);
   void sandboxTunnelManager.stop();
   // And the private tunnel: the cloud minted it, the cloud revoked us — it must not keep a way in.
-  // The listener on the private ip goes with it (dynamic import: server.ts imports this module).
+  // (The syncVpcListener call is the config-followed hook, now a no-op — there is no second
+  // listener any more; dynamic import because server.ts imports this module.)
   saveVpc(undefined);
   void privateTunnelManager.stop();
   void import("./server.js").then((m) => m.syncVpcListener()).catch(() => undefined);
