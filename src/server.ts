@@ -10,7 +10,7 @@ import { deleteSandbox, getSandbox, listSandboxes, osbHealthy, pauseSandbox, res
 import { handlePublicWebRequest, handlePublicWebUpgrade, handleViewRequest, handleViewUpgrade, invalidateEndpoints } from "./doorman.js";
 import { launch, restartTerminal, sanitizeStyle, type LaunchRequest } from "./launch.js";
 import { sinkFor, abortMerge, dropSink, saveWorkspace, syncWorkspace } from "./persistence.js";
-import { dropView, dropViewsForSandbox, ensureRouteId, getView, mintViewToken, updateView, viewsForSandbox, type View } from "./views.js";
+import { dropView, dropViewsForSandbox, ensureRouteId, getView, isSlugPrefix, mintViewToken, updateView, viewsForSandbox, type View } from "./views.js";
 import { forgetExecd, run } from "./execd.js";
 import { agentJson, getAgent, listAgents, parseRoster, spawnAgent, startAgent, stopAgent } from "./agents.js";
 import { bridgePattern, connectorTurn, syncViewsFile } from "./acpview.js";
@@ -154,11 +154,14 @@ export async function startConfigured(opts?: { forceRelay?: boolean }): Promise<
     // `previewPrefix`, and nothing else ever re-fetches the block: its new web views would mint a
     // bare slug the Worker cannot route (previews only, and silently). One re-fetch at boot in
     // exactly that case — the same idempotent repair POST /vpc runs — and the prefix persists after.
+    // The test is `isSlugPrefix`, not "is something there": a prefix persisted in a shape newWebSlug
+    // no longer mints with (an older build accepted 6-16 chars) is exactly as unroutable as none at
+    // all, and truthiness would let it sit there forever without a single re-ask.
     // NOT on the pair path (`forceRelay`): there the vpc block on disk still belongs to the PREVIOUS
     // pairing, so this would query the old backend and could land its answer — a revocation, even —
     // on top of the fresh one the claim is about to fetch. That path fetches the block itself.
     const paired = getPairing();
-    if (!opts?.forceRelay && paired && !getVpc()?.previewPrefix) {
+    if (!opts?.forceRelay && paired && !isSlugPrefix(getVpc()?.previewPrefix)) {
       void fetchVpcConfig(paired.backendUrl, paired.connectionId, paired.secret);
     }
   }
@@ -242,7 +245,10 @@ async function fetchVpcConfig(backendUrl: string, connectionId: string, secret: 
     // The preview prefix rides along: new web views prefix their slug with it (views.ts newWebSlug).
     // Persisted even when the creds did not change, so a server paired before prefixes were handed
     // out picks it up on its next `up` / POST /vpc without a tunnel restart.
-    const previewPrefix = typeof v?.previewPrefix === "string" && /^[a-z2-7]{6,16}$/.test(v.previewPrefix) ? v.previewPrefix : undefined;
+    // Exactly the shape newWebSlug will actually use — anything else is dropped rather than stored,
+    // so the boot repair above keeps re-asking instead of silently minting unroutable bare slugs.
+    const previewPrefix = isSlugPrefix(v?.previewPrefix) ? v.previewPrefix : undefined;
+    if (v?.previewPrefix != null && previewPrefix === undefined) log("the cloud sent a preview prefix of an unexpected shape — ignored; web views stay on <slug>.localhost");
     if (!unchanged) saveVpc({ creds, ...(previewPrefix ? { previewPrefix } : {}) });
     else if (previewPrefix && cur?.previewPrefix !== previewPrefix) saveVpc({ ...cur!, previewPrefix });
     if (!unchanged) await privateTunnelManager.stop();

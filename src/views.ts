@@ -93,9 +93,13 @@ export const viewBySlug = (slug: string): View | undefined => Object.values(view
 // `<suffix>.localhost` only.
 export const SLUG_TAIL_LEN = 10;
 const PREFIX_RE = /^[a-z2-7]{10}$/;
+// The ONE shape a routing prefix may have. Whatever accepts a prefix from the cloud must use this
+// (server.ts fetchVpcConfig): a prefix stored but not usable here is the silent failure mode — the
+// slugs mint bare, the Worker cannot route them, and the boot repair sees a prefix and stops asking.
+export const isSlugPrefix = (p: unknown): p is string => typeof p === "string" && PREFIX_RE.test(p);
 export const newWebSlug = (prefix: string | undefined = getVpc()?.previewPrefix): string => {
   const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
-  const route = typeof prefix === "string" && PREFIX_RE.test(prefix) ? prefix : "";
+  const route = isSlugPrefix(prefix) ? prefix : "";
   // With a shorter suffix, explicitly avoid reusing another live view's address.
   for (let attempt = 0; attempt < 100; attempt++) {
     const tail = [...randomBytes(SLUG_TAIL_LEN)].map((b) => alphabet[b % 32]).join("");
