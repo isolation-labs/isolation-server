@@ -20,6 +20,8 @@
     "test": "npm run build && node --test test/*.test.mjs"
   },
   "dependencies": {
+    "@noble/curves": "^1.9.7",
+    "@scure/base": "^1.2.6",
     "http-proxy-3": "^1.20.5",
     "ssh2": "^1.17.0"
   },

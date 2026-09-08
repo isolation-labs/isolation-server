@@ -593,21 +593,13 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       // in three seconds) asks for the reply to be delivered instead: we answer at once and the
       // agent's own `chat_reply` carries the answer back when the turn ends.
       if (b.async === true) {
+        // The same tail Buzz's relay path runs (channelturn.ts): find the thread's view, take the
+        // turn, post the answer back. One door, so a Slack turn and a Buzz turn cannot drift.
         const view = v;
-        void connectorTurn(view, text, from)
-          .then(async (out) => {
-            // The caller already has its 202, so a failure here reaches nobody unless it is
-            // logged: an async turn that dies (or answers into a chat this session was never
-            // bound to) would otherwise be indistinguishable from one still thinking.
-            if ("error" in out) return log(`${sid}/${key}: async turn failed — ${out.error}`);
-            const { bindingForThread, postToChannel } = await import("./channels.js");
-            const bind = bindingForThread(sid, key);
-            if (!bind) return log(`${sid}/${key}: async turn answered but no chat is bound to this thread — the reply was dropped`);
-            if (out.reply.text.trim()) {
-              await postToChannel(bind.id, { text: out.reply.text, ...(envelope?.thread ? { thread: envelope.thread } : {}), asAgent: view.agentId }).catch((e: Error) => log(`${sid}/${key}: could not deliver the async reply — ${e?.message ?? e}`));
-            }
-          })
-          .catch((e: Error) => log(`${sid}/${key}: async turn threw — ${e?.message ?? e}`));
+        void (async () => {
+          const { deliverChannelTurn } = await import("./channelturn.js");
+          await deliverChannelTurn(sid, key, view.agentId ?? "", text, envelope ?? { connector: "channel", channel: key });
+        })().catch((e: Error) => log(`${sid}/${key}: async turn threw — ${e?.message ?? e}`));
         return json(res, 202, { accepted: true, viewId: v.id });
       }
       const out = await connectorTurn(v, text, from);
@@ -636,7 +628,25 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       const agents = (wanted.length ? wanted : roster.map((a) => a.def.id)).filter((id) => roster.some((a) => a.def.id === id));
       if (!agents.length) return json(res, 400, { error: "none of those agents are in this session" });
       const bind = attachChannel({ sessionId: sid, connector, channel, channelName: typeof b.channelName === "string" ? b.channelName.slice(0, 200) : undefined, agents });
-      return json(res, 201, { ...bind, threads: agents.map((a) => ({ agentId: a, threadKey: channelThreadKey(connector, channel, a) })) });
+      // BUZZ runs here rather than on the cloud (PLAN §1 I5): reading a channel means holding a
+      // relay subscription and posting means signing with the agent's own key. Both arrive sealed
+      // with the binding and live only in this process's memory.
+      let npubs: Record<string, string> | undefined;
+      if (connector === "buzz") {
+        try {
+          const relay = typeof b.relay === "string" ? b.relay : "";
+          if (!relay) throw new Error("a buzz binding needs the relay to connect to");
+          const keys = parseAgentKeys(b.keys, agents);
+          if (!keys.length) throw new Error("a buzz binding needs each agent's own key");
+          npubs = (await (await import("./buzz.js")).attachBuzz(bind, { relay, keys })).npubs;
+        } catch (e) {
+          // The binding is not left half-made: a chat we cannot actually read or write to would
+          // sit in the list looking connected and answer nothing.
+          detachChannel(bind.id);
+          return json(res, 502, { error: `could not connect to Buzz: ${String((e as Error)?.message ?? e)}` });
+        }
+      }
+      return json(res, 201, { ...bind, ...(npubs ? { npubs } : {}), threads: agents.map((a) => ({ agentId: a, threadKey: channelThreadKey(connector, channel, a) })) });
     }
     if (method === "DELETE" && bindingId) {
       // A binding id is only ever detachable through the session it belongs to: the id is the
@@ -974,4 +984,24 @@ function parseEnvelope(raw: unknown): ChatEnvelope | undefined {
     ...(str(o.messageId) ? { messageId: str(o.messageId)! } : {}),
     ...(str(o.thread) ? { thread: str(o.thread)! } : {}),
   };
+}
+
+/**
+ * The per-agent secret keys a Buzz binding carries. They arrive SEALED with the binding (the launch
+ * envelope's own encryption) and are held only in memory for the life of the connection — never
+ * written to disk, never logged, and never handed to a sandbox: the relay client that uses them
+ * runs in this process, which is the reason Buzz is served here at all.
+ */
+function parseAgentKeys(raw: unknown, allowed: string[]): { agentId: string; name: string; nsec: string }[] {
+  const list = Array.isArray(raw) ? raw : [];
+  const out: { agentId: string; name: string; nsec: string }[] = [];
+  for (const k of list) {
+    const o = (k ?? {}) as Record<string, unknown>;
+    const agentId = typeof o.agentId === "string" ? o.agentId : "";
+    const nsec = typeof o.nsec === "string" ? o.nsec.trim() : "";
+    // Only for an agent this binding actually carries — a key for anyone else has no business here.
+    if (!agentId || !nsec || !allowed.includes(agentId)) continue;
+    out.push({ agentId, name: typeof o.name === "string" && o.name ? o.name.slice(0, 80) : agentId, nsec });
+  }
+  return out;
 }

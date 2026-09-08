@@ -95,6 +95,7 @@ export function attachChannel(input: { sessionId: string; connector: string; cha
 export function detachChannel(id: string): boolean {
   const b = bindings.get(id);
   if (!b) return false;
+  if (isLocal(b.connector)) void import("./buzz.js").then((m) => m.detachBuzz(id));
   bindings.delete(id);
   log(`${id}: detached`);
   return true;
@@ -160,11 +161,21 @@ async function cloud(call: CloudCall): Promise<Record<string, unknown>> {
   return body;
 }
 
+/**
+ * WHICH implementation serves a connector. Every one goes through the cloud, because that is where
+ * a chat app's credential lives — except Buzz, whose relay socket and signing key are HERE (I5).
+ * The branch is this one line; every caller above and every agent-facing tool is unchanged, which
+ * is the whole point of one contract (docs/channels-plan.md).
+ */
+const isLocal = (connector: string): boolean => connector === "buzz";
+
 /** Say something in the chat this binding names. `thread` replies inside a thread when given. */
 export async function postToChannel(bindingId: string, o: { text: string; thread?: string; asAgent?: string }): Promise<{ posted: boolean }> {
   const b = bindings.get(bindingId);
   if (!b) throw new Error("that chat is not connected to this session any more");
-  await cloud({ op: "post", bindingId, connector: b.connector, channel: b.channel, text: o.text.slice(0, 8_000), ...(o.thread ? { thread: o.thread } : {}), ...(o.asAgent ? { asAgent: o.asAgent } : {}) });
+  const text = o.text.slice(0, 8_000);
+  if (isLocal(b.connector)) await (await import("./buzz.js")).buzzPost(bindingId, { ...o, text });
+  else await cloud({ op: "post", bindingId, connector: b.connector, channel: b.channel, text, ...(o.thread ? { thread: o.thread } : {}), ...(o.asAgent ? { asAgent: o.asAgent } : {}) });
   return { posted: true };
 }
 
@@ -172,13 +183,16 @@ export async function postToChannel(bindingId: string, o: { text: string; thread
 export async function channelHistory(bindingId: string, limit = 30): Promise<unknown[]> {
   const b = bindings.get(bindingId);
   if (!b) throw new Error("that chat is not connected to this session any more");
-  const out = await cloud({ op: "history", bindingId, connector: b.connector, channel: b.channel, limit: Math.min(Math.max(limit, 1), 100) });
+  const n = Math.min(Math.max(limit, 1), 100);
+  if (isLocal(b.connector)) return (await import("./buzz.js")).buzzHistory(bindingId, n);
+  const out = await cloud({ op: "history", bindingId, connector: b.connector, channel: b.channel, limit: n });
   return Array.isArray(out.messages) ? out.messages : [];
 }
 
 export async function channelMembers(bindingId: string): Promise<unknown[]> {
   const b = bindings.get(bindingId);
   if (!b) throw new Error("that chat is not connected to this session any more");
+  if (isLocal(b.connector)) return (await import("./buzz.js")).buzzMembers(bindingId);
   const out = await cloud({ op: "members", bindingId, connector: b.connector, channel: b.channel });
   return Array.isArray(out.members) ? out.members : [];
 }
@@ -192,6 +206,10 @@ export async function notifyOwner(sessionId: string, text: string, connector?: s
   const s = getSessionRecord(sessionId);
   if (!s?.owner) throw new Error("this session has no recorded owner to reach");
   const live = channelsForSession(sessionId).find((b) => b.status === "live");
-  const out = await cloud({ op: "notify", bindingId: live?.id ?? "", sessionId, member: s.owner, connector: connector ?? live?.connector ?? "", text: text.slice(0, 4_000) });
+  const which = connector ?? live?.connector ?? "";
+  // Buzz has no direct messages here (NIP-17 gift wraps are out of scope), so the honest answer is
+  // the channel the person is already in — and the answer says which it was.
+  if (isLocal(which) && live) return (await import("./buzz.js")).buzzNotifyOwner(live.id, text.slice(0, 4_000));
+  const out = await cloud({ op: "notify", bindingId: live?.id ?? "", sessionId, member: s.owner, connector: which, text: text.slice(0, 4_000) });
   return { sent: out.sent === true, ...(typeof out.via === "string" ? { via: out.via } : {}) };
 }
