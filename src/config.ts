@@ -78,14 +78,18 @@ export interface BastionConfig {
   hostKey?: string;
 }
 
-// The server's PRIVATE named tunnel + its Workers VPC address. The cloud mints
-// both at pairing (or seeds them on a Cloud VM); the server runs `cloudflared tunnel run` with
-// `creds` in TUNNEL_TOKEN (never argv — `ps` is world-readable) and binds on `ip` (a loopback
-// address unique to this server account-wide) as well as 127.0.0.1. The server has NO public URL:
-// the Worker reaches it over the binding at `ip`.
+// The server's PRIVATE named tunnel. The cloud hands it out at pairing (or seeds it on a Cloud VM)
+// from its pre-minted POOL: the Worker holds one `vpc_networks` binding per pool slot, so the tunnel
+// itself identifies this server and there is nothing else to configure. We run `cloudflared tunnel
+// run` with `creds` in TUNNEL_TOKEN (never argv — `ps` is world-readable) and serve the ordinary
+// 127.0.0.1:8090 listener; the server has NO public URL and needs no address of its own.
+//
+// It used to carry an `ip` too — a loopback address unique to this server account-wide — because the
+// Worker selected servers by ip through one shared binding. That required `sudo ifconfig lo0 alias`
+// on macOS and broke on every reboot. Slots removed it; an `ip` on disk from an older build is
+// ignored.
 export interface VpcConfig {
   creds: string; // the named tunnel's run token
-  ip: string; // 127.x.y.z
 }
 
 export interface OsbConfig {

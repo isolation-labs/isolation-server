@@ -13,7 +13,7 @@
 // with `--backend <url>`, which is a flag someone can see and reason about. The old
 // self-describing token — base64url({u: <backend origin>, c: <code>}) — still resolves, so
 // codes copied from an older web build keep working.
-import { HOST, PORT, getToken, getVpc } from "./config.js";
+import { HOST, PORT, getToken } from "./config.js";
 import { gateArgv, installService, uninstallService } from "./service.js";
 import { prepareRuntime, waitForRuntime } from "./runtime.js";
 import { ensureCloudflared } from "./cloudflared.js";
@@ -58,11 +58,6 @@ async function main(): Promise<void> {
     }
     // 2. The relay binary, pre-fetched so `connect` never waits on a download.
     await ensureCloudflared(say).catch((e: Error) => say(`(cloudflared not provisioned yet: ${e.message})`));
-    // 2b. The private tunnel's loopback ip. Linux serves any 127.x.y.z out of the
-    //     box; macOS binds only 127.0.0.1 until lo0 gets an alias — one sudo, kept across restarts of
-    //     the gate but not of the machine, so `up` re-checks every time. (Read straight off disk: on
-    //     a first-ever install there is no vpc block yet, which is what `connect` below covers.)
-    await ensureLoopbackAlias(say, getVpc()?.ip);
     // 3. The gate itself.
     installService({ id: "gate", argv: gateArgv() });
     for (let i = 0; i < 20; i++) {
@@ -102,13 +97,6 @@ async function main(): Promise<void> {
     const body = (await r.json().catch(() => ({}))) as { ok?: boolean; label?: string; url?: string; error?: string };
     if (!r.ok || !body.ok) return fail(body.error ?? `pairing failed (HTTP ${r.status})`);
     console.log(`paired as "${body.label}" — reachable at ${body.url}`);
-    // Pairing is where the private tunnel's ip first arrives, so this is the ONLY chance to bind it
-    // without a second command: `up` ran before there was a vpc block to read. Ask the GATE for the
-    // ip (this process loaded its config before /pair wrote it), then add the alias. The gate's bind
-    // retry picks it up within seconds — otherwise a fresh macOS pairing serves the cloud nothing.
-    const st = await fetch(`${base}/status`, authed()).catch(() => undefined);
-    const ip = st?.ok ? ((await st.json().catch(() => ({}))) as { vpc?: { ip?: string } }).vpc?.ip : undefined;
-    await ensureLoopbackAlias((m) => console.log(`  ${m}`), ip);
     return;
   }
 
@@ -146,25 +134,3 @@ function fail(msg: string): never {
 }
 
 void main();
-
-// macOS only: `sudo ifconfig lo0 alias <ip>` when the private ip is configured and not yet bound.
-// The ip is re-validated here rather than trusted from disk or the wire: it is about to be an
-// argument to a privileged command, and the shape is the same one the gate accepts from the cloud.
-async function ensureLoopbackAlias(say: (m: string) => void, ip: string | undefined): Promise<void> {
-  if (!ip || !/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip) || process.platform !== "darwin") return;
-  const { execFileSync } = await import("node:child_process");
-  const have = (() => {
-    try {
-      return execFileSync("ifconfig", ["lo0"], { encoding: "utf8" }).includes(`inet ${ip} `);
-    } catch {
-      return false;
-    }
-  })();
-  if (have) return;
-  say(`adding loopback alias ${ip} for the private tunnel (sudo may prompt)…`);
-  try {
-    execFileSync("sudo", ["ifconfig", "lo0", "alias", ip], { stdio: "inherit" });
-  } catch {
-    say(`could not add the alias — run: sudo ifconfig lo0 alias ${ip}`);
-  }
-}

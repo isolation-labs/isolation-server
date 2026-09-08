@@ -232,9 +232,8 @@ class PrivateTunnelManager {
   private retry: ReturnType<typeof setTimeout> | undefined;
   lastError: string | undefined;
 
-  status(): { connected: boolean; ip?: string } {
-    const v = getVpc();
-    return { connected: this.up && !!this.child, ...(v ? { ip: v.ip } : {}) };
+  status(): { connected: boolean; configured: boolean } {
+    return { connected: this.up && !!this.child, configured: !!getVpc() };
   }
 
   // Idempotent: an already-running tunnel is left alone (POST /vpc is a repair path and must not
@@ -272,7 +271,7 @@ class PrivateTunnelManager {
       if (!this.up && /Registered tunnel connection/i.test(chunk.toString())) {
         this.up = true;
         this.restarts = 0;
-        log(`private tunnel up (${v.ip})`);
+        log("private tunnel up — the cloud reaches this server over it");
       }
     };
     child.stdout?.on("data", watch);

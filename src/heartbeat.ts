@@ -5,7 +5,6 @@
 import { PORT, getPairing, getVpc, isLoopbackOrigin, savePairing, saveEnrollment, saveBastion, saveSandbox, saveVpc, getMachineId } from "./config.js";
 import { GATE_VERSION } from "./version.js";
 import { privateTunnelManager, sandboxTunnelManager, tunnelManager } from "./tunnel.js";
-import { vpcStatusDetail } from "./server.js";
 import { allWebSlugs } from "./views.js";
 import { bastion } from "./bastion.js";
 
@@ -34,11 +33,11 @@ let lastBeat: BeatStatus | undefined;
 let goingOffline = false;
 let rejectStreak = 0;
 
-// On a private tunnel the server's address IS its loopback ip — the Worker dials
-// it over the binding — and there is no public URL to report. Otherwise the relay's quick-tunnel URL.
+// On a private tunnel there is no public URL to report and no address to choose: the Worker dials
+// this server over the binding for its pool slot, and everything behind a tunnel is 127.0.0.1.
+// Otherwise (no pool slot — a self-host, a backend with no managed tier) the relay's quick-tunnel URL.
 const currentUrl = (): string => {
-  const v = getVpc();
-  if (v) return `http://${v.ip}:${PORT}`;
+  if (getVpc()) return `http://127.0.0.1:${PORT}`;
   return tunnelManager.publicUrl() ?? `http://localhost:${PORT}`;
 };
 
@@ -77,10 +76,6 @@ async function beat(): Promise<void> {
   // Public web previews: every live web view's slug, so the Worker can route
   // https://<slug>.<domain>/ to this server. The cloud replaces its list per beat.
   body.webSlugs = allWebSlugs();
-  // "Up, but the cloud cannot reach me, and here is the fix." The private ip is the ONLY way in, so
-  // an unbound one is invisible from the outside — this is the only channel that still works.
-  const detail = vpcStatusDetail();
-  if (detail) body.unreachable = detail;
   // Report the URL only when changed — and never report the loopback fallback to a
   // REMOTE cloud (a beat racing the tunnel dial would clobber a still-valid tunnel URL).
   if (url !== lastSent && (isLoopbackOrigin(p.backendUrl) || !isLoopbackOrigin(url))) body.url = url;
