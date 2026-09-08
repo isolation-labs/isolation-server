@@ -33,7 +33,7 @@ export interface View {
   dir?: string; // terminal/directory: the subtree under /workspace (the shell's cwd / the browse root)
   command?: string; // terminal: typed into the view's tmux session once, at creation
   style?: TerminalStyle; // terminal: the appearance ttyd was started with (restyle restarts ttyd)
-  slug?: string; // web: the PUBLIC hostname label `<prefix>-<random tail>` (newWebSlug) — the view's address on the sandbox plane
+  slug?: string; // web: the PUBLIC hostname label `<10-char slot prefix><10-char secret>` (newWebSlug) — the view's address on the sandbox plane
   sshRouteId?: string; // the SSH username an end-user types: `ssh <sshRouteId>@<bastion>`. Stable across restarts.
 }
 
@@ -81,21 +81,28 @@ export function dropView(id: string): View | undefined {
 
 export const getView = (id: string): View | undefined => views[id];
 export const viewBySlug = (slug: string): View | undefined => Object.values(views).find((v) => v.type === "web" && v.slug === slug);
-// A web view's slug IS its public, unauthenticated address, and it is also the ROUTE: the Worker
-// reaches this server over the binding for its pool slot, and the slug carries an OPAQUE prefix the
-// cloud derived from that slot (`<prefix>-<tail>`, config.ts VpcConfig.previewPrefix) so the Worker
-// routes `<slug>.<domain>` from the label alone — no lookup, no table, nothing for the heartbeat to
-// report, and the slot number itself never appears. Only THIS server's doorman knows the tail, so a
-// recycled slot or a guessed prefix reaches a doorman that answers "unknown app" (404).
-// The tail is the whole secret: 26 base32 chars = 130 bits, preserving the minimum 128-bit
-// public-address invariant independently of the shared routing prefix. No prefix (unpaired, or a
-// backend without a pool) → the bare tail, reachable at `<tail>.localhost` only.
-export const SLUG_TAIL_LEN = 26;
-const PREFIX_RE = /^[a-z2-7]{6,16}$/;
+// A web view's slug IS its public, unauthenticated address, and it is also the ROUTE. Twenty base32
+// characters, no separator (owner call, 2026-09-08): the first 10 are the OPAQUE prefix the cloud
+// derived from this server's pool slot (config.ts VpcConfig.previewPrefix) — the Worker routes
+// `<slug>.<domain>` to this server's tunnel from those alone, no table, nothing reported over the
+// heartbeat, and the slot number never appears — and the last 10 are the view's secret: 50 random
+// bits, which an online guesser working one hostname per request cannot walk (2^50 ≈ 1e15), while
+// the prefix, being fixed per server, protects nothing. Only THIS server's doorman knows a live
+// suffix, so a recycled slot or a guessed prefix reaches a doorman that answers "unknown app" (404).
+// No prefix (unpaired, or a backend without a pool) → the bare suffix, reachable at
+// `<suffix>.localhost` only.
+export const SLUG_TAIL_LEN = 10;
+const PREFIX_RE = /^[a-z2-7]{10}$/;
 export const newWebSlug = (prefix: string | undefined = getVpc()?.previewPrefix): string => {
   const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
-  const tail = [...randomBytes(SLUG_TAIL_LEN)].map((b) => alphabet[b % 32]).join("");
-  return typeof prefix === "string" && PREFIX_RE.test(prefix) ? `${prefix}-${tail}` : tail;
+  const route = typeof prefix === "string" && PREFIX_RE.test(prefix) ? prefix : "";
+  // With a shorter suffix, explicitly avoid reusing another live view's address.
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const tail = [...randomBytes(SLUG_TAIL_LEN)].map((b) => alphabet[b % 32]).join("");
+    const slug = route + tail;
+    if (!viewBySlug(slug)) return slug;
+  }
+  throw new Error("could not allocate a unique web preview address");
 };
 export const viewsForSandbox = (sandboxId: string): View[] => Object.values(views).filter((v) => v.sandboxId === sandboxId);
 
