@@ -16,6 +16,7 @@ import { agentJson, getAgent, listAgents, parseRoster, spawnAgent, startAgent, s
 import { bridgePattern, connectorTurn, syncViewsFile } from "./acpview.js";
 import { attachChannel, channelBinding, channelThreadKey, channelsForSession, detachChannel, rememberEnvelope, type ChatEnvelope } from "./channels.js";
 import { listHarnesses } from "./harness.js";
+import { sealedOrInline } from "./envelope.js";
 import { pauseSession, resumeSession,
   actorFrom,
   createSessionView,
@@ -598,7 +599,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         const view = v;
         void (async () => {
           const { deliverChannelTurn } = await import("./channelturn.js");
-          await deliverChannelTurn(sid, key, view.agentId ?? "", text, envelope ?? { connector: "channel", channel: key });
+          await deliverChannelTurn(sid, key, view.agentId ?? "", text, envelope ?? { connector: "channel", channel: key }, from);
         })().catch((e: Error) => log(`${sid}/${key}: async turn threw — ${e?.message ?? e}`));
         return json(res, 202, { accepted: true, viewId: v.id });
       }
@@ -627,6 +628,9 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       const roster = listAgents(sid);
       const agents = (wanted.length ? wanted : roster.map((a) => a.def.id)).filter((id) => roster.some((a) => a.def.id === id));
       if (!agents.length) return json(res, 400, { error: "none of those agents are in this session" });
+      // Re-attaching the same chat returns the SAME binding (channels.ts), which decides what a
+      // failed Buzz connect below is allowed to tear down.
+      const reattach = channelsForSession(sid).some((x) => x.connector === connector && x.channel === channel);
       const bind = attachChannel({ sessionId: sid, connector, channel, channelName: typeof b.channelName === "string" ? b.channelName.slice(0, 200) : undefined, agents });
       // BUZZ runs here rather than on the cloud (PLAN §1 I5): reading a channel means holding a
       // relay subscription and posting means signing with the agent's own key. Both arrive sealed
@@ -636,13 +640,15 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         try {
           const relay = typeof b.relay === "string" ? b.relay : "";
           if (!relay) throw new Error("a buzz binding needs the relay to connect to");
-          const keys = parseAgentKeys(b.keys, agents);
+          const keys = parseAgentKeys(sealedOrInline(b.keys), agents);
           if (!keys.length) throw new Error("a buzz binding needs each agent's own key");
           npubs = (await (await import("./buzz.js")).attachBuzz(bind, { relay, keys })).npubs;
         } catch (e) {
-          // The binding is not left half-made: a chat we cannot actually read or write to would
-          // sit in the list looking connected and answer nothing.
-          detachChannel(bind.id);
+          // A binding we just minted is not left half-made: a chat we cannot actually read or
+          // write to would sit in the list looking connected and answer nothing. One that was
+          // ALREADY here is left alone — a retry against a relay that blinked must not delete the
+          // record, nor drop the relay connection that is still serving it.
+          if (!reattach) detachChannel(bind.id);
           return json(res, 502, { error: `could not connect to Buzz: ${String((e as Error)?.message ?? e)}` });
         }
       }
@@ -987,13 +993,17 @@ function parseEnvelope(raw: unknown): ChatEnvelope | undefined {
 }
 
 /**
- * The per-agent secret keys a Buzz binding carries. They arrive SEALED with the binding (the launch
- * envelope's own encryption) and are held only in memory for the life of the connection — never
- * written to disk, never logged, and never handed to a sandbox: the relay client that uses them
- * runs in this process, which is the reason Buzz is served here at all.
+ * The per-agent secret keys a Buzz binding carries. They arrive SEALED to this server (the same
+ * AES-GCM envelope every launch secret uses — envelope.ts) and are held only in memory for the
+ * life of the connection — never written to disk, never logged, and never handed to a sandbox:
+ * the relay client that uses them runs in this process, which is why Buzz is served here at all.
  */
 function parseAgentKeys(raw: unknown, allowed: string[]): { agentId: string; name: string; nsec: string }[] {
-  const list = Array.isArray(raw) ? raw : [];
+  // Sealed, the payload is an object like every other launch secret (`{ keys: [...] }`); inline
+  // (loopback, local mode) it is the bare array. A blob we could not open is neither, and yields
+  // nothing — which the caller turns into "a buzz binding needs each agent's own key".
+  const inner = (raw as { keys?: unknown } | null)?.keys;
+  const list = Array.isArray(raw) ? raw : Array.isArray(inner) ? inner : [];
   const out: { agentId: string; name: string; nsec: string }[] = [];
   for (const k of list) {
     const o = (k ?? {}) as Record<string, unknown>;

@@ -19,7 +19,7 @@ const log = (...a: unknown[]) => console.log("[channel]", ...a);
  * Run one inbound message as a turn and deliver the answer back to the chat. Never throws: the
  * caller is a relay socket or a fire-and-forget HTTP handler, and there is nobody left to tell.
  */
-export async function deliverChannelTurn(sessionId: string, threadKey: string, agentId: string, text: string, envelope: ChatEnvelope): Promise<void> {
+export async function deliverChannelTurn(sessionId: string, threadKey: string, agentId: string, text: string, envelope: ChatEnvelope, from?: string): Promise<void> {
   const s = getSessionRecord(sessionId);
   if (!s?.sandboxId) return log(`${sessionId}: gone — dropping a ${envelope.connector} message`);
 
@@ -34,8 +34,10 @@ export async function deliverChannelTurn(sessionId: string, threadKey: string, a
     if (!view) return log(`${sessionId}: could not open a thread for ${rec.def.name}`);
   }
 
-  const from = `${envelope.connector}:${envelope.senderName ?? envelope.sender ?? "someone"}`;
-  const out = await connectorTurn(view, text, from);
+  // The caller may already know who this is from (the thread route takes `from` in the body); the
+  // envelope is the fallback, which is all the relay path ever has.
+  const who = from || `${envelope.connector}:${envelope.senderName ?? envelope.sender ?? "someone"}`;
+  const out = await connectorTurn(view, text, who);
   if ("error" in out) return log(`${sessionId}/${threadKey}: turn failed — ${out.error}`);
   if (!out.reply.text.trim()) return;
 

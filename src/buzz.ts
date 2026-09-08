@@ -13,11 +13,9 @@
 // Scope, deliberately: CHANNELS. Direct messages are NIP-17 gift wraps, which need a second and
 // much larger piece of cryptography (NIP-44 + NIP-59); "add an agent to a channel the way you add a
 // person" is what Buzz's own pitch is about, and it is what this does.
-import { getPairing } from "./config.js";
 import { channelThreadKey, rememberEnvelope, type ChannelBinding, type ChatEnvelope } from "./channels.js";
 import { getSessionRecord } from "./sessions.js";
 import {
-  AUTH_KIND,
   MESSAGE_KINDS,
   authEvent,
   channelMessage,
@@ -53,15 +51,14 @@ interface Conn {
   bindings: Map<string, { binding: ChannelBinding; agents: AgentKey[] }>;
   /** Pending one-shot queries (history), by subscription id. */
   queries: Map<string, { events: NostrEvent[]; done: (e: NostrEvent[]) => void; timer: ReturnType<typeof setTimeout> }>;
-  authed: boolean;
+  /** The relay's last NIP-42 challenge, and the challenge each key has answered it with. */
+  challenge?: string;
+  authedFor: Map<string, string>;
   closed: boolean;
   attempts: number;
 }
 
 const conns = new Map<string, Conn>(); // relay url → connection
-
-/** Everything this connector knows, so `channels.ts` can ask whether Buzz can serve a binding. */
-export const buzzKnows = (bindingId: string): boolean => [...conns.values()].some((c) => c.bindings.has(bindingId));
 
 // ── Attaching ──────────────────────────────────────────────────────────────────────────────────
 
@@ -88,11 +85,27 @@ export async function attachBuzz(binding: ChannelBinding, input: BuzzAttach): Pr
   if (!agents.length) throw new Error("no keys were supplied for the agents in this chat");
 
   const conn = await connect(relay);
+  // Re-attaching the same chat onto a DIFFERENT relay must not leave the old connection serving it:
+  // its subscription still covers this channel, so every message would become two turns (and two
+  // replies), and `connFor` — which takes the first connection holding the binding — would send
+  // this chat's outbound posts back to the relay we just moved off.
+  for (const c of [...conns.values()]) {
+    if (c === conn || !c.bindings.delete(binding.id)) continue;
+    if (c.bindings.size === 0) close(c);
+    else resubscribe(c);
+  }
   conn.bindings.set(binding.id, { binding, agents });
+  await sendAuth(conn); // this connection may already have been challenged, before these keys existed
   resubscribe(conn);
   // A profile is published once per attach: it is a replaceable event, so re-publishing is how a
   // renamed agent is renamed in the room, and cheap enough not to be worth remembering.
-  for (const a of agents) await publish(conn, await signEvent(a.sk, profileEvent(a.name, "An Isolation agent."))).catch(() => undefined);
+  // NOT awaited: a relay that never sends OK would otherwise hold the attach request open for the
+  // publish timeout, once per agent, for something purely cosmetic.
+  for (const a of agents) {
+    void signEvent(a.sk, profileEvent(a.name, "An Isolation agent."))
+      .then((ev) => publish(conn, ev))
+      .catch(() => undefined);
+  }
   log(`${binding.id}: ${relay} ${binding.channelName ?? binding.channel} — ${agents.map((a) => a.name).join(", ")}`);
   return { npubs: Object.fromEntries(agents.map((a) => [a.agentId, npubOf(a.pubkey)])) };
 }
@@ -128,21 +141,41 @@ async function connect(relay: string): Promise<Conn> {
   const existing = conns.get(relay);
   if (existing && !existing.closed) return existing;
   const ws = new WebSocket(relay);
-  const conn: Conn = { relay, ws, bindings: existing?.bindings ?? new Map(), queries: new Map(), authed: false, closed: false, attempts: existing?.attempts ?? 0 };
+  const conn: Conn = { relay, ws, bindings: existing?.bindings ?? new Map(), queries: new Map(), authedFor: new Map(), closed: false, attempts: existing?.attempts ?? 0 };
   conns.set(relay, conn);
 
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${relay} did not answer`)), REQUEST_TIMEOUT_MS);
-    ws.addEventListener("open", () => {
-      clearTimeout(timer);
-      conn.attempts = 0;
-      resolve();
-    }, { once: true });
-    ws.addEventListener("error", () => {
-      clearTimeout(timer);
-      reject(new Error(`could not reach ${relay}`));
-    }, { once: true });
-  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${relay} did not answer`)), REQUEST_TIMEOUT_MS);
+      ws.addEventListener("open", () => {
+        clearTimeout(timer);
+        conn.attempts = 0;
+        resolve();
+      }, { once: true });
+      ws.addEventListener("error", () => {
+        clearTimeout(timer);
+        reject(new Error(`could not reach ${relay}`));
+      }, { once: true });
+    });
+  } catch (e) {
+    // The `close` listener below was never attached, so nothing else will ever mark this one dead:
+    // a connection left in the registry looking OPEN is handed straight back by the next connect()
+    // (and by every redial), and Buzz then sends into a socket that will never carry anything.
+    // Kept in the map rather than deleted, so the bindings a redial needs survive with it.
+    conn.closed = true;
+    try {
+      ws.close();
+    } catch {
+      /* never opened */
+    }
+    // A CONCURRENT attach may already have registered its binding on this half-open connection
+    // (connect() hands back whatever is in the map until it is marked closed). Nothing else will
+    // ever redial it — the `close` listener was never attached — so that chat would be deaf for
+    // good. Redial here; the caller still gets its error, and a connection nobody is using has no
+    // bindings and so is not retried.
+    if (conn.bindings.size) redial(conn);
+    throw e;
+  }
 
   ws.addEventListener("message", (ev) => void onMessage(conn, String((ev as MessageEvent).data)).catch((e) => log(`${relay}: ${String((e as Error)?.message ?? e)}`)));
   ws.addEventListener("close", () => {
@@ -193,6 +226,28 @@ function resubscribe(conn: Conn): void {
   send(conn, ["REQ", "iso", { kinds: MESSAGE_KINDS, "#h": channels, "#p": pubkeys, since: Math.floor(Date.now() / 1000) }]);
 }
 
+/**
+ * Answer the relay's NIP-42 challenge for every key this connection holds. Idempotent per
+ * challenge, and a no-op until there IS a key — `attachBuzz` calls it again the moment one
+ * arrives. Returns whether anything was actually sent, which is what decides a re-subscribe.
+ */
+async function sendAuth(conn: Conn): Promise<boolean> {
+  const challenge = conn.challenge;
+  if (!challenge) return false;
+  // Tracked PER KEY, not per connection: a second chat attaching later brings an agent this
+  // socket has never introduced, and a connection that considered itself "authenticated" would
+  // never introduce it — leaving that agent's `#p` filter refused on an auth-required relay.
+  // One answer per key, not per binding, since two chats here can carry the same agent.
+  const agents = new Map([...conn.bindings.values()].flatMap((b) => b.agents.map((a) => [a.pubkey, a] as const)));
+  const owed = [...agents.values()].filter((a) => conn.authedFor.get(a.pubkey) !== challenge);
+  if (!owed.length) return false;
+  for (const a of owed) {
+    send(conn, ["AUTH", await authEvent(a.sk, conn.relay, challenge)]);
+    conn.authedFor.set(a.pubkey, challenge);
+  }
+  return true;
+}
+
 async function onMessage(conn: Conn, raw: string): Promise<void> {
   let msg: unknown[];
   try {
@@ -203,13 +258,30 @@ async function onMessage(conn: Conn, raw: string): Promise<void> {
   const [type] = msg as [string, ...unknown[]];
 
   if (type === "AUTH") {
-    // NIP-42: prove we hold each agent's key. One challenge, one answer per agent — the relay
-    // associates the connection with whoever answered.
-    const challenge = String(msg[1] ?? "");
-    for (const b of conn.bindings.values()) for (const a of b.agents) send(conn, ["AUTH", await authEvent(a.sk, conn.relay, challenge)]);
-    conn.authed = true;
-    // A relay that challenges usually rejects the subscription that preceded it; ask again.
-    resubscribe(conn);
+    // NIP-42: prove we hold each agent's key — one answer per agent, and the relay associates the
+    // connection with whoever answered. The challenge is REMEMBERED rather than answered once and
+    // thrown away, because a relay issues it ONCE, when the socket opens, while keys keep arriving
+    // afterwards: the second chat to attach rides the connection the first one opened, and brings
+    // an agent this socket has never introduced. Answering only the keys present at challenge time
+    // leaves that agent subscribed but unauthenticated — silently deaf on exactly the relays that
+    // gate a channel on NIP-42, which is the interesting kind.
+    conn.challenge = String(msg[1] ?? "");
+    // A relay that challenges usually rejects the subscription that preceded it; ask again — but
+    // only if we had something to answer with, so a keyless connection does not churn.
+    if (await sendAuth(conn)) resubscribe(conn);
+    return;
+  }
+
+  if (type === "CLOSED") {
+    const closedId = String(msg[1] ?? "");
+    const q = conn.queries.get(closedId);
+    // A refused query must not sit until its timeout: answer with whatever arrived before it.
+    if (q) return finishQuery(conn, closedId, q.events);
+    if (closedId !== "iso") return;
+    log(`${conn.relay}: subscription closed — ${String(msg[2] ?? "")}`);
+    // Typically `auth-required` on the REQ that raced the challenge. Answer it and ask again; when
+    // there is nothing NEW to answer with, stop here rather than loop.
+    if (await sendAuth(conn)) resubscribe(conn);
     return;
   }
 
@@ -239,21 +311,32 @@ async function onMessage(conn: Conn, raw: string): Promise<void> {
 // ── Inbound: a mention becomes a turn ──────────────────────────────────────────────────────────
 
 async function onChannelMessage(conn: Conn, e: NostrEvent): Promise<void> {
+  // The subscription asked for message kinds; a relay is free to send anything, and a profile or
+  // an auth event turned into a turn is a signed message being read as something it is not.
+  if (!MESSAGE_KINDS.includes(e.kind)) return;
   const channel = tagValue(e, "h");
   if (!channel || !e.content.trim()) return;
-  const entry = [...conn.bindings.values()].find((b) => b.binding.channel === channel);
-  if (!entry) return;
-  const { binding } = entry;
+  // EVERY binding on this channel, not the first: two sessions of a workspace can both be in one
+  // chat, and picking one of them by position drops the mentions addressed to the other.
+  const here = [...conn.bindings.values()].filter((b) => b.binding.channel === channel);
+  if (!here.length) return;
 
-  // Never answer ourselves: an agent's own message comes back on its own subscription, and
-  // answering it is a loop that costs a turn every time round.
-  if (entry.agents.some((a) => a.pubkey === e.pubkey)) return;
+  // Never answer ourselves — or each other: an agent's own message comes back on its own
+  // subscription, and answering it is a loop that costs a turn every time round.
+  if (here.some((b) => b.agents.some((a) => a.pubkey === e.pubkey))) return;
 
   const mentioned = new Set(tagValues(e, "p"));
-  // Addressed by key when the sender mentioned one; otherwise the chat's single agent takes it.
-  // Never fan out — that is N turns for one message.
-  const target = entry.agents.find((a) => mentioned.has(a.pubkey)) ?? (entry.agents.length === 1 ? entry.agents[0] : undefined);
-  if (!target) return;
+  // Addressed by key when the sender mentioned one — the binding is then whichever one carries
+  // that agent. Otherwise, with nobody named at all, a chat holding exactly one agent takes it.
+  // Never fan out (N turns for one message), and never let the fallback catch a message that named
+  // SOMEONE ELSE: one subscription serves every binding on this relay, so a mention of another
+  // session's agent arrives here too, and answering it would be this chat's agent replying to a
+  // message addressed to a different one.
+  let entry = here.find((b) => b.agents.some((a) => mentioned.has(a.pubkey)));
+  if (!entry && !mentioned.size && here.length === 1 && here[0].agents.length === 1) entry = here[0];
+  if (!entry) return;
+  const target = entry.agents.find((a) => mentioned.has(a.pubkey)) ?? entry.agents[0];
+  const { binding } = entry;
 
   const s = getSessionRecord(binding.sessionId);
   if (!s?.sandboxId) return;
@@ -290,8 +373,12 @@ function connFor(bindingId: string): { conn: Conn; entry: { binding: ChannelBind
 /** Say something in the channel, signed by the agent that is saying it. */
 export async function buzzPost(bindingId: string, o: { text: string; thread?: string; asAgent?: string }): Promise<void> {
   const { conn, entry } = connFor(bindingId);
-  const agent = entry.agents.find((a) => a.agentId === o.asAgent) ?? entry.agents[0];
-  if (!agent) throw new Error("no agent key for this chat");
+  // NEVER fall back to another agent's key when one was NAMED: a binding can carry an agent whose
+  // key was not supplied, and signing its reply with the first agent's key would put words in that
+  // agent's mouth — the one thing "an agent signs as itself" has to mean. Only an unaddressed post
+  // (notifyOwner, which speaks for the chat rather than for anyone) takes the first key.
+  const agent = o.asAgent ? entry.agents.find((a) => a.agentId === o.asAgent) : entry.agents[0];
+  if (!agent) throw new Error(o.asAgent ? `no Buzz key was supplied for ${o.asAgent} — it cannot post in this chat` : "no agent key for this chat");
   const ev = await signEvent(agent.sk, channelMessage(entry.binding.channel, o.text, o.thread ? { root: o.thread, replyTo: o.thread } : {}));
   await publish(conn, ev);
 }
@@ -324,7 +411,7 @@ function publish(conn: Conn, ev: NostrEvent): Promise<void> {
 /** The last messages of the channel, oldest first — read on demand, never injected into a turn. */
 export async function buzzHistory(bindingId: string, limit: number): Promise<unknown[]> {
   const { conn, entry } = connFor(bindingId);
-  const events = await query(conn, { kinds: MESSAGE_KINDS, "#h": [entry.binding.channel], limit });
+  const events = (await query(conn, { kinds: MESSAGE_KINDS, "#h": [entry.binding.channel], limit })).filter(inChannel(entry.binding.channel));
   return events
     .sort((a, b) => a.created_at - b.created_at)
     .map((e) => ({
@@ -343,7 +430,7 @@ export async function buzzHistory(bindingId: string, limit: number): Promise<unk
  */
 export async function buzzMembers(bindingId: string): Promise<unknown[]> {
   const { conn, entry } = connFor(bindingId);
-  const events = await query(conn, { kinds: MESSAGE_KINDS, "#h": [entry.binding.channel], limit: 100 });
+  const events = (await query(conn, { kinds: MESSAGE_KINDS, "#h": [entry.binding.channel], limit: 100 })).filter(inChannel(entry.binding.channel));
   const seen = new Map<string, { id: string; name: string | null; kind: string }>();
   for (const e of events) {
     const agent = entry.agents.find((a) => a.pubkey === e.pubkey);
@@ -351,6 +438,9 @@ export async function buzzMembers(bindingId: string): Promise<unknown[]> {
   }
   return [...seen.values()];
 }
+
+/** The filter a relay was ASKED for, applied again on what it actually sent. */
+const inChannel = (channel: string) => (e: NostrEvent): boolean => MESSAGE_KINDS.includes(e.kind) && tagValue(e, "h") === channel;
 
 function query(conn: Conn, filter: Record<string, unknown>): Promise<NostrEvent[]> {
   return new Promise((resolve) => {
@@ -376,11 +466,7 @@ function finishQuery(conn: Conn, id: string, events: NostrEvent[]): void {
  * they hear about it. `notify` on Slack is a real DM; here it is a mention, and the answer says so.
  */
 export async function buzzNotifyOwner(bindingId: string, text: string): Promise<{ sent: boolean; via?: string }> {
-  const { entry } = connFor(bindingId);
+  connFor(bindingId); // throws the same "not connected here any more" every other outbound call does
   await buzzPost(bindingId, { text });
-  void entry;
-  void getPairing();
   return { sent: true, via: "buzz (in the channel — Buzz direct messages are not supported yet)" };
 }
-
-export const buzzAuthKind = AUTH_KIND; // re-exported so a test can assert the handshake shape

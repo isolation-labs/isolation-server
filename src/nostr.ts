@@ -32,9 +32,19 @@ const unhex = (s: string): Uint8Array => new Uint8Array((s.match(/.{1,2}/g) ?? [
 export function secretKeyBytes(nsec: string): Uint8Array {
   const s = nsec.trim();
   if (/^[0-9a-f]{64}$/i.test(s)) return unhex(s);
-  const d = bech32.decode(s as `${string}1${string}`, 200);
-  if (d.prefix !== "nsec") throw new Error(`expected an nsec, got ${d.prefix}`);
-  return new Uint8Array(bech32.fromWords(d.words));
+  let d: { prefix: string; words: number[] };
+  try {
+    d = bech32.decode(s as `${string}1${string}`, 200);
+  } catch {
+    // NEVER let the underlying error out: @scure/base quotes the input back ("Invalid checksum in
+    // nsec1…"), and this message travels into an HTTP response and a log line. A mistyped key is
+    // still almost all of a real one.
+    throw new Error("that is not a valid nsec");
+  }
+  if (d.prefix !== "nsec") throw new Error(`expected an nsec, got ${d.prefix.slice(0, 20)}`);
+  const sk = new Uint8Array(bech32.fromWords(d.words));
+  if (sk.length !== 32) throw new Error("an nsec is 32 bytes");
+  return sk;
 }
 
 /** The x-only public key (NIP-01's `pubkey`), as hex. */

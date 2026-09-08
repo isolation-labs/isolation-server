@@ -95,7 +95,7 @@ export function attachChannel(input: { sessionId: string; connector: string; cha
 export function detachChannel(id: string): boolean {
   const b = bindings.get(id);
   if (!b) return false;
-  if (isLocal(b.connector)) void import("./buzz.js").then((m) => m.detachBuzz(id));
+  if (isLocal(b.connector)) void import("./buzz.js").then((m) => m.detachBuzz(id)).catch(() => undefined);
   bindings.delete(id);
   log(`${id}: detached`);
   return true;
@@ -114,13 +114,18 @@ export function bindingForThread(sessionId: string, threadKey: string): ChannelB
  * — but it says so and its agents stop answering. A new launch re-attaches to the same chat.
  */
 export async function endChannelsFor(sessionId: string): Promise<void> {
+  const mine = channelsForSession(sessionId);
   await Promise.all(
-    channelsForSession(sessionId).map(async (b) => {
+    mine.map(async (b) => {
       if (b.status === "ended") return;
       bindings.set(b.id, { ...b, status: "ended" });
       await postToChannel(b.id, { text: "This session has ended. Ask again to start a new one." }).catch(() => undefined);
     }),
   );
+  // The binding record outlives the session; the CONNECTION must not. Buzz holds an open relay
+  // socket, a live subscription that would keep turning messages into turns, and the agents' own
+  // secret keys — all of which end here, after the goodbye has gone out over them.
+  if (mine.some((b) => isLocal(b.connector))) (await import("./buzz.js")).detachBuzzFor(sessionId);
 }
 
 export function rememberEnvelope(sessionId: string, threadKey: string, envelope: ChatEnvelope | undefined): void {
@@ -205,7 +210,12 @@ export async function channelMembers(bindingId: string): Promise<unknown[]> {
 export async function notifyOwner(sessionId: string, text: string, connector?: string): Promise<{ sent: boolean; via?: string }> {
   const s = getSessionRecord(sessionId);
   if (!s?.owner) throw new Error("this session has no recorded owner to reach");
-  const live = channelsForSession(sessionId).find((b) => b.status === "live");
+  // The chat we reach through must be one OF the connector we were asked for: the caller names it
+  // from the agent's OWN thread, and a session that is in both Slack and Buzz would otherwise hand
+  // a Buzz notify the first live binding whatever it is — a Slack binding id to a relay that has
+  // never heard of it, or the wrong chat entirely.
+  const liveOnes = channelsForSession(sessionId).filter((b) => b.status === "live");
+  const live = connector ? liveOnes.find((b) => b.connector === connector) : liveOnes[0];
   const which = connector ?? live?.connector ?? "";
   // Buzz has no direct messages here (NIP-17 gift wraps are out of scope), so the honest answer is
   // the channel the person is already in — and the answer says which it was.
