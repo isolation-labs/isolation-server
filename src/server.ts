@@ -376,8 +376,14 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (method === "GET" && url === "/sandboxes") {
     try {
       const items = await listSandboxes();
+      // The ops list: an org admin sees a teammate's sandbox, but the VIEWS ride along raw — and a
+      // web view's `slug` IS its access (the public plane authenticates on the slug alone). Listing
+      // is not opening, so the views come only with the session, never with the admin exception.
       return json(res, 200, {
-        items: items.filter((s) => mayTearDown(actor, sessionForSandbox(s.id))).map((s) => ({ ...s, views: viewsForSandbox(s.id) })),
+        items: items
+          .map((s) => ({ s, owning: sessionForSandbox(s.id) }))
+          .filter(({ owning }) => mayTearDown(actor, owning))
+          .map(({ s, owning }) => ({ ...s, views: mayOpen(actor, owning) ? viewsForSandbox(s.id) : [] })),
       });
     } catch (e) {
       return json(res, 502, { error: String((e as Error)?.message ?? e) });
