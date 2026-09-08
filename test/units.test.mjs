@@ -54,10 +54,12 @@ test("applyAiCred replaces the whole pair — no leftover env var out-ranks or r
   assert.deepEqual(env2, { ANTHROPIC_API_KEY: "isogw_abc" });
 });
 
-test("web slugs are long enough to be addresses (≥128-bit)", () => {
-  const slug = views.newWebSlug();
-  assert.match(slug, /^[a-z2-7]{26}$/);
-  assert.notEqual(views.newWebSlug(), slug);
+test("web slugs: `<prefix>-<16 base32>` when the cloud handed this server a preview prefix, the bare tail otherwise", () => {
+  const bare = views.newWebSlug(undefined);
+  assert.match(bare, /^[a-z2-7]{16}$/);
+  assert.notEqual(views.newWebSlug(undefined), bare);
+  assert.match(views.newWebSlug("k7mq2xa4wz"), /^k7mq2xa4wz-[a-z2-7]{16}$/);
+  assert.match(views.newWebSlug("NOT a prefix"), /^[a-z2-7]{16}$/, "a malformed prefix is ignored, never a broken label");
 });
 
 test("parseRoster: shapes, defaults, and garbage rejection", () => {
@@ -382,21 +384,6 @@ test("vpc config round-trips and a domain-only sandbox config is legal", () => {
   cfgMod.saveSandbox({ domain: "isolation.cc" });
   assert.deepEqual(cfgMod.getSandbox(), { domain: "isolation.cc" });
   cfgMod.saveSandbox(undefined);
-});
-
-test("allWebSlugs lists exactly the live web views' slugs — what the heartbeat reports to the Worker", () => {
-  const w1 = views.addView("sb-slugs", "web", 7001, { slug: "a".repeat(26), appPort: 3000 });
-  const w2 = views.addView("sb-slugs", "web", 7002, { slug: "b".repeat(26), appPort: 3001 });
-  const t = views.addView("sb-slugs", "terminal", 7681, {});
-  const got = views.allWebSlugs().filter((s) => s.viewId === w1.id || s.viewId === w2.id || s.viewId === t.id);
-  assert.deepEqual(
-    got.sort((x, y) => x.slug.localeCompare(y.slug)),
-    [{ slug: "a".repeat(26), viewId: w1.id }, { slug: "b".repeat(26), viewId: w2.id }],
-    "web views only, terminal excluded",
-  );
-  views.dropView(w1.id);
-  assert.ok(!views.allWebSlugs().some((s) => s.viewId === w1.id), "a dropped view's slug is gone");
-  views.dropViewsForSandbox("sb-slugs");
 });
 
 test("a web view's URL follows the sandbox domain: https://<slug>.<domain>/ once a domain is set", async () => {

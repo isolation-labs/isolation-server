@@ -90,6 +90,10 @@ export interface BastionConfig {
 // ignored.
 export interface VpcConfig {
   creds: string; // the named tunnel's run token
+  // The OPAQUE prefix the cloud derives from this server's pool slot (a keyed hash of the slot —
+  // the number itself never shows). A web view's slug is `<previewPrefix>-<tail>`, so the Worker
+  // routes `<slug>.<domain>` to this server's tunnel from the label alone (views.ts newWebSlug).
+  previewPrefix?: string;
 }
 
 export interface OsbConfig {

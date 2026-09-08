@@ -7,7 +7,7 @@
 // body = base64url(JSON {v: viewId, exp: unixSeconds}).
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
-import { VIEWS_FILE, ensureDataDir, getPairing, getToken } from "./config.js";
+import { VIEWS_FILE, ensureDataDir, getPairing, getToken, getVpc } from "./config.js";
 
 export type ViewType = "terminal" | "code" | "web" | "directory" | "agent";
 
@@ -33,7 +33,7 @@ export interface View {
   dir?: string; // terminal/directory: the subtree under /workspace (the shell's cwd / the browse root)
   command?: string; // terminal: typed into the view's tmux session once, at creation
   style?: TerminalStyle; // terminal: the appearance ttyd was started with (restyle restarts ttyd)
-  slug?: string; // web: the PUBLIC hostname label (unguessable, ≥128-bit) — the view's address on the sandbox plane
+  slug?: string; // web: the PUBLIC hostname label `<prefix>-<random tail>` (newWebSlug) — the view's address on the sandbox plane
   sshRouteId?: string; // the SSH username an end-user types: `ssh <sshRouteId>@<bastion>`. Stable across restarts.
 }
 
@@ -81,15 +81,23 @@ export function dropView(id: string): View | undefined {
 
 export const getView = (id: string): View | undefined => views[id];
 export const viewBySlug = (slug: string): View | undefined => Object.values(views).find((v) => v.type === "web" && v.slug === slug);
-// 26 base32 chars = 130 bits: a web view's slug IS its public, unauthenticated address.
-export const newWebSlug = (): string => {
+// A web view's slug IS its public, unauthenticated address, and it is also the ROUTE: the Worker
+// reaches this server over the binding for its pool slot, and the slug carries an OPAQUE prefix the
+// cloud derived from that slot (`<prefix>-<tail>`, config.ts VpcConfig.previewPrefix) so the Worker
+// routes `<slug>.<domain>` from the label alone — no lookup, no table, nothing for the heartbeat to
+// report, and the slot number itself never appears. Only THIS server's doorman knows the tail, so a
+// recycled slot or a guessed prefix reaches a doorman that answers "unknown app" (404).
+// The tail is the whole secret: 16 base32 chars = 80 bits, far beyond what can be enumerated
+// through the Worker one hostname at a time, and short enough to paste. No prefix (unpaired, or a
+// backend without a pool) → the bare tail, reachable at `<tail>.localhost` only.
+export const SLUG_TAIL_LEN = 16;
+const PREFIX_RE = /^[a-z2-7]{6,16}$/;
+export const newWebSlug = (prefix: string | undefined = getVpc()?.previewPrefix): string => {
   const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
-  return [...randomBytes(26)].map((b) => alphabet[b % 32]).join("");
+  const tail = [...randomBytes(SLUG_TAIL_LEN)].map((b) => alphabet[b % 32]).join("");
+  return typeof prefix === "string" && PREFIX_RE.test(prefix) ? `${prefix}-${tail}` : tail;
 };
 export const viewsForSandbox = (sandboxId: string): View[] => Object.values(views).filter((v) => v.sandboxId === sandboxId);
-// Every live web view's public slug — what the heartbeat reports so the Worker can route previews.
-export const allWebSlugs = (): Array<{ slug: string; viewId: string }> =>
-  Object.values(views).flatMap((v) => (v.type === "web" && v.slug ? [{ slug: v.slug, viewId: v.id }] : []));
 
 // The view's route id, minted once and PERSISTED: a user's saved `ssh <id>@host` has to keep
 // working across restarts of this server and of the bastion, so it can never be regenerated.

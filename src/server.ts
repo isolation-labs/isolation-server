@@ -5,7 +5,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { GATE_VERSION } from "./version.js";
 import { HOST, PORT, getBastion, getName, getPairing, getToken, getVpc, isLoopbackOrigin, originAllowed, saveBastion, savePairing, saveVpc, tokenMatches, getMachineId } from "./config.js";
-import { beatNow, beatOffline, detach, pairingStatus, startHeartbeat } from "./heartbeat.js";
+import { beatOffline, detach, pairingStatus, startHeartbeat } from "./heartbeat.js";
 import { deleteSandbox, getSandbox, listSandboxes, osbHealthy, pauseSandbox, resumeSandbox, sandboxLogs } from "./opensandbox.js";
 import { handlePublicWebRequest, handlePublicWebUpgrade, handleViewRequest, handleViewUpgrade, invalidateEndpoints } from "./doorman.js";
 import { launch, restartTerminal, sanitizeStyle, type LaunchRequest } from "./launch.js";
@@ -183,7 +183,7 @@ async function fetchVpcConfig(backendUrl: string, connectionId: string, secret: 
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ connectionId, secret }),
     });
-    type VpcAnswer = { vpc?: { creds?: string; domain?: string } | null };
+    type VpcAnswer = { vpc?: { creds?: string; previewPrefix?: string; domain?: string } | null };
     // `undefined` = the answer was not JSON at all. That is NOT the cloud speaking, so it must never
     // revoke: an HTML interstitial or a truncated 200 in front of the backend would otherwise cost
     // this server its only way in, and nothing re-fetches on its own afterwards — the cloud would go
@@ -228,9 +228,12 @@ async function fetchVpcConfig(backendUrl: string, connectionId: string, secret: 
     // A slot RECYCLE rotates the tunnel's secret while keeping its id, so a changed credential for
     // the same server is normal and must restart cloudflared with the new one.
     const unchanged = cur?.creds === creds;
-    // Unchanged creds still re-run the bring-up: POST /vpc is the repair path a user reaches for
-    // when the tunnel is not up, and both steps below are idempotent.
-    if (!unchanged) saveVpc({ creds });
+    // The preview prefix rides along: new web views prefix their slug with it (views.ts newWebSlug).
+    // Persisted even when the creds did not change, so a server paired before prefixes were handed
+    // out picks it up on its next `up` / POST /vpc without a tunnel restart.
+    const previewPrefix = typeof v?.previewPrefix === "string" && /^[a-z2-7]{6,16}$/.test(v.previewPrefix) ? v.previewPrefix : undefined;
+    if (!unchanged) saveVpc({ creds, ...(previewPrefix ? { previewPrefix } : {}) });
+    else if (previewPrefix && cur?.previewPrefix !== previewPrefix) saveVpc({ ...cur!, previewPrefix });
     if (!unchanged) await privateTunnelManager.stop();
     await privateTunnelManager.start().catch((e: Error) => log(`private tunnel failed: ${e.message}`));
     // The public quick tunnel has no job left: everything reaches this server through the Worker.
@@ -510,8 +513,6 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         const gone = getView(vid);
         if (gone?.sshRouteId) bastion.unregisterRoute(gone.sshRouteId);
         const v = dropView(vid);
-        // A dropped web view's slug must stop routing at the Worker on the next beat — now.
-        if (v?.type === "web") void beatNow();
         // Best-effort: stop the view's in-sandbox server so the port frees up.
         if (v) {
           // Every ported view type owns a process — including a web view's forwarder.

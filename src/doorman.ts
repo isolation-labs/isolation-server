@@ -208,7 +208,7 @@ export async function handleViewUpgrade(req: IncomingMessage, socket: Duplex, he
 // or `<slug>.localhost` on a connected/local server (browsers resolve *.localhost to
 // loopback with no DNS). We route by Host — NOT a /v/ path — so the app sits at `/` and
 // its root-absolute asset URLs resolve. This plane is PUBLIC + unauthenticated by
-// design (the slug is the secret: ≥128-bit, unguessable) and it claims sandbox hosts
+// design (the slug's random tail is the secret — views.ts newWebSlug) and it claims sandbox hosts
 // whole: the token-gated API and /v/ views are never reachable on these hostnames.
 
 const hostOnly = (h: string | undefined): string => (h ?? "").split(":")[0].trim().toLowerCase();

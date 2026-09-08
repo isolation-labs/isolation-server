@@ -5,7 +5,6 @@
 import { PORT, getPairing, getVpc, isLoopbackOrigin, savePairing, saveEnrollment, saveBastion, saveSandbox, saveVpc, getMachineId } from "./config.js";
 import { GATE_VERSION } from "./version.js";
 import { privateTunnelManager, sandboxTunnelManager, tunnelManager } from "./tunnel.js";
-import { allWebSlugs } from "./views.js";
 import { bastion } from "./bastion.js";
 
 const log = (...a: unknown[]) => console.log("[heartbeat]", ...a);
@@ -41,10 +40,8 @@ const currentUrl = (): string => {
   return tunnelManager.publicUrl() ?? `http://localhost:${PORT}`;
 };
 
-// Beats are serialized: web views scaffold in a loop and each one fires beatNow(), so several
-// POSTs could otherwise be in flight at once — and since the cloud REPLACES its slug list per beat,
-// an older, shorter list landing last would un-route the newest previews. One beat at a time, with
-// at most one follow-up queued (the next beat re-reads the whole state anyway).
+// One beat at a time: beatNow() (pairing, `up`, POST /vpc) can land while a scheduled beat is in
+// flight; the follow-up is queued rather than raced, and re-reads the whole state anyway.
 let inFlight: Promise<void> | undefined;
 let queued = false;
 
@@ -73,9 +70,6 @@ async function beat(): Promise<void> {
   if (!p) return;
   const url = currentUrl();
   const body: Record<string, unknown> = { connectionId: p.connectionId, secret: p.secret, version: GATE_VERSION, machineId: getMachineId() };
-  // Public web previews: every live web view's slug, so the Worker can route
-  // https://<slug>.<domain>/ to this server. The cloud replaces its list per beat.
-  body.webSlugs = allWebSlugs();
   // Report the URL only when changed — and never report the loopback fallback to a
   // REMOTE cloud (a beat racing the tunnel dial would clobber a still-valid tunnel URL).
   if (url !== lastSent && (isLoopbackOrigin(p.backendUrl) || !isLoopbackOrigin(url))) body.url = url;

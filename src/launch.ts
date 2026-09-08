@@ -355,11 +355,9 @@ export async function scaffoldView(sandboxId: string, w: ViewSpec): Promise<View
     ...(command ? { command } : {}),
     ...(style ? { style } : {}),
     ...(w.type === "agent" && w.agentId ? { agentId: w.agentId } : {}),
+    // The slug routes itself (slot prefix, views.ts): nothing to tell the cloud.
     ...(w.type === "web" ? { slug: newWebSlug() } : {}),
   });
-  // A new web view is a new public slug: tell the cloud NOW so the preview URL
-  // routes within a second, not at the next scheduled beat.
-  if (v.type === "web") void import("./heartbeat.js").then((h) => h.beatNow()).catch(() => undefined);
   await startViewProcess(sandboxId, v);
   await syncViewsFile(sandboxId);
   return v;
