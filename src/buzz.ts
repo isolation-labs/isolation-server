@@ -309,6 +309,18 @@ async function onMessage(conn: Conn, raw: string): Promise<void> {
 }
 
 // ── Inbound: a mention becomes a turn ──────────────────────────────────────────────────────────
+//
+// BUZZ NEEDS NO INTERLOCUTOR, AND NO COMMANDS. Slack gives an app ONE identity, so a chat full of
+// agents is one bot wearing names, nobody can be addressed directly, and something has to decide who
+// a message is for — hence `/agent <name>`, the picker and the per-thread interlocutor on the Slack
+// side (backend/src/routing.ts). Here every agent is its OWN keypair and its own member of the
+// channel, so a `p` tag IS the address: you talk to all of them, by name, the way you talk to people.
+// There is nothing to pick, so there is nothing to ask and no command to learn.
+//
+// What is left is not a router but two obvious continuations of a mention: a reply inside a thread
+// keeps talking to whoever that thread is with, and a chat holding exactly one agent needs no tag at
+// all. An unaddressed message in a room with several agents is for nobody in particular, and costs
+// nothing.
 
 async function onChannelMessage(conn: Conn, e: NostrEvent): Promise<void> {
   // The subscription asked for message kinds; a relay is free to send anything, and a profile or
@@ -327,7 +339,7 @@ async function onChannelMessage(conn: Conn, e: NostrEvent): Promise<void> {
 
   const mentioned = new Set(tagValues(e, "p"));
   // Addressed by key when the sender mentioned one — the binding is then whichever one carries
-  // that agent. Otherwise, with nobody named at all, a chat holding exactly one agent takes it.
+  // that agent. This is the whole of routing here; the rest is just continuing a thread.
   // Never fan out (N turns for one message), and never let the fallback catch a message that named
   // SOMEONE ELSE: one subscription serves every binding on this relay, so a mention of another
   // session's agent arrives here too, and answering it would be this chat's agent replying to a
@@ -336,8 +348,8 @@ async function onChannelMessage(conn: Conn, e: NostrEvent): Promise<void> {
   let entry = here.find((b) => b.agents.some((a) => mentioned.has(a.pubkey)));
   let target = entry?.agents.find((a) => mentioned.has(a.pubkey));
   if (!entry && !mentioned.size) {
-    // NOBODY named. Two ways that is still addressed at someone, in the order routing.ts uses:
-    // the thread it was said in belongs to an agent, or the chat holds exactly one.
+    // NOBODY named. Two ways that is still addressed at someone: the thread it was said in is a
+    // conversation with an agent already, or the chat holds exactly one and there is no ambiguity.
     for (const b of here) {
       const owner = root ? threadOwner(b.binding.sessionId, "buzz", channel, root) : undefined;
       const owned = owner ? b.agents.find((a) => a.agentId === owner) : undefined;
@@ -373,7 +385,9 @@ async function onChannelMessage(conn: Conn, e: NostrEvent): Promise<void> {
 
   // The turn runs through the same door Slack's does — the server's own thread route — so the
   // bridge, the thread file and the agent's view are all identical either way.
-  // This thread is that agent's from now on: a reply in it needs no mention (routing rule 1).
+  // This thread is a conversation with that agent from now on, so a reply in it needs no `p` tag.
+  // It is remembered for the THREAD, never for the channel: mentioning Sol once does not make the
+  // room Sol's, which is the difference between continuing a conversation and picking an agent.
   rememberThreadOwner(binding.sessionId, "buzz", channel, envelope.thread ?? "", target.agentId);
   const { deliverChannelTurn } = await import("./channelturn.js");
   await deliverChannelTurn(binding.sessionId, key, target.agentId, e.content, envelope);
