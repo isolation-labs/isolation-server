@@ -128,12 +128,30 @@ export async function endChannelsFor(sessionId: string): Promise<void> {
   if (mine.some((b) => isLocal(b.connector))) (await import("./buzz.js")).detachBuzzFor(sessionId);
 }
 
+// WHO OWNS A THREAD in a chat (PLAN §1 I3). Routing's first rule: a reply inside a thread goes to
+// whoever answered in it, so a person names an agent once and then has a conversation. Kept beside
+// the bindings, with the same lifetime — a connector served from this process (Buzz) loses its
+// binding on a restart anyway, so there is nothing here that outlives what it belongs to.
+const threadOwners = new Map<string, string>(); // `${sessionId}\u0000${connector}:${channel}:${ref}` → agentId
+const ownerKey = (sessionId: string, connector: string, channel: string, ref: string) => `${sessionId}\u0000${connector}:${channel}:${ref}`;
+
+export const threadOwner = (sessionId: string, connector: string, channel: string, ref: string): string | undefined =>
+  ref ? threadOwners.get(ownerKey(sessionId, connector, channel, ref)) : undefined;
+
+/** The FIRST agent to answer in a thread keeps it; a later mention of someone else does not steal it. */
+export function rememberThreadOwner(sessionId: string, connector: string, channel: string, ref: string, agentId: string): void {
+  if (!ref || !agentId) return;
+  const k = ownerKey(sessionId, connector, channel, ref);
+  if (!threadOwners.has(k)) threadOwners.set(k, agentId);
+}
+
 export function rememberEnvelope(sessionId: string, threadKey: string, envelope: ChatEnvelope | undefined): void {
   if (envelope) envelopes.set(envelopeKey(sessionId, threadKey), envelope);
 }
 export const envelopeFor = (sessionId: string, threadKey: string): ChatEnvelope | undefined => envelopes.get(envelopeKey(sessionId, threadKey));
 /** Every envelope of a session, whether or not its binding is still attached. */
 export function forgetEnvelopesFor(sessionId: string): void {
+  for (const k of [...threadOwners.keys()]) if (k.startsWith(`${sessionId}\u0000`)) threadOwners.delete(k);
   const prefix = envelopeKey(sessionId, "");
   for (const k of envelopes.keys()) if (k.startsWith(prefix)) envelopes.delete(k);
 }

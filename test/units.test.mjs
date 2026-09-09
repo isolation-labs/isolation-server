@@ -566,3 +566,28 @@ test("every tool the in-sandbox MCP offers over the control channel is one the s
   for (const t of handled) assert.ok(declared.has(t), `the server handles ${t}, which is not in PUMP_TOOLS`);
   assert.ok(declared.size >= 13);
 });
+
+// Thread ownership (PLAN §1 I3, routing rule 1): a reply inside a thread goes to whoever answered
+// in it, so a person names an agent once and then has a conversation. The FIRST agent keeps it —
+// a later mention of someone else in the same thread must not steal it, or a conversation would
+// change hands mid-sentence.
+test("a thread belongs to the first agent that answered in it, per session and per chat", async () => {
+  const ch = await import("../dist/channels.js");
+
+  assert.equal(ch.threadOwner("s-1", "buzz", "C1", "root-1"), undefined, "nothing owns a thread nobody has answered in");
+  ch.rememberThreadOwner("s-1", "buzz", "C1", "root-1", "ag-isla");
+  assert.equal(ch.threadOwner("s-1", "buzz", "C1", "root-1"), "ag-isla");
+
+  ch.rememberThreadOwner("s-1", "buzz", "C1", "root-1", "ag-sol");
+  assert.equal(ch.threadOwner("s-1", "buzz", "C1", "root-1"), "ag-isla", "the first one keeps it");
+
+  // Scoped every way it needs to be: another thread, another chat, another connector, another
+  // session are all different conversations.
+  for (const [s, c, ch2, r] of [["s-1", "buzz", "C1", "root-2"], ["s-1", "buzz", "C2", "root-1"], ["s-1", "slack", "C1", "root-1"], ["s-2", "buzz", "C1", "root-1"]])
+    assert.equal(ch.threadOwner(s, c, ch2, r), undefined, `${s}/${c}/${ch2}/${r}`);
+
+  // An empty reference is not a thread, and must never be remembered as one — every top-level
+  // message would then share a single owner.
+  ch.rememberThreadOwner("s-1", "buzz", "C1", "", "ag-sol");
+  assert.equal(ch.threadOwner("s-1", "buzz", "C1", ""), undefined);
+});

@@ -13,7 +13,7 @@
 // Scope, deliberately: CHANNELS. Direct messages are NIP-17 gift wraps, which need a second and
 // much larger piece of cryptography (NIP-44 + NIP-59); "add an agent to a channel the way you add a
 // person" is what Buzz's own pitch is about, and it is what this does.
-import { channelThreadKey, rememberEnvelope, type ChannelBinding, type ChatEnvelope } from "./channels.js";
+import { channelThreadKey, rememberEnvelope, rememberThreadOwner, threadOwner, type ChannelBinding, type ChatEnvelope } from "./channels.js";
 import { getSessionRecord } from "./sessions.js";
 import {
   MESSAGE_KINDS,
@@ -332,10 +332,27 @@ async function onChannelMessage(conn: Conn, e: NostrEvent): Promise<void> {
   // SOMEONE ELSE: one subscription serves every binding on this relay, so a mention of another
   // session's agent arrives here too, and answering it would be this chat's agent replying to a
   // message addressed to a different one.
+  const root = threadRoot(e);
   let entry = here.find((b) => b.agents.some((a) => mentioned.has(a.pubkey)));
-  if (!entry && !mentioned.size && here.length === 1 && here[0].agents.length === 1) entry = here[0];
-  if (!entry) return;
-  const target = entry.agents.find((a) => mentioned.has(a.pubkey)) ?? entry.agents[0];
+  let target = entry?.agents.find((a) => mentioned.has(a.pubkey));
+  if (!entry && !mentioned.size) {
+    // NOBODY named. Two ways that is still addressed at someone, in the order routing.ts uses:
+    // the thread it was said in belongs to an agent, or the chat holds exactly one.
+    for (const b of here) {
+      const owner = root ? threadOwner(b.binding.sessionId, "buzz", channel, root) : undefined;
+      const owned = owner ? b.agents.find((a) => a.agentId === owner) : undefined;
+      if (owned) {
+        entry = b;
+        target = owned;
+        break;
+      }
+    }
+    if (!entry && here.length === 1 && here[0].agents.length === 1) {
+      entry = here[0];
+      target = here[0].agents[0];
+    }
+  }
+  if (!entry || !target) return;
   const { binding } = entry;
 
   const s = getSessionRecord(binding.sessionId);
@@ -356,6 +373,8 @@ async function onChannelMessage(conn: Conn, e: NostrEvent): Promise<void> {
 
   // The turn runs through the same door Slack's does — the server's own thread route — so the
   // bridge, the thread file and the agent's view are all identical either way.
+  // This thread is that agent's from now on: a reply in it needs no mention (routing rule 1).
+  rememberThreadOwner(binding.sessionId, "buzz", channel, envelope.thread ?? "", target.agentId);
   const { deliverChannelTurn } = await import("./channelturn.js");
   await deliverChannelTurn(binding.sessionId, key, target.agentId, e.content, envelope);
 }
