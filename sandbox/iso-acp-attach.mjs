@@ -44,7 +44,14 @@ const HOST = "127.0.0.1";
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 // stderr, never stdout: stdout is the protocol, and one stray log line corrupts the stream.
-const log = (...a) => process.stderr.write(`[acp-attach] ${a.join(" ")}\n`);
+//
+// AND STRIPPED OF EVERY CONTROL CHARACTER, because stderr here is the PERSON'S TERMINAL — the
+// renderer inherits it straight into the ssh channel — and two of these lines quote whatever
+// answered on the port: an HTTP status line, and the view id a bridge claims. That is not our text.
+// A rogue listener inside the sandbox on a recycled port would be refused (below) and would still
+// get an escape sequence onto the screen at the very moment a person is least oriented. One line
+// each, so nothing but the message itself survives. (C1 too: an 8-bit CSI is a single byte.)
+const log = (...a) => process.stderr.write(`[acp-attach] ${a.join(" ").replace(/[\u0000-\u001f\u007f-\u009f]/g, "")}\n`);
 
 if (!PORT) {
   log("no bridge port — the view may not be running");

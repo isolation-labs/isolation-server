@@ -293,14 +293,21 @@ test("a client that hangs up mid-replay ends the script cleanly — a broken pip
   });
 });
 
-test("a server that is not a WebSocket is refused rather than half-spoken to", async () => {
+test("a server that is not a WebSocket is refused rather than half-spoken to — and its answer cannot drive the terminal", async () => {
+  // The refusal QUOTES THE STATUS LINE, and this stderr is the PERSON'S TERMINAL: the renderer
+  // inherits it into the ssh channel. Whatever answered on the port wrote that line, so an escape in
+  // it would be an instruction and not text — on the very first thing a person sees on connecting.
   const server = net.createServer((s) => {
-    s.on("data", () => s.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"));
+    s.on("data", () => s.write("HTTP/1.1 404 Not \u001b[2JFound\r\nContent-Length: 0\r\n\r\n"));
   });
   const port = await listen(server);
   const child = spawn(process.execPath, [SCRIPT, String(port)], { stdio: ["pipe", "pipe", "pipe"] });
+  let err = "";
+  child.stderr.on("data", (d) => (err += d.toString("utf8")));
   try {
     assert.equal(await exitCode(child), 1, "a non-101 answer is fatal, not something to keep writing frames into");
+    assert.ok(!err.includes("\u001b[2J"), `an escape reached the terminal: ${JSON.stringify(err)}`);
+    assert.match(err, /404 Not \[2JFound/, "…and the line still says what answered, minus the one byte that was not text");
   } finally {
     child.kill("SIGKILL");
     server.close();
@@ -321,10 +328,15 @@ test("the attach refuses a bridge that names a different view — nothing of it 
     child.stderr.on("data", (d) => (err += d.toString("utf8")));
     await bridge.ready;
     // The stale bridge's own hello — a whole conversation, and not the one this route is for.
-    bridge.send(JSON.stringify({ jsonrpc: "2.0", method: "_iso/hello", params: { viewId: "v-someone-else", updates: [{ text: "another agent's transcript" }] } }));
+    // The id it CLAIMS is quoted back in the refusal, and that refusal lands on the person's terminal
+    // (the renderer inherits this stderr into the ssh channel) — so whatever is squatting on the port
+    // gets to write there. Its escapes come out; the name it claimed still reads.
+    bridge.send(JSON.stringify({ jsonrpc: "2.0", method: "_iso/hello", params: { viewId: "v-someone-\u001b[2Jelse", updates: [{ text: "another agent's transcript" }] } }));
     assert.equal(await exitCode(child), 1, "a bridge that is not this view's is fatal");
     assert.equal(out, "", "not one byte of the other conversation was forwarded");
     assert.match(err, /not v-mine's agent view/);
+    assert.ok(!err.includes("\u001b[2J"), `an escape reached the terminal: ${JSON.stringify(err)}`);
+    assert.match(err, /v-someone-/, "…and what it claimed to be still shows");
   });
 });
 
