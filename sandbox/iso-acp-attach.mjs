@@ -25,14 +25,21 @@ import net from "node:net";
 import { randomBytes, createHash } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 
-const PORT = Number(process.env.ISO_ACP_PORT || process.argv[2] || 0);
+// THE ARGUMENTS WIN, AND THEY ARE TAKEN AS A PAIR. The bastion execs this with the route's own
+// port and the view id that port must answer to; the environment is only a by-hand convenience.
+// If env could override either half it would in practice override BOTH — whoever reaches it (an
+// env var the member set on the workspace environment, an sshd that accepts env requests, an edge
+// that starts forwarding them) would name the port AND the id it is checked against, which is the
+// identity check below signing its own waiver. So: when there are arguments, nothing else is read.
+const fromArgv = process.argv[2] !== undefined;
+const PORT = Number((fromArgv ? process.argv[2] : process.env.ISO_ACP_PORT) || 0);
 // WHICH VIEW THIS PORT IS SUPPOSED TO BE. A PORT IS NOT IDENTITY: view ports are handed out from
 // the free ones (launch.ts `nextFree` only avoids LIVE views) and a bridge orphaned by a deleted
 // view is never killed, so another agent's bridge can be sitting on this number — answering
 // happily, and handing whoever asks its whole conversation. The doorman makes exactly this check
 // on the browser's path (`bridgeHealthy`); an ssh client needs it just as much. Empty = unchecked,
-// which is only ever the case when this is run by hand.
-const VIEW_ID = process.env.ISO_ACP_VIEW || process.argv[3] || "";
+// which is only ever the case when this is run by hand — an `acp` route always carries it.
+const VIEW_ID = (fromArgv ? process.argv[3] : process.env.ISO_ACP_VIEW) || "";
 const HOST = "127.0.0.1";
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
