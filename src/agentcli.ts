@@ -315,6 +315,8 @@ export async function runAgentCli(opts: AgentCliOptions): Promise<number> {
   let sessionId = "";
   let nextId = 1;
   let busy = false;
+  /** What we sent, so the bridge's echo of it is not printed under what you typed. */
+  const mine: string[] = [];
   // The id of the prompt we are waiting on, so its answer can be told from any other response.
   let promptId: number | undefined;
   // A permission request is a QUESTION THE AGENT IS BLOCKED ON, so it takes over the prompt until
@@ -349,10 +351,20 @@ export async function runAgentCli(opts: AgentCliOptions): Promise<number> {
           return r.text("agent", green(bold(agentName)), textOf(u.content));
         case "agent_thought_chunk":
           return r.text("thought", dim("thinking"), dim(textOf(u.content)));
-        case "user_message_chunk":
-          // Somebody else is driving — the browser, Slack, another client. Showing it is the point:
-          // this is one conversation with several windows on it.
-          return r.text("user", dim("someone"), dim(textOf(u.content)));
+        case "user_message_chunk": {
+          const text = textOf(u.content);
+          // MY OWN ECHO. The bridge echoes every prompt to every window, the sender included — right
+          // for a browser, which has not drawn it yet, and wrong here, where you typed it at the
+          // prompt and it is already on screen. `from` is "view" for EVERY window, so it cannot tell
+          // mine from anybody else's; the text I sent can.
+          const at = mine.indexOf(text);
+          if (at >= 0) {
+            mine.splice(at, 1);
+            return;
+          }
+          const from = m.params?._meta?.iso?.from;
+          return r.text("user", dim(!from || from === "view" ? "another window" : String(from).slice(0, 40)), dim(text));
+        }
         case "tool_call":
           return r.line(dim(`  · ${u.title ?? u.kind ?? "tool"}`));
         case "tool_call_update":
@@ -424,7 +436,10 @@ export async function runAgentCli(opts: AgentCliOptions): Promise<number> {
   function wireUpdate(u: any) {
     const uu = u?.params?.update;
     if (uu?.sessionUpdate === "agent_message_chunk") r.text("agent", green(bold(agentName)), textOf(uu.content));
-    else if (uu?.sessionUpdate === "user_message_chunk") r.text("user", dim("someone"), dim(textOf(uu.content)));
+    else if (uu?.sessionUpdate === "user_message_chunk") {
+      const from = u?.params?._meta?.iso?.from;
+      r.text("user", dim(!from || from === "view" ? "another window" : String(from).slice(0, 40)), dim(textOf(uu.content)));
+    }
   }
 
   wire.onClose(() => {

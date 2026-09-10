@@ -99,6 +99,14 @@ let nextId = 1;
 let busy = false;
 // The id of the prompt we are waiting on, so its answer can be told from any other response.
 let promptId;
+// WHAT WE JUST SENT, so the bridge's echo of it is not printed underneath what you typed.
+//
+// Every window renders a prompt from the bridge's echo — one source of truth, the sender included
+// (iso-acp-bridge.mjs). In a browser that is right: the page has not drawn it yet. In a TERMINAL it
+// is already on screen, because you typed it at the prompt, so the echo prints it a second time.
+// And the `from` the bridge sends is "view" for EVERY window, so it cannot tell mine from anybody
+// else's; the text I sent can.
+let mine = [];
 // A permission request is a QUESTION THE AGENT IS BLOCKED ON, so it takes over the prompt: anything
 // else typed would go to a turn that is not running.
 let pending;
@@ -114,17 +122,28 @@ function prompt() {
   rl.prompt();
 }
 
-function render(u) {
+function render(u, from) {
   const k = u?.sessionUpdate;
   switch (k) {
     case "agent_message_chunk":
       return say("agent", green(bold(NAME)), textOf(u.content));
     case "agent_thought_chunk":
       return say("thought", dim("thinking"), dim(textOf(u.content)));
-    case "user_message_chunk":
-      // Somebody else is driving — the browser, Slack, another client. Showing it is the point: one
-      // conversation, several windows on it.
-      return say("user", dim("someone"), dim(textOf(u.content)));
+    case "user_message_chunk": {
+      const text = textOf(u.content);
+      // MY OWN ECHO: already on screen, above the prompt I typed it at.
+      const i = mine.indexOf(text);
+      if (i >= 0) {
+        mine.splice(i, 1);
+        return;
+      }
+      // SOMEBODY ELSE IS DRIVING — the browser, Slack, another terminal. Showing it is the point:
+      // one conversation with several windows on it, and a turn you did not start is the thing you
+      // most need to see. `from` names the door where the bridge knows one; "another window" is the
+      // honest answer for a second browser tab or terminal, which it reports only as "view".
+      const who = !from || from === "view" ? "another window" : String(from).slice(0, 40);
+      return say("user", dim(who), dim(text));
+    }
     case "tool_call":
       return line(dim(`  · ${u.title ?? u.kind ?? "tool"}`));
     case "tool_call_update":
@@ -166,7 +185,7 @@ function handle(m) {
     line(yellow(`⚠ ${m.params?.toolCall?.title ?? "the agent is asking permission"}`));
     return prompt();
   }
-  if (m.method === "session/update") return render(m.params?.update ?? m.params);
+  if (m.method === "session/update") return render(m.params?.update ?? m.params, m.params?._meta?.iso?.from);
   if (m.method === "_iso/hello") {
     sessionId = m.params?.sessionId ?? "";
     // THE REPLAY BUFFER HOLDS WHOLE NOTIFICATIONS, not bare updates: the bridge pushes the
@@ -175,7 +194,7 @@ function handle(m) {
     // the default case, and replays an empty transcript under a line announcing how much it replayed.
     const updates = (m.params?.updates ?? []).filter((u) => u?.method === "session/update");
     line(dim(`— ${NAME}${updates.length ? `, ${updates.length} earlier update${updates.length === 1 ? "" : "s"} replayed` : ""} — /exit to leave, /cancel to interrupt —`));
-    for (const u of updates) render(u.params?.update);
+    for (const u of updates) render(u.params?.update, u.params?._meta?.iso?.from);
     // A TURN MAY ALREADY BE RUNNING when we join — somebody else's prompt, from another window. The
     // hello says so, and without reading it the first thing typed here goes into a refusal.
     busy = !!m.params?.turn?.active;
