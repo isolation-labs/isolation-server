@@ -359,6 +359,57 @@ test("authorizedKeysFile keeps real keys, one per line, and drops everything els
   assert.equal(authorizedKeysFile(["junk", ed, `${rsa}\nmore`]), `${ed}\n`);
 });
 
+// A LIVE session's allow-list (PLAN §1c): a key pasted into a running session is authorized in
+// seconds, so the parser behind it decides who gets a shell. It has to say no to anything that is
+// not a key, and it has to recognize the SAME key pasted twice — otherwise "add" quietly stacks
+// duplicates and "revoke" leaves one of them behind.
+const { parseAuthorizedKey } = await import("../dist/launch.js");
+
+test("parseAuthorizedKey: a key knows its own type, and the fingerprint is the one ssh-keygen prints", async () => {
+  const { generateKeyPairSync, createHash } = await import("node:crypto");
+  // A REAL ed25519 key, in the exact form a `.pub` file holds — the shape a person pastes.
+  const { publicKey } = generateKeyPairSync("ed25519");
+  const raw = publicKey.export({ type: "spki", format: "der" }).subarray(-32);
+  const field = (b) => Buffer.concat([Buffer.from([0, 0, 0, b.length]), b]);
+  const blobBuf = Buffer.concat([field(Buffer.from("ssh-ed25519")), field(raw)]);
+  const blob = blobBuf.toString("base64");
+  const line = `ssh-ed25519 ${blob} dan@laptop`;
+
+  const k = parseAuthorizedKey(line);
+  assert.ok(k, "a real public key parses");
+  assert.equal(k.type, "ssh-ed25519");
+  assert.equal(k.comment, "dan@laptop");
+  assert.equal(k.fingerprint, `SHA256:${createHash("sha256").update(blobBuf).digest("base64").replace(/=+$/, "")}`);
+  // Same key, different comment and spacing = the SAME key. Add is idempotent on this.
+  assert.equal(parseAuthorizedKey(`  ssh-ed25519   ${blob}   someone-else  `).fingerprint, k.fingerprint);
+  assert.equal(parseAuthorizedKey(`ssh-ed25519 ${blob}`).line, `ssh-ed25519 ${blob}`, "no comment, no trailing space");
+
+  // The blob must DECLARE the type it is offered as: "ssh-ed25519 <an rsa key>" is not an ed25519
+  // key, and neither is base64 of anything else. This is what a shape-only check would let through.
+  assert.equal(parseAuthorizedKey(`ssh-rsa ${blob} dan`), undefined, "type/blob mismatch is refused");
+  assert.equal(parseAuthorizedKey("ssh-ed25519 aGVsbG8gd29ybGQ= dan"), undefined);
+  // Not keys at all — including the private half, which is the paste people actually get wrong.
+  assert.equal(parseAuthorizedKey("-----BEGIN OPENSSH PRIVATE KEY-----"), undefined);
+  assert.equal(parseAuthorizedKey(""), undefined);
+  assert.equal(parseAuthorizedKey(undefined), undefined);
+  assert.equal(parseAuthorizedKey({ line }), undefined, "off the wire, so a non-string is just no key");
+  // A `.pub` file ENDS in a newline, so its literal contents are the normal paste — and the same
+  // trailing newline rides along in key lists stored elsewhere. It must parse, or a member with a
+  // perfectly good key is told it is not one (and a launch silently drops it).
+  assert.equal(parseAuthorizedKey(`${line}\n`).fingerprint, k.fingerprint, "a trailing newline is trimmed, not fatal");
+  assert.equal(parseAuthorizedKey(`\n${line}\r\n`).line, k.line);
+  assert.equal(authorizedKeysFile([`${line}\n`]), `${k.line}\n`);
+  // INJECTION: this list is an allow-list, and it is handed to the SHARED bastion as well as
+  // written into a file sshd reads line by line. A newline that SURVIVES the trim is inside the
+  // key, and that is the one this must refuse.
+  assert.equal(parseAuthorizedKey(`${line}\nssh-ed25519 ${blob} evil`), undefined);
+  assert.equal(parseAuthorizedKey(`ssh-ed25519 ${blob} dan\r\nevil`), undefined);
+  // A comment is free text from someone's own machine: bounded and printable, never a way to add
+  // a field of its own.
+  assert.equal(parseAuthorizedKey(`ssh-ed25519 ${blob} we\u0007ird`).comment, "weird");
+  assert.ok(parseAuthorizedKey(`ssh-ed25519 ${blob} ${"x".repeat(400)}`).comment.length <= 120);
+});
+
 const { ensureSshCapability } = await import("../dist/runtime.js");
 
 test("ensureSshCapability pulls AUDIT_WRITE back, keeps every other drop", () => {

@@ -10,7 +10,7 @@ import { randomBytes } from "node:crypto";
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DATA, HOST, PORT, ensureDataDir, getSandbox } from "./config.js";
-import { authorizedKeysFile, launch, scaffoldView, type LaunchRequest, type ViewSpec } from "./launch.js";
+import { authorizedKeysFile, installAuthorizedKeys, installBastionKey, launch, parseAuthorizedKey, scaffoldView, startSshAccess, type LaunchRequest, type ViewSpec } from "./launch.js";
 import { deleteSandbox } from "./opensandbox.js";
 import { closeSsh, openSsh } from "./sshfwd.js";
 import { bastion, modeForView, sshCommandFor, CONTAINER_SSH_PORT } from "./bastion.js";
@@ -63,6 +63,11 @@ export interface SessionRecord {
   // The member's PUBLIC keys, kept so a bastion route can be registered (or re-registered on a
   // reconnect) long after the launch body is gone. Public keys — nothing here is a secret.
   authorizedKeys?: string[];
+  // Which of those keys were authorized AFTER the launch, by fingerprint (`ssh-keys` API). A
+  // session-only grant: it is not a credential on anybody's account, it is never written back to
+  // the workspace, and it dies with this session. The map exists so the list can say where a key
+  // came from — an account key comes back on the next launch, one of these does not.
+  addedKeys?: Record<string, { addedAt: number; via?: string }>;
 }
 
 let sessions: Record<string, SessionRecord> = {};
@@ -373,6 +378,158 @@ export async function finishSession(id: string): Promise<void> {
  */
 export function sshKeysFor(sessionId: string): string[] {
   return authorizedKeysFile(sessions[sessionId]?.authorizedKeys).split("\n").filter(Boolean);
+}
+
+// --- ssh keys on a LIVE session -----------------------------------------------------------------
+//
+// Letting somebody in — a colleague pairing for an hour, a laptop whose key is not on the account,
+// an agent that wants its own way back in — used to mean editing the account's credentials and
+// launching the session again, which throws away the very state the visitor was invited to see.
+// These three take effect on a RUNNING session: the file inside the sandbox and the bastion's
+// allow-list are both rewritten from the record, and nothing restarts.
+//
+// The grant is the SESSION's, deliberately: no credential is created, nothing is written back to
+// the workspace, and it is gone when the session finishes (BACKLOG has the "promote to account
+// key" follow-up). A key added here is exactly as powerful as one from the account — this is a
+// shell in the sandbox — so the list says where each key came from and any of them can be revoked.
+
+/** One authorized key, as a caller should see it: never the blob, always the fingerprint. */
+export interface SessionKeyInfo {
+  fingerprint: string;
+  type: string;
+  comment: string;
+  /** `account` = came with the launch (and comes back on the next one); `session` = added here. */
+  source: "account" | "session";
+  addedAt?: number;
+  via?: string;
+}
+
+function keyInfo(rec: SessionRecord, line: string): SessionKeyInfo | undefined {
+  const k = parseAuthorizedKey(line);
+  if (!k) return undefined;
+  const added = rec.addedKeys?.[k.fingerprint];
+  return { fingerprint: k.fingerprint, type: k.type, comment: k.comment, source: added ? "session" : "account", ...(added ? { addedAt: added.addedAt, ...(added.via ? { via: added.via } : {}) } : {}) };
+}
+
+export function listSessionKeys(sessionId: string): SessionKeyInfo[] {
+  const rec = sessions[sessionId];
+  if (!rec) return [];
+  return (rec.authorizedKeys ?? []).map((l) => keyInfo(rec, l)).filter((k): k is SessionKeyInfo => !!k);
+}
+
+/**
+ * Push the record's allow-list into the running sandbox AND out to the bastion — the two places a
+ * key has to be for `ssh` to work — and bring sshd up if this is the first key the session ever
+ * had (a launch with no key never started it: launch.ts).
+ *
+ * Throws when the sandbox refuses the write: the caller is a person who just pasted a key and is
+ * about to try it, so "added" has to mean it actually works.
+ */
+async function applyKeys(rec: SessionRecord): Promise<boolean> {
+  if (!rec.sandboxId) throw new Error("this session has no sandbox yet");
+  const keys = rec.authorizedKeys ?? [];
+  // clearWhenEmpty: revoking the LAST key must truncate the file, or the key just revoked would go
+  // on working for the life of the sandbox.
+  if (!(await installAuthorizedKeys(rec.sandboxId, keys, undefined, { clearWhenEmpty: true }))) {
+    throw new Error("the sandbox would not accept the key — it may be starting up or asleep");
+  }
+  // sshd was never started for a session that launched without a key and without a bastion. Now
+  // there is a reason for it, so start it — that is what makes this work with no relaunch.
+  if (rec.sshd !== true && keys.length) {
+    // The bastion's agent key is the OTHER half of the edge hop: the end user's key is verified at
+    // the bastion, and THIS is what the container itself trusts (launch.ts). A launch that never
+    // called `startSshAccess` never installed it either — and `syncRoutes` below is about to
+    // publish a route — so put it in first, or the route would be a command whose only possible
+    // answer is "permission denied".
+    const agentKey = bastion.agentPublicKey();
+    if (agentKey) await installBastionKey(rec.sandboxId, agentKey);
+    const up = await startSshAccess(rec.sandboxId);
+    update(rec.id, { sshd: up });
+    if (up) {
+      const port = await openSsh(rec.id, rec.sandboxId).catch(() => null);
+      if (port && sessions[rec.id]) update(rec.id, { sshPort: port });
+    }
+  }
+  syncRoutes(rec.id, rec.sandboxId);
+  return sessions[rec.id]?.sshd === true;
+}
+
+/**
+ * Apply the record's list, and leave the record listing EVERY key that might now be in the sandbox
+ * if the push failed — the union of what it said before and what it says after.
+ *
+ * The record is written first (it is what `listSessionKeys` and the bastion read), so a failed push
+ * leaves the two disagreeing, and only one direction of disagreement is safe. A list that shows a
+ * key the sandbox will not let in is a cosmetic lie the next revoke clears. A list that OMITS a key
+ * the sandbox does let in is the dangerous one: it opens a shell for the life of the session while
+ * being invisible and un-revokable, because the next DELETE answers "no key with that fingerprint".
+ *
+ * And a failure genuinely cannot say which happened: `installAuthorizedKeys` reports a command that
+ * ran and failed the same way as one that never ran, and a dropped connection AFTER the sandbox
+ * wrote the file looks identical to one before. So the union is the only shape that is always safe
+ * — for a failed add and a failed revoke alike — and both are retried simply by asking again.
+ */
+async function pushKeys(sessionId: string, before: Pick<SessionRecord, "authorizedKeys" | "addedKeys">): Promise<boolean> {
+  try {
+    return await applyKeys(sessions[sessionId]!);
+  } catch (e) {
+    const rec = sessions[sessionId];
+    if (rec) {
+      const merged = new Map<string, string>();
+      for (const line of [...(before.authorizedKeys ?? []), ...(rec.authorizedKeys ?? [])]) {
+        const p = parseAuthorizedKey(line);
+        if (p) merged.set(p.fingerprint, p.line);
+      }
+      update(sessionId, {
+        authorizedKeys: [...merged.values()],
+        // Keep the provenance of anything that comes back, so a key restored by this path is still
+        // labelled `session` rather than quietly reading as one the account carries.
+        addedKeys: { ...(rec.addedKeys ?? {}), ...(before.addedKeys ?? {}) },
+      });
+    }
+    throw e;
+  }
+}
+
+export async function authorizeSessionKey(sessionId: string, input: unknown, via?: string): Promise<{ key: SessionKeyInfo; keys: SessionKeyInfo[]; ssh: boolean }> {
+  const rec = sessions[sessionId];
+  if (!rec) throw new Error("unknown session");
+  if (rec.state !== "ready") throw new Error(rec.state === "stopped" ? "this session is asleep — resume it and add the key then" : "this session is not ready yet");
+  const k = parseAuthorizedKey(input);
+  if (!k) throw new Error("that is not an ssh public key — paste one line, the contents of a .pub file (`ssh-ed25519 AAAA… you@laptop`)");
+  const before = { authorizedKeys: rec.authorizedKeys, addedKeys: rec.addedKeys };
+  const current = (rec.authorizedKeys ?? []).map((l) => parseAuthorizedKey(l)).filter((p): p is NonNullable<typeof p> => !!p);
+  // ALREADY THERE IS SUCCESS, not an error: re-pasting the same key (or one the account already
+  // carries) is somebody making sure, and the honest answer is that it is authorized.
+  const dup = current.find((p) => p.blob === k.blob);
+  if (!dup) {
+    if (current.length >= 50) throw new Error("this session already has 50 authorized keys — revoke one first");
+    update(sessionId, {
+      authorizedKeys: [...current.map((p) => p.line), k.line],
+      addedKeys: { ...(rec.addedKeys ?? {}), [k.fingerprint]: { addedAt: Date.now(), ...(via ? { via: via.slice(0, 60) } : {}) } },
+    });
+  }
+  const ssh = await pushKeys(sessionId, before);
+  const keys = listSessionKeys(sessionId);
+  return { key: keys.find((x) => x.fingerprint === k.fingerprint) ?? keyInfo(sessions[sessionId]!, k.line)!, keys, ssh };
+}
+
+export async function revokeSessionKey(sessionId: string, fingerprint: unknown): Promise<{ revoked: SessionKeyInfo; keys: SessionKeyInfo[] }> {
+  const rec = sessions[sessionId];
+  if (!rec) throw new Error("unknown session");
+  if (rec.state !== "ready") throw new Error(rec.state === "stopped" ? "this session is asleep — resume it to change its keys" : "this session is not ready yet");
+  const want = String(fingerprint ?? "").trim();
+  const gone = listSessionKeys(sessionId).find((k) => k.fingerprint === want);
+  if (!gone) throw new Error("this session has no key with that fingerprint");
+  const before = { authorizedKeys: rec.authorizedKeys, addedKeys: rec.addedKeys };
+  const addedKeys = { ...(rec.addedKeys ?? {}) };
+  delete addedKeys[want];
+  update(sessionId, {
+    authorizedKeys: (rec.authorizedKeys ?? []).filter((l) => parseAuthorizedKey(l)?.fingerprint !== want),
+    addedKeys,
+  });
+  await pushKeys(sessionId, before);
+  return { revoked: gone, keys: listSessionKeys(sessionId) };
 }
 
 // Register a bastion route for every ssh-shaped view of a sandbox — terminal views, which attach

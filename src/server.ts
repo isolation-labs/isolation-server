@@ -22,13 +22,16 @@ import { pauseSession, resumeSession,
   actorFrom,
   createSessionView,
   davConnect,
+  authorizeSessionKey,
   dropSshForSandbox,
   finishSession,
   getSessionRecord,
+  listSessionKeys,
   listSessionRecords,
   mayOpen,
   mayTearDown,
   renameSession,
+  revokeSessionKey,
   sessionForSandbox,
   sessionChanges,
   sessionJson,
@@ -750,6 +753,32 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
           return json(res, err.conflict ? 409 : 502, { error: err.message, merged: false, conflict: !!err.conflict });
         }
       }
+      // WHO MAY SSH IN, changed on a LIVE session (PLAN §1c). A key pasted here is authorized in
+      // seconds — the sandbox's authorized_keys and the bastion's allow-list are both rewritten,
+      // sshd is started if the launch never had a reason to — and nothing restarts. It is a
+      // session-scoped grant: no credential is created anywhere, and it dies with the session.
+      if (method === "GET" && action === "ssh-keys") return json(res, 200, { keys: listSessionKeys(id), ssh: s.sshd !== false });
+      if (method === "POST" && action === "ssh-keys") {
+        const b = await readBody(req);
+        try {
+          const out = await authorizeSessionKey(id, b.key, typeof b.via === "string" ? b.via : "web");
+          return json(res, 200, out);
+        } catch (e) {
+          // Everything this throws is something the caller can act on (a bad paste, an asleep
+          // session) — 400, never a 500 that reads as "Isolation is broken".
+          return json(res, 400, { error: String((e as Error)?.message ?? e) });
+        }
+      }
+      if (method === "DELETE" && action === "ssh-keys") {
+        // The fingerprint rides in the BODY: it is `SHA256:<base64>`, and base64 in a path is a
+        // trail of encoding bugs for nothing gained.
+        const b = await readBody(req).catch(() => ({}) as Record<string, unknown>);
+        try {
+          return json(res, 200, await revokeSessionKey(id, b.fingerprint));
+        } catch (e) {
+          return json(res, 400, { error: String((e as Error)?.message ?? e) });
+        }
+      }
       if (method === "POST" && action === "rename") {
         const b = await readBody(req);
         return json(res, 200, sessionJson(renameSession(id, String(b.name ?? "")) ?? s));
@@ -859,7 +888,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // normal state for a member with no ssh public key, because sshd still comes up for the
     // bastion's own agent key. Same rule as the dark-bastion case below: never hand out a command
     // whose only possible answer is "permission denied". Not temporary, so not a 503.
-    if (!sshKeysFor(id).length) return json(res, 409, { error: "no ssh public key is authorized for this session — add one to your account and start the session again" });
+    if (!sshKeysFor(id).length) return json(res, 409, { error: "no ssh public key is authorized for this session — add one (POST /sessions/<id>/ssh-keys, or \u201cAllow a key\u201d on the session screen); it takes effect at once, nothing restarts" });
     // Mint the route id now if the view predates the bastion, and make sure it is actually
     // registered — the answer must not be a command that nothing at the edge would recognize.
     const routeId = ensureRouteId(vid);

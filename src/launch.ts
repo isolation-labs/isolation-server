@@ -3,7 +3,7 @@
 // secrets, clone the repos, start the view processes. The devcontainer pipeline and
 // workspace persistence layer on top of this in later phases; nothing here persists
 // a secret beyond the sandbox's lifetime.
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -470,10 +470,58 @@ export function authorizedKeysFile(keys: unknown): string {
   // Keep only what sshd would actually accept, so one malformed paste can't shift the lines below
   // it out of use. A newline inside a "key" would inject extra entries — drop those outright.
   // The list comes off the wire, so a non-array is just "no keys" — never a thrown launch.
-  const clean = (Array.isArray(keys) ? keys : [])
-    .map((k) => String(k ?? "").trim())
-    .filter((k) => k && !/[\r\n]/.test(k) && /^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)\s+\S+/.test(k));
-  return clean.length ? `${clean.join("\n")}\n` : "";
+  const clean = (Array.isArray(keys) ? keys : []).map((k) => parseAuthorizedKey(k)).filter((k): k is AuthorizedKey => !!k);
+  return clean.length ? `${clean.map((k) => k.line).join("\n")}\n` : "";
+}
+
+/** One public key, as sshd would read it — plus the fingerprint a person recognizes it by. */
+export interface AuthorizedKey {
+  /** The line that goes in the file: type + blob + comment, whitespace normalized. */
+  line: string;
+  type: string;
+  /** base64 body — the key ITSELF, and what makes two pastes of the same key the same key. */
+  blob: string;
+  comment: string;
+  /** `SHA256:…`, the same string `ssh-keygen -lf` prints, so it matches what a person sees locally. */
+  fingerprint: string;
+}
+
+// Accepted algorithms. `dss` stays only because the launch path has always taken it; nothing new
+// should be added here without a reason — an unknown word in this position is a paste, not a key.
+const KEY_TYPE_RE = /^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)$/;
+
+/**
+ * Parse ONE `authorized_keys` line. Undefined = not a public key, and callers treat that as "no",
+ * never as "pass it through and let sshd decide": this is an authentication allow-list, and the
+ * same text is handed to the bastion, which is SHARED across every server on the cloud.
+ *
+ * Surrounding whitespace is trimmed FIRST and only then is a newline fatal: a `.pub` file ends in
+ * one, so its literal contents are the normal paste and must parse. A newline that survives the
+ * trim is INSIDE the key, and that is the one character that would turn a single key into several
+ * entries in whatever file or wire list this ends up in — so that one is refused outright.
+ */
+export function parseAuthorizedKey(input: unknown): AuthorizedKey | undefined {
+  const raw = String(input ?? "").trim();
+  if (/[\r\n]/.test(raw)) return undefined;
+  const parts = raw.split(/\s+/);
+  const [type, blob, ...rest] = parts;
+  if (!type || !blob || !KEY_TYPE_RE.test(type)) return undefined;
+  // Base64, and it must decode to a blob that names its own type — the belt-and-braces check that
+  // makes "ssh-ed25519 hello" (which passes a shape test) fail here.
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(blob)) return undefined;
+  let decoded: Buffer;
+  try {
+    decoded = Buffer.from(blob, "base64");
+  } catch {
+    return undefined;
+  }
+  if (decoded.length < 4 + type.length) return undefined;
+  if (decoded.readUInt32BE(0) !== type.length || decoded.subarray(4, 4 + type.length).toString("utf8") !== type) return undefined;
+  // The comment is free text a person typed on their own machine — keep it readable and bounded,
+  // and strip anything that is not printable so it cannot dress itself up as another field.
+  const comment = rest.join(" ").replace(/[^\x20-\x7e]/g, "").slice(0, 120).trim();
+  const fingerprint = `SHA256:${createHash("sha256").update(decoded).digest("base64").replace(/=+$/, "")}`;
+  return { line: `${type} ${blob}${comment ? ` ${comment}` : ""}`, type, blob, comment, fingerprint };
 }
 
 // The in-sandbox ssh daemon's port. Not 22: the sandbox may already have something there, and
@@ -569,18 +617,42 @@ async function startSshBridge(sandboxId: string, onPhase?: (p: string) => void):
   return true;
 }
 
-export async function installAuthorizedKeys(sandboxId: string, keys: unknown, onPhase?: (p: string) => void): Promise<void> {
+/**
+ * Write the session's whole allow-list into the sandbox. It is a REPLACE, not an append: the list
+ * on the record is the truth, so a key revoked there stops working here without anyone having to
+ * edit a file line by line.
+ *
+ * `clearWhenEmpty` is what separates the two callers. A LAUNCH with no keys must leave the file
+ * alone — an image may ship its own `authorized_keys`, and truncating it would take away access
+ * nobody asked us to touch. A REVOCATION of the last key must write the empty file, or the key
+ * just revoked would go on working until the sandbox died.
+ */
+export async function installAuthorizedKeys(sandboxId: string, keys: unknown, onPhase?: (p: string) => void, opts: { clearWhenEmpty?: boolean } = {}): Promise<boolean> {
   const content = authorizedKeysFile(keys);
-  if (!content) return;
+  if (!content && !opts.clearWhenEmpty) return false;
   onPhase?.("installing ssh keys");
   try {
     // ~ is the sandbox user's home, whoever that is — never a hardcoded /root. sshd REFUSES to
     // read either path if the modes are looser than these.
-    await run(sandboxId, `mkdir -p ~/.ssh && chmod 700 ~/.ssh`);
+    //
+    // Echo a marker and check for it rather than trusting the call to have worked: `run()` reports
+    // a transport failure by throwing, but a command that RAN and failed (read-only home, no disk)
+    // comes back like any other. The live path turns this boolean into "the key is authorized" —
+    // and, on a revocation, into "that key can no longer get in" — so it has to be earned.
+    const dir = await run(sandboxId, `mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo ISO_KEYS_OK`);
+    if (!dir.stdout.includes("ISO_KEYS_OK")) return false;
+    // The empty list is TRUNCATED with the shell rather than uploaded: a zero-byte multipart part
+    // is exactly the kind of edge execd need not accept, and there is nothing to transfer anyway.
+    if (!content) {
+      const cleared = await run(sandboxId, `: > ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo ISO_KEYS_OK`);
+      return cleared.stdout.includes("ISO_KEYS_OK");
+    }
     await writeFile(sandboxId, "/tmp/.iso-authorized_keys", content, 0o600);
-    await run(sandboxId, `cat /tmp/.iso-authorized_keys > ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && rm -f /tmp/.iso-authorized_keys`);
+    const wrote = await run(sandboxId, `cat /tmp/.iso-authorized_keys > ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && rm -f /tmp/.iso-authorized_keys && echo ISO_KEYS_OK`);
+    return wrote.stdout.includes("ISO_KEYS_OK");
   } catch {
-    /* ssh access is a convenience; never fail a launch over it */
+    /* ssh access is a convenience; never fail a LAUNCH over it — the live path reads the result */
+    return false;
   }
 }
 
