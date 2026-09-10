@@ -397,10 +397,11 @@ test("an agent view opens with a plain ssh — the same line a terminal view use
     // what a person types.
     assert.equal(b.sshCommandFor("r0ute1"), acp.command);
     assert.equal(b.sshCommandFor("r0ute2"), term.command);
-    // Only the two types that have a real door get one.
+    // Only the types that have a real door get one. A directory view still has none: files mean a
+    // native mount, not a shell wearing a folder's label.
     assert.equal(b.modeForView("terminal"), "tmux");
     assert.equal(b.modeForView("agent"), "acp");
-    assert.equal(b.modeForView("code"), undefined);
+    assert.equal(b.modeForView("code"), "shell");
     assert.equal(b.modeForView("directory"), undefined);
   } finally {
     b.bastion.disable();
@@ -776,4 +777,50 @@ test("a thread belongs to the first agent that answered in it, per session and p
   // message would then share a single owner.
   ch.rememberThreadOwner("s-1", "buzz", "C1", "", "ag-sol");
   assert.equal(ch.threadOwner("s-1", "buzz", "C1", ""), undefined);
+});
+
+test("a code view opens in a local editor — links only, and every one of them the editor's own form", async () => {
+  // A code view's route is a plain `shell` because that is what a remote IDE drives: the editor
+  // ships its own server into the sandbox over that ssh and speaks its protocol across it. So the
+  // payload carries BUTTONS, not a line to type — the member never learns an ssh command.
+  const cfg0 = await import("../dist/config.js");
+  const b = await import("../dist/bastion.js");
+  cfg0.saveBastion({ controlHost: "127.0.0.1", controlPort: 1, publicHost: "ssh.example.cc", edgePort: 2222, daemonLabel: "d-1", registerSecret: "s" });
+  b.bastion.startIfConfigured();
+  try {
+    const code = b.nativeConnectFor("r0ute3", "s-1", "v-3", "shell");
+    assert.equal(code.kind, "code");
+    assert.equal(code.path, "/workspace");
+    const byId = Object.fromEntries(code.editors.map((e) => [e.id, e.url]));
+    // The VS Code family resolves `ssh-remote+<user>@<host>[:<port>]` itself — the form its own
+    // HostInfo.fromString parses. The forks differ only in the scheme. `?windowId=_blank` is
+    // load-bearing: without it VS Code takes over a window the member already had open.
+    assert.equal(byId.vscode, "vscode://vscode-remote/ssh-remote+r0ute3@ssh.example.cc:2222/workspace?windowId=_blank");
+    assert.equal(byId.cursor, "cursor://vscode-remote/ssh-remote+r0ute3@ssh.example.cc:2222/workspace?windowId=_blank");
+    assert.equal(byId.windsurf, "windsurf://vscode-remote/ssh-remote+r0ute3@ssh.example.cc:2222/workspace?windowId=_blank");
+    // Zed's is its own documented shape, not the VS Code one.
+    assert.equal(byId.zed, "zed://ssh/r0ute3@ssh.example.cc:2222/workspace");
+    // No command is rendered for this view type, but one still rides along: it is the truth about
+    // the route, and it is what a support conversation needs.
+    assert.equal(code.command, "ssh r0ute3@ssh.example.cc -p 2222");
+    assert.equal(code.vscodeUrl, undefined, "the daemon-era single button named ONE editor — the menu replaces it");
+  } finally {
+    b.bastion.disable();
+    cfg0.saveBastion(undefined);
+  }
+});
+
+test("editor links omit the default port, and refuse an authority that could smuggle a target", async () => {
+  const b = await import("../dist/bastion.js");
+  // Port 22 is the normal bastion edge, and an editor that is handed `:22` may treat the authority
+  // as a different host than the same one without it — so it is left off, exactly as the ssh line is.
+  const plain = b.editorLinks("r0ute4", "ssh.example.cc");
+  assert.equal(plain[0].url, "vscode://vscode-remote/ssh-remote+r0ute4@ssh.example.cc/workspace?windowId=_blank");
+  assert.equal(plain.find((e) => e.id === "zed").url, "zed://ssh/r0ute4@ssh.example.cc/workspace");
+  // These strings are spliced into a scheme the OS will LAUNCH. Route ids are base36 and the host is
+  // a hostname, so this never fires in practice — the day one of them is not, it must be a missing
+  // button rather than a crafted link.
+  assert.deepEqual(b.editorLinks("r0ute4/../evil", "ssh.example.cc"), []);
+  assert.deepEqual(b.editorLinks("r0ute4", "evil.example.cc/x?y="), []);
+  assert.deepEqual(b.editorLinks("r0ute4@other", "ssh.example.cc"), []);
 });

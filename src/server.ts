@@ -812,10 +812,11 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     return json(res, 200, viewJson(nv, id));
   }
 
-  // "Open externally" (the daemon's nativeConnect contract): hand the web a ready-to-run `ssh`
-  // command for this view. TERMINAL AND AGENT ONLY — each lands in the very thing the browser view
-  // is showing (that tmux session; that conversation), which is the whole point; every other view
-  // type is deliberately not connectable (`modeForView`, bastion.ts).
+  // "Open externally" (the daemon's nativeConnect contract): hand the web what it needs to open this
+  // view outside the browser. A terminal or agent view gets a ready-to-run `ssh` line landing in the
+  // very thing the page is showing; a CODE view gets editor deep links instead, because an IDE
+  // drives the ssh itself and there is nothing for a person to type. A directory view is still
+  // deliberately not connectable (`modeForView`, bastion.ts).
   const nc = /^\/sessions\/(s-[a-z0-9]+)\/views\/([a-zA-Z0-9-]+)\/connect$/.exec(url);
   if (nc && method === "POST") {
     const [, id, vid] = nc;
