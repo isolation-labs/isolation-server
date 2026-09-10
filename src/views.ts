@@ -176,6 +176,26 @@ export function mintViewToken(viewId: string, ttlSec = 3600): string {
   return `${body}.${sign(body)}`;
 }
 
+// --- the files-view mount credential -------------------------------------
+//
+// A mounted drive needs a credential a person can TYPE ONCE and a keychain can keep, so unlike a
+// view token this one does not expire and does not change between calls: it is derived from the
+// view id, so the same view always shows the same password and a mount survives every restart of
+// this server. Its lifetime is the VIEW's — the id dies with the session, and nothing else in the
+// system accepts it (the doorman takes it only on that view's /dav path).
+//
+// Base64url of a truncated HMAC: 24 characters, 144 bits, and no `:` — which matters, because HTTP
+// Basic splits the credential on the first colon.
+const DAV_PASSWORD_LEN = 24;
+export const davPassword = (viewId: string): string => createHmac("sha256", getToken()).update(`dav:${viewId}`).digest("base64url").slice(0, DAV_PASSWORD_LEN);
+
+export function verifyDavPassword(candidate: string | undefined, viewId: string): boolean {
+  if (!candidate || candidate.length !== DAV_PASSWORD_LEN) return false;
+  const a = Buffer.from(candidate);
+  const b = Buffer.from(davPassword(viewId));
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 export function verifyViewToken(token: string | undefined, viewId: string): boolean {
   if (!token || !token.includes(".")) return false;
   const [body, mac] = token.split(".");

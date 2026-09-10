@@ -422,10 +422,11 @@ export const bastion = new BastionClient();
 // Which view types are reachable over ssh, and how.
 //
 // TERMINAL AND AGENT, deliberately — and nothing else. Each of those attaches the very thing the
-// browser view is showing, which is a feature you can explain in a sentence. `code` and `directory`
-// would each be a plain shell wearing a different label, which is a worse thing to ship than
-// nothing: `code` promises VS Code Remote (its own setup story) and `directory` promises files
-// (which means SMB, not ssh). Neither is decided, so neither gets an address.
+// browser view is showing, which is a feature you can explain in a sentence. `code` would be a
+// plain shell wearing a different label (it promises VS Code Remote, its own setup story), which is
+// a worse thing to ship than nothing. `directory` promises FILES, and its door is not ssh at all:
+// it mounts over WebDAV through the doorman (webdav.ts), which every desktop opens with nothing
+// installed and no port but 443.
 /**
  * WHICH DOOR A VIEW HAS, and the route type is the whole of it — a person types
  * `ssh <routeId>@<host>` and the bastion already knows what that route is for.
@@ -436,8 +437,8 @@ export const bastion = new BastionClient();
  *                    the same session, live, both ways, so an external ACP client and the session
  *                    screen are two windows on one thing.
  *
- * A code or directory view has no external door yet, and answering `undefined` is what keeps it
- * from getting one by accident.
+ * A code view has no external door yet, and answering `undefined` is what keeps it from getting one
+ * by accident. A directory view's door is WebDAV, not ssh — see the note above.
  */
 export function modeForView(type: string): RouteMode | undefined {
   if (type === "terminal") return "tmux";

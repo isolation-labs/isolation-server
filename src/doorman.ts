@@ -12,10 +12,11 @@ import type { Duplex } from "node:stream";
 import httpProxy from "http-proxy-3";
 import { getSandbox, tokenMatches } from "./config.js";
 import { endpointFor } from "./opensandbox.js";
-import { getView, verifyViewToken, viewBySlug, type View } from "./views.js";
+import { getView, verifyDavPassword, verifyViewToken, viewBySlug, type View } from "./views.js";
 import { startWebForwarder, webForwarderAlive } from "./launch.js";
 import { handleCodeView } from "./codeview.js";
 import { handleAgentView } from "./agentview.js";
+import { handleWebdav } from "./webdav.js";
 import { ensureBridge } from "./acpview.js";
 
 const proxy = httpProxy.createProxyServer({ ws: true, xfwd: true });
@@ -51,7 +52,29 @@ proxy.on("proxyRes", (proxyRes) => {
 
 const VIEW_RE = /^\/v\/([a-zA-Z0-9-]+)(\/.*)?$/;
 
+// The name a file client shows in its credential prompt and saves the mount under. The view's own
+// label when it has one, so a member with two files views can tell the two keychain entries apart.
+const davRealm = (view: View): string => (view.label ?? "Files").replace(/[^\x20-\x7e]/g, "").replace(/["\\]/g, "").slice(0, 60) || "Files";
+
 export const viewIdFromUrl = (url: string | undefined): string | undefined => VIEW_RE.exec((url ?? "").split("?")[0])?.[1];
+
+// The token an HTTP Basic credential carries, if any. A native file client (Finder, Explorer,
+// GNOME Files) has NO other way to authenticate a mount: it cannot append a query parameter to the
+// requests it generates itself and it will not carry a bearer. The token is taken from the password
+// — where a client stores it in the OS keychain and where the username is free to be a label — and
+// from the username as a fallback, for clients that send a password-less credential.
+export function basicToken(auth: string | undefined): string | undefined {
+  if (!auth || !/^basic /i.test(auth)) return undefined;
+  let decoded: string;
+  try {
+    decoded = Buffer.from(auth.slice(6).trim(), "base64").toString("utf8");
+  } catch {
+    return undefined;
+  }
+  const colon = decoded.indexOf(":");
+  if (colon < 0) return decoded || undefined;
+  return decoded.slice(colon + 1) || decoded.slice(0, colon) || undefined;
+}
 
 function tokenFromRequest(req: IncomingMessage, viewId: string): string | undefined {
   const u = new URL(req.url ?? "/", "http://x");
@@ -59,6 +82,8 @@ function tokenFromRequest(req: IncomingMessage, viewId: string): string | undefi
   if (q) return q;
   const auth = req.headers.authorization;
   if (auth?.startsWith("Bearer ")) return auth.slice(7);
+  const basic = basicToken(auth);
+  if (basic) return basic;
   const cookies = req.headers.cookie ?? "";
   for (const c of cookies.split(";")) {
     const [k, ...rest] = c.trim().split("=");
@@ -68,9 +93,12 @@ function tokenFromRequest(req: IncomingMessage, viewId: string): string | undefi
   return undefined;
 }
 
-const authorized = (req: IncomingMessage, viewId: string): { ok: boolean; queryToken?: string } => {
+// `isDav` widens the accepted credentials by exactly one: the view's stable mount password
+// (views.ts davPassword), which is deliberately confined to that view's own /dav path. It is the
+// one credential here that never expires, so it must not become a way in anywhere else.
+const authorized = (req: IncomingMessage, viewId: string, isDav = false): { ok: boolean; queryToken?: string } => {
   const t = tokenFromRequest(req, viewId);
-  const ok = !!t && (tokenMatches(t) || verifyViewToken(t, viewId));
+  const ok = !!t && (tokenMatches(t) || verifyViewToken(t, viewId) || (isDav && verifyDavPassword(t, viewId)));
   const u = new URL(req.url ?? "/", "http://x");
   return { ok, queryToken: u.searchParams.get("token") ?? undefined };
 };
@@ -82,9 +110,18 @@ const authorized = (req: IncomingMessage, viewId: string): { ok: boolean; queryT
 // the caller's other headers verbatim — and `x-forwarded-host` is one of those, so a caller can
 // steer such a request onto the public plane. Strip OURS only: a view app's own Bearer or cookie
 // auth is its business and passes through untouched.
-export function stripOurCredentials(req: IncomingMessage): void {
+export function stripOurCredentials(req: IncomingMessage, viewId?: string): void {
   const auth = req.headers.authorization;
   if (auth?.startsWith("Bearer ") && tokenMatches(auth.slice(7))) delete req.headers.authorization;
+  // The same rule for the Basic form a mount client sends: a view app must never be handed the
+  // credential that authenticated the request to US. An app's OWN basic auth is left alone.
+  //
+  // The mount password is stripped too, even though it does not authorize a proxied path: a request
+  // can be authorized by its query token and STILL carry one in a Basic header, and that password
+  // never expires — leaking it to whatever the sandbox is serving would hand out the folder for the
+  // life of the view.
+  const basic = basicToken(auth);
+  if (basic && (tokenMatches(basic) || (viewId && (verifyViewToken(basic, viewId) || verifyDavPassword(basic, viewId))))) delete req.headers.authorization;
   const cookie = req.headers.cookie;
   if (!cookie) return;
   const parts = cookie.split(";");
@@ -133,8 +170,13 @@ export async function handleViewRequest(req: IncomingMessage, res: ServerRespons
     res.writeHead(404, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "unknown view" }));
     return true;
   }
-  const { ok, queryToken } = authorized(req, viewId);
+  const rest = m[2] || "/";
+  const isDav = view.type === "directory" && (rest === "/dav" || rest.startsWith("/dav/"));
+  const { ok, queryToken } = authorized(req, viewId, isDav);
   if (!ok) {
+    // A file client has no login page: it authenticates only after a Basic challenge, and it needs
+    // the realm to label the keychain entry it saves the mount's token under.
+    if (isDav) res.setHeader("WWW-Authenticate", `Basic realm="${davRealm(view)}", charset="UTF-8"`);
     res.writeHead(401, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "unauthorized" }));
     return true;
   }
@@ -146,17 +188,28 @@ export async function handleViewRequest(req: IncomingMessage, res: ServerRespons
   // code view's API) itself. An agent view's WebSocket is the one thing proxied — to the
   // in-sandbox ACP bridge (handleViewUpgrade).
   if (view.type === "code") {
-    await handleCodeView(req, res, view, m[2] || "/");
+    await handleCodeView(req, res, view, rest);
     return true;
   }
   if (view.type === "agent") {
-    await handleAgentView(req, res, view, m[2] || "/");
+    await handleAgentView(req, res, view, rest);
+    return true;
+  }
+  // A files view's external door: `/v/<id>/dav/*` is WebDAV, served here over execd, so the same
+  // view a browser renders through filebrowser can be MOUNTED as a drive with nothing installed
+  // (webdav.ts). The rest of the view path stays filebrowser's.
+  if (isDav) {
+    const pathname = (req.url ?? "/").split("?")[0];
+    // The prefix the mount is addressed at, taken from THIS request rather than assumed, so hrefs
+    // stay followable when something in front adds a path prefix of its own.
+    const prefix = `${pathname.slice(0, pathname.length - rest.length)}/dav`;
+    await handleWebdav(req, res, view, rest.slice("/dav".length), prefix);
     return true;
   }
   try {
     const t = await resolveTarget(view.sandboxId, view.port);
     req.url = `${t.basePath}${viewPath(view, req.url, viewId)}`;
-    stripOurCredentials(req);
+    stripOurCredentials(req, viewId);
     proxy.web(req, res, { target: `http://${t.host}` });
   } catch (e) {
     targets.delete(`${view.sandboxId}:${view.port}`);
