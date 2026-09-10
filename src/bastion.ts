@@ -418,8 +418,8 @@ export const bastion = new BastionClient();
 
 // Which view types are reachable over ssh, and how.
 //
-// TERMINAL ONLY, deliberately. A terminal route attaches the very tmux session the browser shows,
-// so the two are one live screen — that is a feature you can explain in a sentence. The other types
+// TERMINAL AND AGENT, deliberately — and nothing else. Each of those attaches the very thing the
+// browser view is showing, which is a feature you can explain in a sentence. `code` and `directory`
 // would each be a plain shell wearing a different label, which is a worse thing to ship than
 // nothing: `code` promises VS Code Remote (its own setup story) and `directory` promises files
 // (which means SMB, not ssh). Neither is decided, so neither gets an address.
@@ -442,11 +442,20 @@ export function modeForView(type: string): RouteMode | undefined {
   return undefined;
 }
 
-/** `ssh <routeId>@<host>` for a view, when the bastion is configured and the type is reachable. */
-export function sshCommandFor(routeId: string): string | undefined {
+/**
+ * The line a person types for a route, when the bastion is configured and the type is reachable.
+ *
+ * THE MODE DECIDES THE LINE, and getting that wrong publishes a command that cannot work: the edge
+ * refuses a plain `ssh` on an acp route (a shell there would drop somebody into bash where they
+ * expected a conversation), so an agent view must be told the subsystem form. `-s` takes the
+ * subsystem name in the COMMAND position — after the destination — so `ssh -s acp <route>@<host>`
+ * would dial a host literally called "acp" and never reach the bastion. The order is the contract.
+ */
+export function sshCommandFor(routeId: string, mode: RouteMode = "tmux"): string | undefined {
   const host = bastion.publicHost();
   if (!host) return undefined;
   const port = bastion.edgePort() ?? 22;
+  if (mode === "acp") return `ssh${port === 22 ? "" : ` -p ${port}`} -s ${routeId}@${host} acp`;
   return `ssh ${routeId}@${host}${port === 22 ? "" : ` -p ${port}`}`;
 }
 
@@ -457,12 +466,12 @@ export function sshCommandFor(routeId: string): string | undefined {
  */
 export function nativeConnectFor(routeId: string, sessionId: string, viewId: string, mode: RouteMode = "tmux"): Record<string, unknown> | undefined {
   const host = bastion.publicHost();
-  const command = sshCommandFor(routeId);
+  const command = sshCommandFor(routeId, mode);
   if (!host || !command) return undefined;
   const port = bastion.edgePort() ?? 22;
-  // AN AGENT ROUTE IS NOT A TERMINAL, and the command has to say so. `-s acp` asks for the ACP
-  // subsystem; a plain `ssh` to this route is refused at the edge with the line to use instead,
-  // because a shell here would drop somebody into bash expecting a conversation.
+  // AN AGENT ROUTE IS NOT A TERMINAL, and the payload has to say so: no `sshUrl` (there is nothing
+  // for the OS to open — the far end is JSON-RPC, not a screen), and the subsystem line that
+  // `sshCommandFor` builds for this mode. A plain `ssh` to this route is refused at the edge.
   if (mode === "acp") {
     return {
       kind: "agent",
@@ -474,7 +483,7 @@ export function nativeConnectFor(routeId: string, sessionId: string, viewId: str
       viewId,
       passwordless: true,
       bastion: true,
-      command: `ssh -s acp ${routeId}@${host}${port === 22 ? "" : ` -p ${port}`}`,
+      command,
       subsystem: "acp",
       // What it IS, for a page that has to explain it: newline-delimited JSON-RPC on stdio, which is
       // the framing ACP uses over stdio anyway — so this line works wherever an "agent command" is

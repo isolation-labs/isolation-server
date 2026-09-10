@@ -813,8 +813,9 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   }
 
   // "Open externally" (the daemon's nativeConnect contract): hand the web a ready-to-run `ssh`
-  // command for this view. TERMINAL ONLY — it lands in the very tmux session the browser shows,
-  // which is the whole point; every other view type is deliberately not connectable (bastion.ts).
+  // command for this view. TERMINAL AND AGENT ONLY — each lands in the very thing the browser view
+  // is showing (that tmux session; that conversation), which is the whole point; every other view
+  // type is deliberately not connectable (`modeForView`, bastion.ts).
   const nc = /^\/sessions\/(s-[a-z0-9]+)\/views\/([a-zA-Z0-9-]+)\/connect$/.exec(url);
   if (nc && method === "POST") {
     const [, id, vid] = nc;
@@ -852,7 +853,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!bastion.isLive()) return json(res, 503, { error: "the ssh bastion is not reachable right now" });
     syncRoutes(id, s2.sandboxId);
     // The MODE decides what the caller is told to type: a terminal gets `ssh …`, an agent view gets
-    // `ssh -s acp …`. Same route, same key check, different door.
+    // `ssh -s … acp`. Same route, same key check, different door.
     const out = nativeConnectFor(routeId, id, vid, modeForView(v.type));
     return out ? json(res, 200, out) : json(res, 503, { error: "the ssh bastion is not reachable right now" });
   }

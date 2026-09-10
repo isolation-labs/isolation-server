@@ -372,8 +372,9 @@ export function sshKeysFor(sessionId: string): string[] {
   return authorizedKeysFile(sessions[sessionId]?.authorizedKeys).split("\n").filter(Boolean);
 }
 
-// Register a bastion route for every ssh-shaped view of a sandbox — terminal views only, which
-// attach their live tmux session (see `modeForView`). Idempotent: a route id is minted once and
+// Register a bastion route for every ssh-shaped view of a sandbox — terminal views, which attach
+// their live tmux session, and agent views, which join their live conversation (see
+// `modeForView`). Idempotent: a route id is minted once and
 // persisted on the view, so re-running this re-asserts rather than churns, and a saved
 // `ssh <id>@host` keeps working across restarts of anything.
 // The tmux session a terminal view runs in — the bastion `attach`es exactly this, so an ssh user
@@ -388,6 +389,14 @@ export function syncRoutes(sessionId: string, sandboxId: string): void {
   for (const v of viewsForSandbox(sandboxId)) {
     const mode = modeForView(v.type);
     if (!mode) continue;
+    // An agent route carries the command whose stdio IS the conversation. The bastion execs what it
+    // is told rather than knowing anything about ACP — the same division tmux mode already has. No
+    // command means no door: register nothing rather than a route the edge can only refuse.
+    const acpCommand = mode === "acp" ? attachCommand(v.port, v.id) : undefined;
+    if (mode === "acp" && !acpCommand) {
+      log(`${v.id}: agent view has no usable bridge port (${String(v.port)}) — no ssh route`);
+      continue;
+    }
     const routeId = ensureRouteId(v.id);
     if (!routeId) continue;
     bastion.registerRoute({
@@ -399,9 +408,7 @@ export function syncRoutes(sessionId: string, sandboxId: string): void {
       viewType: v.type,
       mode,
       ...(mode === "tmux" ? { tmuxTarget: tmuxTargetFor(v) } : {}),
-      // An agent route carries the command whose stdio IS the conversation. The bastion execs what
-      // it is told rather than knowing anything about ACP — the same division tmux mode already has.
-      ...(mode === "acp" && v.port ? { acpCommand: attachCommand(v.port) } : {}),
+      ...(acpCommand ? { acpCommand } : {}),
       ...(v.dir ? { dir: v.dir } : {}),
       ...(v.label ? { label: v.label } : {}),
       keys,
@@ -526,9 +533,12 @@ export function viewJson(v: View, sessionId: string): Record<string, unknown> {
 }
 
 function sshJson(v: View): Record<string, unknown> {
-  if (!v.sshRouteId || !modeForView(v.type)) return {};
-  const command = sshCommandFor(v.sshRouteId);
-  return command ? { ssh: { routeId: v.sshRouteId, command } } : {};
+  const mode = modeForView(v.type);
+  if (!v.sshRouteId || !mode) return {};
+  // The MODE has to reach the line: an agent route refuses a plain `ssh` at the edge, so publishing
+  // the terminal form for one would hand the web a command whose only possible answer is a refusal.
+  const command = sshCommandFor(v.sshRouteId, mode);
+  return command ? { ssh: { routeId: v.sshRouteId, command, ...(mode === "acp" ? { subsystem: "acp", protocol: "acp" } : {}) } } : {};
 }
 
 // A web view's public address: its slug as a hostname — on the wildcard sandbox domain

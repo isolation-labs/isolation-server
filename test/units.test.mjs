@@ -371,6 +371,60 @@ test("ensureSshCapability pulls AUDIT_WRITE back, keeps every other drop", () =>
   assert.equal(ensureSshCapability(`[docker]\nfoo = 1\n`).changed, false);
 });
 
+// --- the ssh bastion ----------------------------------------------------------
+
+test("an agent view's connect line is `ssh -s <route>@<host> acp` — the subsystem goes in the COMMAND slot", async () => {
+  // ssh(1) parses `-s` as a flag with NO argument: `ssh -s acp r@host` takes the FIRST non-option
+  // as the destination, so it dials a host literally named "acp" as the local user and never
+  // reaches the bastion at all. The order below is the whole contract of this line, and it is a
+  // string a person copies — nothing downstream would catch it being wrong.
+  const cfg0 = await import("../dist/config.js");
+  const b = await import("../dist/bastion.js");
+  cfg0.saveBastion({ controlHost: "127.0.0.1", controlPort: 1, publicHost: "ssh.example.cc", edgePort: 2222, daemonLabel: "d-1", registerSecret: "s" });
+  b.bastion.startIfConfigured(); // the dial fails against a dead port; only `settings` matters here
+  try {
+    const acp = b.nativeConnectFor("r0ute1", "s-1", "v-1", "acp");
+    assert.equal(acp.command, "ssh -p 2222 -s r0ute1@ssh.example.cc acp");
+    assert.equal(acp.kind, "agent");
+    assert.equal(acp.subsystem, "acp");
+    // A terminal route is unchanged: no subsystem, and a deep link the OS can open.
+    const term = b.nativeConnectFor("r0ute2", "s-1", "v-2");
+    assert.equal(term.command, "ssh r0ute2@ssh.example.cc -p 2222");
+    assert.equal(term.sshUrl, "ssh://r0ute2@ssh.example.cc:2222");
+    // The SAME line has to come out of the per-view `ssh` block the session JSON publishes — the
+    // edge refuses a plain `ssh` on an acp route, so the terminal form there would be a command
+    // whose only possible answer is a refusal.
+    assert.equal(b.sshCommandFor("r0ute1", "acp"), acp.command);
+    assert.equal(b.sshCommandFor("r0ute2", "tmux"), term.command);
+    // Only the two types that have a real door get one.
+    assert.equal(b.modeForView("terminal"), "tmux");
+    assert.equal(b.modeForView("agent"), "acp");
+    assert.equal(b.modeForView("code"), undefined);
+    assert.equal(b.modeForView("directory"), undefined);
+  } finally {
+    b.bastion.disable();
+    cfg0.saveBastion(undefined);
+  }
+});
+
+test("attachCommand refuses anything but a real port and a real view id — it becomes a shell string", async () => {
+  // The route's command is interpolated into a line a SHARED bastion runs inside the sandbox, and
+  // the view registry is a JSON file read back with a cast and no validation (views.ts) — so this
+  // function is the only thing standing between a tampered/garbage record and that shell.
+  const { attachCommand } = await import("../dist/acpview.js");
+  assert.match(attachCommand(45000, "v-abc123"), / \/tmp\/\.iso-acp-attach\.mjs 45000 v-abc123$/);
+  // The view id is carried because A PORT IS NOT IDENTITY: ports are recycled and an orphaned
+  // bridge answers on them, so the attach checks the bridge's `_iso/hello` names this view.
+  assert.equal(attachCommand(45000, "v-a; rm -rf /"), undefined);
+  assert.equal(attachCommand(45000, "$(id)"), undefined);
+  assert.equal(attachCommand(45000, ""), undefined);
+  assert.equal(attachCommand(45000, undefined), undefined);
+  assert.equal(attachCommand(0, "v-abc"), undefined);
+  assert.equal(attachCommand(70000, "v-abc"), undefined);
+  assert.equal(attachCommand(1.5, "v-abc"), undefined);
+  assert.equal(attachCommand(undefined, "v-abc"), undefined);
+});
+
 // --- the private tunnel -------------------------------------------------------
 const cfgMod = await import("../dist/config.js");
 

@@ -177,6 +177,25 @@ test("a message the client sends that is past 64KB is framed with a 64-bit lengt
   });
 });
 
+test("a prompt split mid-character across stdin chunks arrives intact — a chunk boundary is not a character boundary", async () => {
+  // stdin arrives in pipe-sized pieces, and any prompt outside ASCII will sooner or later be cut
+  // through the middle of a multi-byte sequence. Decoded per-chunk, each half becomes U+FFFD and
+  // the agent is quietly asked something other than what was typed — with nothing thrown anywhere.
+  await withAttach(async ({ child, nextFrame }) => {
+    await new Promise((r) => setTimeout(r, 100));
+    const waiting = nextFrame();
+    const text = JSON.stringify({ jsonrpc: "2.0", id: 3, method: "session/prompt", params: { prompt: [{ type: "text", text: "café 🚀 日本語" }] } });
+    const bytes = Buffer.from(`${text}\n`, "utf8");
+    // Cut inside the emoji: a 4-byte sequence, so the split lands between its continuation bytes.
+    const cut = bytes.indexOf(Buffer.from("🚀", "utf8")) + 2;
+    child.stdin.write(bytes.subarray(0, cut));
+    await new Promise((r) => setTimeout(r, 30));
+    child.stdin.write(bytes.subarray(cut));
+    const got = await waiting;
+    assert.equal(JSON.parse(got).params.prompt[0].text, "café 🚀 日本語", "every character survived the split");
+  });
+});
+
 test("a bridge that closes ends the client cleanly — an ended session is not a failure", async () => {
   await withAttach(async ({ bridge, child }) => {
     await new Promise((r) => setTimeout(r, 100));
@@ -184,6 +203,53 @@ test("a bridge that closes ends the client cleanly — an ended session is not a
     bridge.close();
     assert.equal(await exited, 0, "exit 0, so `ssh` does not report a failure when the view simply ended");
   });
+});
+
+test("a bridge that speaks and then closes is fully delivered — stdout is a pipe, and exit drops what is buffered", async () => {
+  // THE FAILING SHAPE: the bridge hands a late joiner the whole replay buffer and the view is then
+  // deleted. Our stdout is the ssh channel, so those writes are queued, not written — and a client
+  // that reads at its own pace (any real one) had received NOTHING by the time the socket closed.
+  // A reader that drains instantly hides this completely, so this test deliberately does not.
+  const bridge = fakeBridge();
+  const port = await listen(bridge.server);
+  const child = spawn(process.execPath, [SCRIPT, String(port)], { stdio: ["pipe", "pipe", "pipe"] });
+  let out = "";
+  child.stdout.pause(); // the slow client
+  await new Promise((r) => setTimeout(r, 100));
+  const text = JSON.stringify({ jsonrpc: "2.0", method: "_iso/hello", params: { updates: Array.from({ length: 2000 }, (_, i) => ({ i, text: "x".repeat(200) })) } });
+  assert.ok(text.length > 256 * 1024, "past anything a pipe buffers for us");
+  bridge.send(text);
+  const exited = new Promise((r) => child.on("exit", (c) => r(c)));
+  setTimeout(() => bridge.close(), 20);
+  // Start reading only well after the bridge is gone: what survives is what the client really gets.
+  await new Promise((r) => setTimeout(r, 300));
+  child.stdout.on("data", (d) => (out += d.toString("utf8")));
+  child.stdout.resume();
+  assert.equal(await exited, 0);
+  await new Promise((r) => setTimeout(r, 50));
+  bridge.server.close();
+  assert.equal(JSON.parse(out.trim()).params.updates.length, 2000, "every byte the bridge said arrived before we exited");
+});
+
+test("a client that hangs up mid-replay ends the script cleanly — a broken pipe is a goodbye, not a crash", async () => {
+  // OUR STDIO IS THE SSH CHANNEL, so a client that disconnects breaks the pipe under a write that is
+  // still queued — and an EPIPE on `process.stdout` with no listener is an UNCAUGHT EXCEPTION: exit
+  // 1 and a stack trace, for what is simply somebody closing their client. The `_iso/hello` replay
+  // buffer makes this the common shape, not a corner: there is always something still queued.
+  const bridge = fakeBridge();
+  const port = await listen(bridge.server);
+  const child = spawn(process.execPath, [SCRIPT, String(port)], { stdio: ["pipe", "pipe", "pipe"] });
+  let err = "";
+  child.stderr.on("data", (d) => (err += d.toString("utf8")));
+  child.stdout.pause(); // nothing is draining, so the write stays queued
+  await new Promise((r) => setTimeout(r, 100));
+  bridge.send(JSON.stringify({ jsonrpc: "2.0", method: "_iso/hello", params: { updates: Array.from({ length: 5000 }, (_, i) => ({ i, text: "x".repeat(200) })) } }));
+  const exited = new Promise((r) => child.on("exit", (c) => r(c)));
+  setTimeout(() => child.stdout.destroy(), 150); // the client hangs up
+  assert.equal(await exited, 0, "a hung-up client is exit 0, not a crash");
+  assert.ok(!/Unhandled 'error'|EPIPE/.test(err), `nothing was thrown at the user: ${err.slice(0, 200)}`);
+  bridge.close();
+  bridge.server.close();
 });
 
 test("a server that is not a WebSocket is refused rather than half-spoken to", async () => {
@@ -195,4 +261,59 @@ test("a server that is not a WebSocket is refused rather than half-spoken to", a
   const code = await new Promise((r) => child.on("exit", (c) => r(c)));
   server.close();
   assert.equal(code, 1, "a non-101 answer is fatal, not something to keep writing frames into");
+});
+
+// A PORT IS NOT IDENTITY. View ports come from the free ones (launch.ts `nextFree` only avoids LIVE
+// views) and a bridge orphaned by a deleted view is never killed — so the number in the route's
+// command can be another agent's bridge, which answers happily. On the browser's path the doorman
+// makes this check (`bridgeHealthy` requires the view's own id); an ssh client gets it here, and
+// getting it wrong hands somebody another agent's whole transcript.
+
+test("the attach refuses a bridge that names a different view — nothing of it reaches the client", async () => {
+  const bridge = fakeBridge();
+  const port = await listen(bridge.server);
+  const child = spawn(process.execPath, [SCRIPT, String(port), "v-mine"], { stdio: ["pipe", "pipe", "pipe"] });
+  let out = "";
+  let err = "";
+  child.stdout.on("data", (d) => (out += d.toString("utf8")));
+  child.stderr.on("data", (d) => (err += d.toString("utf8")));
+  await new Promise((r) => setTimeout(r, 100));
+  // The stale bridge's own hello — a whole conversation, and not the one this route is for.
+  bridge.send(JSON.stringify({ jsonrpc: "2.0", method: "_iso/hello", params: { viewId: "v-someone-else", updates: [{ text: "another agent's transcript" }] } }));
+  const code = await new Promise((r) => child.on("exit", (c) => r(c)));
+  bridge.close();
+  bridge.server.close();
+  assert.equal(code, 1, "a bridge that is not this view's is fatal");
+  assert.equal(out, "", "not one byte of the other conversation was forwarded");
+  assert.match(err, /not v-mine's agent view/);
+});
+
+test("the attach joins a bridge that names its view, and holds stdin until it has", async () => {
+  const bridge = fakeBridge();
+  const port = await listen(bridge.server);
+  const child = spawn(process.execPath, [SCRIPT, String(port), "v-mine"], { stdio: ["pipe", "pipe", "pipe"] });
+  const lines = [];
+  let out = "";
+  child.stdout.on("data", (d) => {
+    out += d.toString("utf8");
+    for (;;) {
+      const nl = out.indexOf("\n");
+      if (nl === -1) break;
+      lines.push(out.slice(0, nl));
+      out = out.slice(nl + 1);
+    }
+  });
+  await new Promise((r) => setTimeout(r, 100));
+  // A client that types before the bridge has identified itself must not have its prompt sent to
+  // whatever is on the port — it waits for the hello, then goes to the verified bridge.
+  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "session/prompt", params: { prompt: [] } })}\n`);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(bridge.received, [], "nothing was sent before the bridge named its view");
+  bridge.send(JSON.stringify({ jsonrpc: "2.0", method: "_iso/hello", params: { viewId: "v-mine" } }));
+  for (let i = 0; i < 100 && !bridge.received.length; i++) await new Promise((r) => setTimeout(r, 10));
+  assert.equal(JSON.parse(bridge.received[0]).method, "session/prompt", "the held prompt went to the verified bridge");
+  assert.equal(JSON.parse(lines[0]).method, "_iso/hello", "and the hello itself reached the client");
+  child.kill("SIGKILL");
+  bridge.close();
+  bridge.server.close();
 });
