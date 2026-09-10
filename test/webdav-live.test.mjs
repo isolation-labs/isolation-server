@@ -266,6 +266,34 @@ describe("the files view mounts over WebDAV", { skip: SKIP }, () => {
     }
   });
 
+  test("the mount is also addressed by its NAMED path, and hrefs follow the path used", async () => {
+    // `/mnt/<name>` is what the card hands out: the trailing segment is what every OS names the
+    // drive after, so it carries the folder's name instead of a fixed `dav` (sessions.ts mountName).
+    // The name is decorative — any segment is this same root — but the hrefs must come back under
+    // the prefix the CLIENT mounted, or every path it follows lands outside its own volume.
+    const opts = await fetch(`http://127.0.0.1:${ctx.port}/v/${ctx.viewId}/mnt/cv/`, {
+      method: "OPTIONS",
+      headers: { Authorization: ctx.auth },
+    });
+    assert.equal(opts.status, 200);
+    assert.equal(opts.headers.get("dav"), "1, 2", "the named path is the same class-2 mount");
+
+    const r = await fetch(`http://127.0.0.1:${ctx.port}/v/${ctx.viewId}/mnt/cv/`, {
+      method: "PROPFIND",
+      headers: { Authorization: ctx.auth, Depth: "1" },
+    });
+    assert.equal(r.status, 207);
+    const body = await r.text();
+    assert.match(body, new RegExp(`<D:href>/v/${ctx.viewId}/mnt/cv/</D:href>`), "the root href is the prefix that was mounted");
+    assert.match(body, new RegExp(`<D:href>/v/${ctx.viewId}/mnt/cv/sub/</D:href>`));
+    assert.doesNotMatch(body, /\/dav\//, "no href may point at the other spelling of this root");
+
+    // A file under the named path is the same file the `/dav` alias serves.
+    const f = await fetch(`http://127.0.0.1:${ctx.port}/v/${ctx.viewId}/mnt/cv/a.txt`, { headers: { Authorization: ctx.auth } });
+    assert.equal(f.status, 200);
+    assert.equal(await f.text(), "hello world");
+  });
+
   test("PROPFIND depth 1 lists the directory, with sizes, types and free space", async () => {
     const r = await dav("/", { method: "PROPFIND", headers: { Depth: "1", "Content-Type": "application/xml" }, body: "" });
     assert.equal(r.status, 207);

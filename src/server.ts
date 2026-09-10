@@ -7,7 +7,7 @@ import { GATE_VERSION } from "./version.js";
 import { HOST, PORT, getBastion, getName, getPairing, getToken, getVpc, isLoopbackOrigin, originAllowed, saveBastion, savePairing, saveVpc, tokenMatches, getMachineId } from "./config.js";
 import { beatOffline, detach, pairingStatus, startHeartbeat } from "./heartbeat.js";
 import { deleteSandbox, getSandbox, listSandboxes, osbHealthy, pauseSandbox, resumeSandbox, sandboxLogs } from "./opensandbox.js";
-import { handlePublicWebRequest, handlePublicWebUpgrade, handleViewRequest, handleViewUpgrade, invalidateEndpoints } from "./doorman.js";
+import { DAV_PREFIX_RE, handlePublicWebRequest, handlePublicWebUpgrade, handleViewRequest, handleViewUpgrade, invalidateEndpoints } from "./doorman.js";
 import { launch, restartTerminal, sanitizeStyle, type LaunchRequest } from "./launch.js";
 import { sinkFor, abortMerge, dropSink, saveWorkspace, syncWorkspace } from "./persistence.js";
 import { dropView, dropViewsForSandbox, ensureRouteId, getView, isSlugPrefix, mintViewToken, updateView, viewsForSandbox, type View } from "./views.js";
@@ -278,8 +278,10 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   }
   // A blanket 204 for OPTIONS is right for a CORS preflight and WRONG for WebDAV: OPTIONS is how a
   // file client discovers the mount, and answering it here would hide the `DAV: 1, 2` header the
-  // client needs to mount read-WRITE. A files view's /dav path answers for itself (webdav.ts).
-  if (method === "OPTIONS" && !/^\/v\/[a-zA-Z0-9-]+\/dav(\/|$)/.test(url)) return void res.writeHead(204).end();
+  // client needs to mount read-WRITE. A files view's mount path answers for itself (webdav.ts), so
+  // the shortcut steps aside for exactly the prefixes the doorman routes there (DAV_PREFIX_RE).
+  const davDoor = /^\/v\/[a-zA-Z0-9-]+(\/.*)$/.exec(url.split("?")[0]);
+  if (method === "OPTIONS" && !(davDoor && DAV_PREFIX_RE.test(davDoor[1]))) return void res.writeHead(204).end();
 
   // The public web plane claims its hostnames FIRST — those hosts never reach /v/ or the API.
   if (await handlePublicWebRequest(req, res)) return;

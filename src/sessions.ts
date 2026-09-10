@@ -550,10 +550,24 @@ const DAV_USERNAME = "isolation";
  */
 function davJson(v: View): Record<string, unknown> {
   if (v.type !== "directory") return {};
-  return { dav: { protocol: "webdav", path: davPath(v.id) } };
+  return { dav: { protocol: "webdav", path: davPath(v) } };
 }
 
-const davPath = (viewId: string): string => `/v/${viewId}/dav/`;
+// The name the mounted drive gets. It is NOT cosmetic and it is not ours to choose freely: macOS
+// names a WebDAV volume after the LAST PATH SEGMENT of the address it mounted (verified — mounting
+// `…/dav/src/` produces `/Volumes/src`), and Windows shows the same segment as the drive label. A
+// share addressed at `/v/<id>/dav/` therefore appears in Finder's sidebar, on the Desktop and in
+// every `/Volumes` path as **dav** — which says nothing about which folder of which session it is.
+// So the address ends in the folder's own name instead, and the drive reads as `cv`.
+const mountName = (v: View): string => {
+  const base = (v.dir ?? "").split("/").filter(Boolean).pop() ?? "";
+  return base.replace(/[^A-Za-z0-9._-]/g, "-").replace(/^[.-]+/, "").slice(0, 40) || "workspace";
+};
+
+// `/mnt/<name>` is the mount's canonical prefix; the name is decorative, so ANY single segment
+// resolves to this view's root (doorman.ts DAV_PREFIX_RE) and a bookmark saved under an older name
+// keeps working. `/dav/` stays an alias for the same reason — drives mounted before this existed.
+const davPath = (v: View): string => `/v/${v.id}/mnt/${encodeURIComponent(mountName(v))}/`;
 
 /**
  * Everything a person needs to MOUNT a files view as a drive — the daemon's `nativeConnect` payload
@@ -571,7 +585,7 @@ const davPath = (viewId: string): string => `/v/${viewId}/dav/`;
  * would break every mount on the next restart, and a person cannot retype one they never see again.
  */
 export function davConnect(v: View, sessionId: string): Record<string, unknown> {
-  const path = davPath(v.id);
+  const path = davPath(v);
   const password = davPassword(v.id);
   return {
     kind: "webdav",

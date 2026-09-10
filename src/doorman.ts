@@ -52,6 +52,10 @@ proxy.on("proxyRes", (proxyRes) => {
 
 const VIEW_RE = /^\/v\/([a-zA-Z0-9-]+)(\/.*)?$/;
 
+// A files view's WebDAV door, as it appears INSIDE the view path. Two spellings of one root:
+// `/mnt/<name>` (current — the segment names the drive) and `/dav` (what earlier mounts saved).
+export const DAV_PREFIX_RE = /^\/(?:dav|mnt\/[^/]+)(?=\/|$)/;
+
 // The name a file client shows in its credential prompt and saves the mount under. The view's own
 // label when it has one, so a member with two files views can tell the two keychain entries apart.
 const davRealm = (view: View): string => (view.label ?? "Files").replace(/[^\x20-\x7e]/g, "").replace(/["\\]/g, "").slice(0, 60) || "Files";
@@ -106,7 +110,7 @@ export function tokensFromRequest(req: IncomingMessage): string[] {
 }
 
 // `isDav` widens the accepted credentials by exactly one: the view's stable mount password
-// (views.ts davPassword), which is deliberately confined to that view's own /dav path. It is the
+// (views.ts davPassword), which is deliberately confined to that view's own mount path. It is the
 // one credential here that never expires, so it must not become a way in anywhere else.
 const authorized = (req: IncomingMessage, viewId: string, isDav = false): { ok: boolean; queryToken?: string } => {
   const ok = tokensFromRequest(req).some((t) => tokenMatches(t) || verifyViewToken(t, viewId) || (isDav && verifyDavPassword(t, viewId)));
@@ -194,7 +198,11 @@ export async function handleViewRequest(req: IncomingMessage, res: ServerRespons
     return true;
   }
   const rest = m[2] || "/";
-  const isDav = view.type === "directory" && (rest === "/dav" || rest.startsWith("/dav/"));
+  // The mount's prefix inside the view: `/mnt/<name>` (the name is decorative — it exists so the
+  // drive is called `cv` and not `dav`, sessions.ts mountName — so any single segment resolves to
+  // this view's root) or the original `/dav`, still served for drives mounted before that.
+  const davPrefix = view.type === "directory" ? (DAV_PREFIX_RE.exec(rest)?.[0] ?? undefined) : undefined;
+  const isDav = davPrefix !== undefined;
   const { ok, queryToken } = authorized(req, viewId, isDav);
   if (!ok) {
     // A file client has no login page: it authenticates only after a Basic challenge, and it needs
@@ -221,12 +229,13 @@ export async function handleViewRequest(req: IncomingMessage, res: ServerRespons
   // A files view's external door: `/v/<id>/dav/*` is WebDAV, served here over execd, so the same
   // view a browser renders through filebrowser can be MOUNTED as a drive with nothing installed
   // (webdav.ts). The rest of the view path stays filebrowser's.
-  if (isDav) {
+  if (davPrefix !== undefined) {
     const pathname = (req.url ?? "/").split("?")[0];
     // The prefix the mount is addressed at, taken from THIS request rather than assumed, so hrefs
-    // stay followable when something in front adds a path prefix of its own.
-    const prefix = `${pathname.slice(0, pathname.length - rest.length)}/dav`;
-    await handleWebdav(req, res, view, rest.slice("/dav".length), prefix);
+    // stay followable when something in front adds a path prefix of its own — and so a client that
+    // mounted `/mnt/cv` gets hrefs under `/mnt/cv`, not under some other spelling of the same root.
+    const prefix = `${pathname.slice(0, pathname.length - rest.length)}${davPrefix}`;
+    await handleWebdav(req, res, view, rest.slice(davPrefix.length), prefix);
     return true;
   }
   try {
