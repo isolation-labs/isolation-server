@@ -18,9 +18,15 @@ const log = (...a: unknown[]) => console.log("[acp]", ...a);
 
 const SANDBOX_DIR = join(dirname(fileURLToPath(import.meta.url)), "sandbox");
 const BRIDGE_SRC = readFileSync(join(SANDBOX_DIR, "iso-acp-bridge.mjs"), "utf8");
+// The same conversation, for a client that is not a browser: `ssh -s acp <route>@…` execs this in
+// the sandbox and it joins the bridge as one more of the N clients it already fans out to.
+const ATTACH_SRC = readFileSync(join(SANDBOX_DIR, "iso-acp-attach.mjs"), "utf8");
 const MCP_SRC = readFileSync(join(SANDBOX_DIR, "iso-mcp.mjs"), "utf8");
 
 export const BRIDGE_PATH = "/tmp/.iso-acp-bridge.mjs";
+export const ATTACH_PATH = "/tmp/.iso-acp-attach.mjs";
+/** What the bastion execs for an `acp` route. The PORT is the view's own bridge. */
+export const attachCommand = (port: number): string => `exec "$(command -v iso-node || command -v node)" ${ATTACH_PATH} ${port}`;
 export const MCP_PATH = "/tmp/.iso-mcp.mjs";
 export const MCP_WRAPPER = "/tmp/.iso-mcp.sh";
 export const VIEWS_FILE = "/tmp/.iso-views.json";
@@ -98,6 +104,7 @@ export async function startAgentBridge(view: View): Promise<void> {
   };
   const cfgPath = `/tmp/.iso-acp-${view.id}.json`;
   await writeFile(view.sandboxId, BRIDGE_PATH, BRIDGE_SRC, 0o644);
+  await writeFile(view.sandboxId, ATTACH_PATH, ATTACH_SRC, 0o644);
   await writeFile(view.sandboxId, MCP_PATH, MCP_SRC, 0o644);
   await writeFile(view.sandboxId, MCP_WRAPPER, MCP_WRAPPER_SRC, 0o755);
   // The agent's HOME is under the workspace tree so the conversation persists — and that tree is

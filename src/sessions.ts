@@ -20,6 +20,7 @@ import { dropViewsForSandbox, ensureRouteId, viewsForSandbox, type View, type Vi
 import { dropSessionAgents, parseAgentSecrets, parseRoster, registerRoster, setAgentCredentials, type AgentDef } from "./agents.js";
 import { installVault, parseVaultManifest, vaultPresent, type VaultSummary } from "./vault.js";
 import { forgetThreads } from "./threads.js";
+import { attachCommand } from "./acpview.js";
 import { sealedOrInline } from "./envelope.js";
 
 const log = (...a: unknown[]) => console.log("[sessions]", ...a);
@@ -398,6 +399,9 @@ export function syncRoutes(sessionId: string, sandboxId: string): void {
       viewType: v.type,
       mode,
       ...(mode === "tmux" ? { tmuxTarget: tmuxTargetFor(v) } : {}),
+      // An agent route carries the command whose stdio IS the conversation. The bastion execs what
+      // it is told rather than knowing anything about ACP — the same division tmux mode already has.
+      ...(mode === "acp" && v.port ? { acpCommand: attachCommand(v.port) } : {}),
       ...(v.dir ? { dir: v.dir } : {}),
       ...(v.label ? { label: v.label } : {}),
       keys,

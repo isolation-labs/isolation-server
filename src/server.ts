@@ -851,7 +851,9 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // so a dark bastion is a 503 here — the reconnect loop makes this answerable again on its own.
     if (!bastion.isLive()) return json(res, 503, { error: "the ssh bastion is not reachable right now" });
     syncRoutes(id, s2.sandboxId);
-    const out = nativeConnectFor(routeId, id, vid);
+    // The MODE decides what the caller is told to type: a terminal gets `ssh …`, an agent view gets
+    // `ssh -s acp …`. Same route, same key check, different door.
+    const out = nativeConnectFor(routeId, id, vid, modeForView(v.type));
     return out ? json(res, 200, out) : json(res, 503, { error: "the ssh bastion is not reachable right now" });
   }
 

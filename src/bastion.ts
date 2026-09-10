@@ -36,15 +36,18 @@ const log = (...a: unknown[]) => console.log("[bastion]", ...a);
 // allow-list. 256 KiB is orders of magnitude past that, and bounds what an unframed peer can grow.
 const MAX_CTRL_LINE = 256 * 1024;
 
-export type RouteMode = "tmux" | "shell";
+export type RouteMode = "tmux" | "shell" | "acp";
 
 export interface RouteReg {
   routeId: string;
   sessionId: string; // the SANDBOX id: it is what comes back as srcIP on a reverse channel
   viewId: string;
   viewType: string;
-  mode: RouteMode; // tmux = attach the view's live tmux session; shell = transparent (VS Code, scp)
+  mode: RouteMode; // tmux = attach the view's live tmux session; shell = transparent (VS Code, scp);
+  //                  acp  = the agent view's own conversation, for an external ACP client
   tmuxTarget?: string;
+  /** acp only: what the bastion execs in the sandbox. Its stdio IS the ACP stream. */
+  acpCommand?: string;
   dir?: string;
   label?: string;
   keys: string[]; // the end-user public keys allowed to open this route
@@ -420,8 +423,23 @@ export const bastion = new BastionClient();
 // would each be a plain shell wearing a different label, which is a worse thing to ship than
 // nothing: `code` promises VS Code Remote (its own setup story) and `directory` promises files
 // (which means SMB, not ssh). Neither is decided, so neither gets an address.
+/**
+ * WHICH DOOR A VIEW HAS, and the route type is the whole of it — a person types
+ * `ssh <routeId>@<host>` and the bastion already knows what that route is for.
+ *
+ *   terminal → tmux: attach the very session the browser view is showing.
+ *   agent    → acp:  join the very conversation the browser view is showing, as one more client of
+ *                    a bridge that already fans out to N. NOT a terminal running a chat program —
+ *                    the same session, live, both ways, so an external ACP client and the session
+ *                    screen are two windows on one thing.
+ *
+ * A code or directory view has no external door yet, and answering `undefined` is what keeps it
+ * from getting one by accident.
+ */
 export function modeForView(type: string): RouteMode | undefined {
-  return type === "terminal" ? "tmux" : undefined;
+  if (type === "terminal") return "tmux";
+  if (type === "agent") return "acp";
+  return undefined;
 }
 
 /** `ssh <routeId>@<host>` for a view, when the bastion is configured and the type is reachable. */
@@ -437,11 +455,33 @@ export function sshCommandFor(routeId: string): string | undefined {
  * contract). Passwordless by construction: the member's key was checked at the edge, so there is
  * no credential to hand out here and nothing secret in this payload.
  */
-export function nativeConnectFor(routeId: string, sessionId: string, viewId: string): Record<string, unknown> | undefined {
+export function nativeConnectFor(routeId: string, sessionId: string, viewId: string, mode: RouteMode = "tmux"): Record<string, unknown> | undefined {
   const host = bastion.publicHost();
   const command = sshCommandFor(routeId);
   if (!host || !command) return undefined;
   const port = bastion.edgePort() ?? 22;
+  // AN AGENT ROUTE IS NOT A TERMINAL, and the command has to say so. `-s acp` asks for the ACP
+  // subsystem; a plain `ssh` to this route is refused at the edge with the line to use instead,
+  // because a shell here would drop somebody into bash expecting a conversation.
+  if (mode === "acp") {
+    return {
+      kind: "agent",
+      host,
+      port,
+      user: routeId,
+      routeId,
+      sessionId,
+      viewId,
+      passwordless: true,
+      bastion: true,
+      command: `ssh -s acp ${routeId}@${host}${port === 22 ? "" : ` -p ${port}`}`,
+      subsystem: "acp",
+      // What it IS, for a page that has to explain it: newline-delimited JSON-RPC on stdio, which is
+      // the framing ACP uses over stdio anyway — so this line works wherever an "agent command" is
+      // configured, and the browser view stays live on the same conversation.
+      protocol: "acp",
+    };
+  }
   return {
     kind: "terminal",
     host,
