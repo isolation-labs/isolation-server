@@ -447,8 +447,10 @@ export function modeForView(type: string): RouteMode | undefined {
  * The line a person types for a route: `ssh <routeId>@<host>`, whatever the route is for.
  *
  * ONE LINE FOR EVERY DOOR, because the ROUTE already says what it opens — a terminal route attaches
- * that terminal, an agent route lands in that conversation. Nothing about the protocol reaches what
- * anybody types, and neither route ever opens a shell.
+ * that terminal, an agent route lands in that conversation, a code route is the transparent shell an
+ * IDE drives. Nothing about the protocol reaches what anybody types. Only the code route opens a
+ * shell, and it is the one nobody is meant to type: the web hands out an editor link instead
+ * (`editorLinks`), and this line survives for it only as the truth a support conversation needs.
  */
 export function sshCommandFor(routeId: string): string | undefined {
   const host = bastion.publicHost();

@@ -374,9 +374,9 @@ export function sshKeysFor(sessionId: string): string[] {
 
 // Register a bastion route for every ssh-shaped view of a sandbox — terminal views, which attach
 // their live tmux session, agent views, which join their live conversation, and code views, whose
-// transparent shell is what a local IDE drives (see `modeForView`). Idempotent: a route id is minted once and
-// persisted on the view, so re-running this re-asserts rather than churns, and a saved
-// `ssh <id>@host` keeps working across restarts of anything.
+// transparent shell is what a local IDE drives (see `modeForView`). Idempotent: a route id is
+// minted once and persisted on the view, so re-running this re-asserts rather than churns, and a
+// saved `ssh <id>@host` keeps working across restarts of anything.
 // The tmux session a terminal view runs in — the bastion `attach`es exactly this, so an ssh user
 // and the browser terminal share one live screen rather than getting two separate shells.
 function tmuxTargetFor(v: View): string {
