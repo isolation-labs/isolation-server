@@ -790,9 +790,11 @@ test("every tool the in-sandbox MCP offers over the control channel is one the s
   const forwarded = new Set([...mcp.matchAll(/const SERVER_TOOLS = new Set\(\[([\s\S]*?)\]\)/g)].flatMap((m) => [...m[1].matchAll(/"([a-z_]+)"/g)].map((x) => x[1])));
   const advertised = new Set([...mcp.matchAll(/name: "([a-z_]+)"/g)].map((m) => m[1]));
 
-  // What the server's switch actually answers.
+  // What the server's switch actually answers — a case with its own body, OR one that falls through
+  // to the shared forward (the seven control-plane tools became actions on 2026-09-10 and are
+  // answered by the cloud, so they carry no body here).
   const pump = readFileSync(join(root, "src", "toolpump.ts"), "utf8");
-  const handled = new Set([...pump.matchAll(/^\s{4}case "([a-z_]+)": \{/gm)].map((m) => m[1]));
+  const handled = new Set([...pump.matchAll(/^\s{4}case "([a-z_]+)":/gm)].map((m) => m[1]));
 
   const declared = new Set(PUMP_TOOLS);
   for (const t of declared) {
@@ -803,6 +805,19 @@ test("every tool the in-sandbox MCP offers over the control channel is one the s
   for (const t of forwarded) assert.ok(declared.has(t), `iso-mcp forwards ${t}, which is not in PUMP_TOOLS`);
   for (const t of handled) assert.ok(declared.has(t), `the server handles ${t}, which is not in PUMP_TOOLS`);
   assert.ok(declared.size >= 13);
+
+  // AND THE SPLIT ITSELF, which is the rule that matters now: the control-plane tools are forwarded
+  // to the cloud as actions and must NOT be re-implemented here (that is how two `view_create`s
+  // with different arguments happened), while the agent's own work plane must never be forwarded —
+  // it has no meaning outside the sandbox.
+  const forwardedToCloud = ["views_list", "view_create", "view_link", "view_delete", "ssh_command", "session_logs", "session_save"];
+  for (const t of forwardedToCloud) {
+    assert.ok(handled.has(t), `${t} lost its case`);
+    assert.ok(!new RegExp(`case "${t}": \\{`).test(pump), `${t} is an ACTION — it must be forwarded, not answered here`);
+  }
+  for (const t of ["chat_context", "chat_history", "chat_members", "chat_reply", "chat_post", "chat_notify_owner"]) {
+    assert.ok(new RegExp(`case "${t}": \\{`).test(pump), `${t} is the agent's own work plane and is answered here`);
+  }
 });
 
 // Thread ownership (PLAN §1 I3, routing rule 1): a reply inside a thread goes to whoever answered

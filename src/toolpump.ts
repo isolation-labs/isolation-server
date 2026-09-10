@@ -18,12 +18,11 @@
 // tool call exactly as it does to the browser's click. The tool map below is the entire surface an
 // agent can reach, and each entry is pinned to the CALLING view's own session: an argument never
 // names another one.
-import { HOST, PORT, getToken } from "./config.js";
 import { endpointFor } from "./opensandbox.js";
-import { getSessionRecord, sessionForSandbox } from "./sessions.js";
+import { sessionForSandbox } from "./sessions.js";
 import { getView, viewsForSandbox, type View } from "./views.js";
-import { threadKeyOf } from "./agents.js";
-import { bindingForThread, channelHistory, channelMembers, channelsForSession, envelopeFor, notifyOwner, postToChannel } from "./channels.js";
+import { agentForView, threadKeyOf } from "./agents.js";
+import { bindingForThread, channelHistory, channelMembers, channelsForSession, cloud, envelopeFor, notifyOwner, postToChannel } from "./channels.js";
 
 const log = (...a: unknown[]) => console.log("[toolpump]", ...a);
 
@@ -138,60 +137,22 @@ export function startToolPumpsFor(sandboxId: string): void {
 
 const str = (v: unknown, max = 500): string | undefined => (typeof v === "string" && v.trim() ? v.trim().slice(0, max) : undefined);
 
-/** One call into this server's own API, as the session's owner. */
-async function api(sessionId: string, path: string, init: { method?: string; body?: unknown } = {}): Promise<any> {
-  const s = getSessionRecord(sessionId);
-  const headers: Record<string, string> = { authorization: `Bearer ${getToken()}`, "content-type": "application/json" };
-  // Act as the session's launcher — the same identity the Worker's proxy stamps. Without it the
-  // server would treat the call as identity-less, which is a WIDER right, not a narrower one.
-  if (s?.owner) {
-    headers["x-isolation-actor"] = s.owner;
-    headers["x-isolation-actor-role"] = "member";
-  }
-  const r = await fetch(`http://${HOST}:${PORT}${path}`, {
-    method: init.method ?? "GET",
-    headers,
-    ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
-    signal: AbortSignal.timeout(30_000),
+async function cloudAction(view: View, sessionId: string, call: ToolCall): Promise<unknown> {
+  const rec = agentForView(view);
+  const name = call.tool === "ssh_command" ? "view_connect" : call.tool;
+  const args: Record<string, unknown> = call.tool === "ssh_command" ? { view: "terminal" } : { ...(call.args ?? {}) };
+  const out = await cloud({
+    op: "action",
+    name,
+    args,
+    sessionId,
+    agentId: view.agentId ?? rec?.def.id ?? "",
+    viewId: view.id,
+    harness: rec?.def.harness ?? "agent",
   });
-  const text = await r.text();
-  let body: any;
-  try {
-    body = text ? JSON.parse(text) : undefined;
-  } catch {
-    body = undefined;
-  }
-  if (!r.ok) throw new Error(String(body?.error ?? `the server answered HTTP ${r.status}`));
-  return body;
-}
-
-/** A view as an agent should see it: what it is, and the address to hand a person. */
-function brief(v: { id: string; type: string; label?: string | null; target?: { url?: string; appPort?: number } }): Record<string, unknown> {
-  const url = v.target?.url;
-  // Only a WEB view's url is an address someone else can open: it lives on the sandbox plane and
-  // its random hostname IS the access secret. Judged on the HOST, not a prefix match: a server the
-  // cloud has served no preview domain to falls back to `<slug>.localhost` (views.ts webUrl), which
-  // resolves on this machine and nowhere else — telling an agent to hand that to a colleague is
-  // handing out a dead link.
-  let host = "";
-  try {
-    host = typeof url === "string" ? new URL(url).hostname.toLowerCase() : "";
-  } catch {
-    host = "";
-  }
-  const local = !host || host === "localhost" || host.endsWith(".localhost") || host.startsWith("127.") || host === "::1" || host === "[::1]";
-  const shareable = v.type === "web" && !local;
-  return {
-    id: v.id,
-    type: v.type,
-    label: v.label ?? null,
-    shareable,
-    ...(shareable ? { publicUrl: url } : {}),
-    // A web view that is NOT shareable still has an address — it just only works on the machine
-    // running this server. Say so rather than answering as if the window had no link at all.
-    ...(!shareable && v.type === "web" && url ? { localUrl: url } : {}),
-    ...(v.target?.appPort ? { appPort: v.target.appPort } : {}),
-  };
+  // The cloud answers `{ result }` for a success and `{ error }` for anything the agent can act on;
+  // `cloud()` has already turned the second into a throw.
+  return (out as { result?: unknown }).result;
 }
 
 async function runTool(view: View, call: ToolCall): Promise<unknown> {
@@ -201,81 +162,26 @@ async function runTool(view: View, call: ToolCall): Promise<unknown> {
   const args = call.args ?? {};
 
   switch (call.tool) {
-    case "views_list": {
-      const views = await api(s.id, `/sessions/${id}/views`);
-      return { views: (Array.isArray(views) ? views : []).map(brief) };
-    }
-
-    // "Show me the preview." A web view publishes what the sandbox serves on a port at a public
-    // address whose random hostname is the access secret — so creating one IS sharing it, and the
-    // answer says so in the same breath rather than leaving the agent to guess.
-    case "view_create": {
-      const type = str(args.type, 20) ?? "";
-      if (!["web", "terminal", "code", "directory"].includes(type)) throw new Error("type must be web, terminal, code or directory");
-      if (type === "web" && !str(args.url)) throw new Error("a web view needs a url — what you serve inside the sandbox, e.g. http://localhost:3000/");
-      const created = await api(s.id, `/sessions/${id}/views`, {
-        method: "POST",
-        body: {
-          type,
-          ...(str(args.url) ? { url: str(args.url) } : {}),
-          ...(str(args.dir, 200) ? { dir: str(args.dir, 200) } : {}),
-          ...(str(args.command) ? { command: str(args.command) } : {}),
-          ...(str(args.label, 80) ? { label: str(args.label, 80) } : {}),
-        },
-      });
-      const b = brief(created);
-      return {
-        ...b,
-        note: b.shareable
-          ? "Anyone with that link can open it — the random part of the hostname is the only thing protecting it."
-          : b.localUrl
-            ? "This server has no public preview domain yet, so that address only opens on the machine running it. The window is on the session screen either way."
-            : "This window opens on the session screen, which needs a signed-in browser.",
-      };
-    }
-
-    case "view_link": {
-      const want = str(args.viewId, 60);
-      const views = await api(s.id, `/sessions/${id}/views`);
-      const v = (Array.isArray(views) ? views : []).find((x: { id: string }) => x.id === want);
-      if (!v) throw new Error(`this session has no view "${want ?? ""}"`);
-      return brief(v);
-    }
-
-    case "view_delete": {
-      const want = str(args.viewId, 60);
-      if (!want) throw new Error("viewId is required");
-      if (want === view.id) throw new Error("that is your own window — closing it would end this conversation");
-      const views = await api(s.id, `/sessions/${id}/views`);
-      if (!(Array.isArray(views) ? views : []).some((x: { id: string }) => x.id === want)) throw new Error(`this session has no view "${want}"`);
-      await api(s.id, `/views/${encodeURIComponent(want)}`, { method: "DELETE" });
-      return { closed: true };
-    }
-
-    // The command a person types to get into this sandbox from their own terminal.
-    case "ssh_command": {
-      const views = await api(s.id, `/sessions/${id}/views`);
-      const term = (Array.isArray(views) ? views : []).find((v: { type: string }) => v.type === "terminal");
-      if (!term) throw new Error("this session has no terminal to attach to — create one with view_create first");
-      const conn = await api(s.id, `/sessions/${id}/views/${encodeURIComponent(term.id)}/connect`, { method: "POST", body: {} });
-      if (!conn?.command) throw new Error("this server has no ssh route configured");
-      return {
-        command: conn.command,
-        host: conn.host,
-        ...(conn.bastion ? { throughBastion: true } : { port: conn.port }),
-        note: "The person's ssh public key must be on the Isolation account that launched this session.",
-      };
-    }
-
-    // The sandbox's own boot/lifecycle output — the first thing to read when something is wrong.
-    case "session_logs": {
-      const tail = Math.min(Math.max(typeof args.tail === "number" ? args.tail : 100, 1), 500);
-      const out = await api(s.id, `/sessions/${id}/logs?tail=${tail}`);
-      // The route always answers with its own last-500 window (it ignores the query), so the
-      // `tail` the agent asked for is applied HERE — otherwise every call floods the turn with 500
-      // lines whatever it requested.
-      return out?.available ? { available: true, lines: (out.lines ?? []).slice(-tail).map((l: { line: string }) => l.line) } : { available: false, note: "the container is gone — there is nothing left to read" };
-    }
+    // ── THE CONTROL PLANE, forwarded (docs/actions-plan.md A2) ─────────────────────────────────
+    //
+    // These are not this server's to answer. Each one is an ACTION — the same body a person reaches
+    // from the website, from `/view` typed in Slack, and from an MCP tool — and until 2026-09-10
+    // there was a second implementation of every one of them right here, with the same names and
+    // subtly different arguments. Now the agent is simply a fifth actor: the cloud checks that this
+    // server is running this session, pins the call to it, runs the one body and logs it.
+    //
+    // WHAT IS NOT FORWARDED, and never will be: everything below this block. `chat_*` is the
+    // conversation this agent was summoned into, `memory_*` and `thread_send` are answered inside
+    // the sandbox. That is the agent's WORK plane, it has no equivalent outside a session, and
+    // giving it one would be inventing a door rather than sharing one.
+    case "views_list":
+    case "view_create":
+    case "view_link":
+    case "view_delete":
+    case "ssh_command":
+    case "session_logs":
+    case "session_save":
+      return cloudAction(view, s.id, call);
 
     // ── The chat this agent was spoken to in (PLAN §1 I3) ──────────────────────────────────────
     // Agnostic by construction: the connector is a field on the envelope, never a different tool.
@@ -340,11 +246,6 @@ async function runTool(view: View, call: ToolCall): Promise<unknown> {
     }
 
     // Commit the session's file tree back into the workspace, so the work survives the session.
-    case "session_save": {
-      const out = await api(s.id, `/sessions/${id}/save`, { method: "POST", body: {} });
-      return out?.skipped ? { saved: false, reason: out.reason ?? "there was nothing to save" } : { saved: true };
-    }
-
     default:
       throw new Error(`unknown tool: ${call.tool}`);
   }

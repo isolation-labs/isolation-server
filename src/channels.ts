@@ -163,12 +163,18 @@ export function forgetEnvelopesFor(sessionId: string): void {
 // the same, only the implementation branches, and it branches once.
 
 interface CloudCall {
-  op: "post" | "history" | "members" | "notify";
-  bindingId: string;
+  op: "post" | "history" | "members" | "notify" | "action";
   [k: string]: unknown;
 }
 
-async function cloud(call: CloudCall): Promise<Record<string, unknown>> {
+/**
+ * ONE CALL TO THE CLOUD, authenticated by this server's pairing secret.
+ *
+ * Exported since 2026-09-10: the tool pump forwards an agent's control-plane calls over the same
+ * channel (`op: "action"`), and giving it a second way to reach the cloud would mean a second place
+ * to get the credential and the error handling right.
+ */
+export async function cloud(call: CloudCall): Promise<Record<string, unknown>> {
   const p = getPairing();
   if (!p) throw new Error("this server is not paired with a cloud, so it cannot reach the chat");
   const r = await fetch(`${p.backendUrl.replace(/\/+$/, "")}/api/pair/channel`, {

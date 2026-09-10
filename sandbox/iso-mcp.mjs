@@ -2,7 +2,10 @@
 // registered with the harness through ACP's `session/new … mcpServers`. It teaches the agent
 // its environment as TOOLS rather than prose: who it is, which session and workspace it is in,
 // the views (windows) of the session, its own memory note, and a way to hand a message to
-// another agent's thread (the bridge's POST /prompt). Env, all set by isolation-server:
+// another agent's thread (the bridge's POST /prompt). The second group are ACTIONS — the same
+// bodies a person reaches from the website or by typing `/view` in Slack — forwarded by this
+// server to the cloud rather than implemented twice (docs/actions-plan.md). Env, all set by
+// isolation-server:
 //   ISO_AGENT_ID ISO_AGENT_NAME ISO_HARNESS ISO_SESSION_ID ISO_WORKSPACE_ID ISO_VIEW_ID
 //   ISO_MEMORY_PATH ISO_VIEWS_FILE ISO_BRIDGE_PORT
 //
@@ -91,12 +94,13 @@ const TOOLS = [
   },
   {
     name: "ssh_command",
-    description: "The command someone types to get into this sandbox from their own terminal. It only works for a person whose ssh public key is on the account that launched this session.",
+    description:
+      "How someone reaches this sandbox's terminal from their own machine: the `command` they type, and the host it goes through. It works for a public key this session authorizes — the launcher's own, plus any added since. Answers about the session's TERMINAL window; create one with view_create if it has none.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "session_logs",
-    description: "This sandbox's own boot and lifecycle output — how it started, what the clone did, why something failed.",
+    description: "This sandbox's own boot and lifecycle output — how it started, what the clone did, why something failed. `lines` is the text; `entries` adds each line's timestamp and stream.",
     inputSchema: { type: "object", properties: { tail: { type: "number", description: "how many lines (default 100, max 500)" } }, additionalProperties: false },
   },
   {
