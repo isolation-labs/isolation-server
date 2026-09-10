@@ -419,30 +419,28 @@ function sameEndpoint(a: BastionConfig, b: BastionConfig): boolean {
 
 export const bastion = new BastionClient();
 
-// Which view types are reachable over ssh, and how.
-//
-// TERMINAL AND AGENT, deliberately — and nothing else. Each of those attaches the very thing the
-// browser view is showing, which is a feature you can explain in a sentence. `code` would be a
-// plain shell wearing a different label (it promises VS Code Remote, its own setup story), which is
-// a worse thing to ship than nothing. `directory` promises FILES, and its door is not ssh at all:
-// it mounts over WebDAV through the doorman (webdav.ts), which every desktop opens with nothing
-// installed and no port but 443.
 /**
  * WHICH DOOR A VIEW HAS, and the route type is the whole of it — a person types
  * `ssh <routeId>@<host>` and the bastion already knows what that route is for.
  *
- *   terminal → tmux: attach the very session the browser view is showing.
- *   agent    → acp:  join the very conversation the browser view is showing, as one more client of
- *                    a bridge that already fans out to N. NOT a terminal running a chat program —
- *                    the same session, live, both ways, so an external ACP client and the session
- *                    screen are two windows on one thing.
+ *   terminal → tmux:  attach the very session the browser view is showing.
+ *   agent    → acp:   join the very conversation the browser view is showing, as one more client of
+ *                     a bridge that already fans out to N. NOT a terminal running a chat program —
+ *                     the same session, live, both ways, so an external ACP client and the session
+ *                     screen are two windows on one thing.
+ *   code     → shell: a transparent shell, which is what a remote IDE needs and the ONLY route mode
+ *                     that carries exec, sftp and `ssh -L` (proxy.ts). Nobody is meant to type this
+ *                     one: the web hands out an editor deep link and the editor drives the ssh.
  *
- * A code view has no external door yet, and answering `undefined` is what keeps it from getting one
- * by accident. A directory view's door is WebDAV, not ssh — see the note above.
+ * A DIRECTORY view answers `undefined` here, and that is not a gap: its door is not ssh at all. It
+ * mounts over WebDAV through the doorman (webdav.ts) — plain HTTPS on the port the view plane
+ * already answers on, which every desktop opens with nothing installed. `davConnect` (sessions.ts)
+ * is what the web hands out for it, so `undefined` is what keeps it from ALSO getting a shell.
  */
 export function modeForView(type: string): RouteMode | undefined {
   if (type === "terminal") return "tmux";
   if (type === "agent") return "acp";
+  if (type === "code") return "shell";
   return undefined;
 }
 
@@ -450,14 +448,78 @@ export function modeForView(type: string): RouteMode | undefined {
  * The line a person types for a route: `ssh <routeId>@<host>`, whatever the route is for.
  *
  * ONE LINE FOR EVERY DOOR, because the ROUTE already says what it opens — a terminal route attaches
- * that terminal, an agent route lands in that conversation. Nothing about the protocol reaches what
- * anybody types, and neither route ever opens a shell.
+ * that terminal, an agent route lands in that conversation, a code route is the transparent shell an
+ * IDE drives. Nothing about the protocol reaches what anybody types. Only the code route opens a
+ * shell, and it is the one nobody is meant to type: the web hands out an editor link instead
+ * (`editorLinks`), and this line survives for it only as the truth a support conversation needs.
  */
 export function sshCommandFor(routeId: string): string | undefined {
   const host = bastion.publicHost();
   if (!host) return undefined;
   const port = bastion.edgePort() ?? 22;
   return `ssh ${routeId}@${host}${port === 22 ? "" : ` -p ${port}`}`;
+}
+
+/**
+ * A local editor a `code` view can be opened in: what the button says, and the URL the browser hands
+ * to the OS. `id` is stable — the web remembers the last one a member picked and makes it the
+ * primary button, so renaming one would silently forget everybody's choice.
+ */
+export interface EditorLink {
+  id: string;
+  name: string;
+  url: string;
+}
+
+/** The folder a code view opens. Code views carry no `dir` (launch.ts sets it for terminal/directory only). */
+const EDITOR_PATH = "/workspace";
+
+// The authority a route id + bastion host make, and nothing else may reach a URL we hand the
+// browser: this string is spliced into a scheme the OS will launch, so anything outside this set
+// (a slash, a `?`, a second `@`) could smuggle a different target into the click. Route ids are
+// base36 and the host is a hostname, so the guard never fires in practice — it is here so that a
+// day when one of them is not stays a missing button rather than a crafted link.
+const SAFE_AUTHORITY = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * THE ONE-CLICK DOORS for a code view — the whole external story for it, deliberately.
+ *
+ * A code view's route is a plain `shell`, which is what a remote IDE drives: the editor uploads its
+ * own server into the sandbox over that ssh and speaks its protocol across it. So there is nothing
+ * for a person to type and no command worth showing — the product is the button.
+ *
+ * TWO URL SHAPES, and both are the editor's own, not ours:
+ *   VS Code and its forks resolve `ssh-remote+<authority>` themselves. `user@host[:port]` is the
+ *   form their `HostInfo.fromString` parses (verified against ms-vscode-remote.remote-ssh 0.128.0);
+ *   the extension's own hex-JSON encoding parses too, but the plain form is what the forks share.
+ *   Zed documents `zed://ssh/[<user>@]<host>[:<port>]/<path>`.
+ *
+ * `?windowId=_blank` IS NOT DECORATION — without it VS Code TAKES OVER a window you already had
+ * open (observed 2026-09-10). Its protocol handler reads exactly this parameter to set
+ * `shouldOpenInNewWindow`, and strips it again before building the folder URI, so it costs the
+ * opened window nothing (verified by reading VS Code's own `handleProtocolUrl` /
+ * `getWindowOpenableFromProtocolUrl`). Zed gets no equivalent: none is documented, and it was never
+ * the one stealing a window.
+ *
+ * Only VS Code is verified against a real installation here. Cursor and Windsurf are VS Code forks
+ * that keep the `vscode-remote` resolver, so they are ONE LIVE CLICK from proven rather than known
+ * — see BACKLOG.md. JetBrains Gateway is absent on purpose: its link requires `idePath`, a path to
+ * an IDE installed on the REMOTE, which nothing here can know.
+ */
+export function editorLinks(user: string, host: string, port = 22, path = EDITOR_PATH): EditorLink[] {
+  if (!SAFE_AUTHORITY.test(user) || !SAFE_AUTHORITY.test(host)) return [];
+  const authority = `${user}@${host}${port === 22 ? "" : `:${port}`}`;
+  // The VS Code family: one scheme each, the same path grammar. The scheme doubles as the `id`,
+  // which is why these are the strings that must not change.
+  const vscodeFamily: Array<[string, string]> = [
+    ["vscode", "VS Code"],
+    ["cursor", "Cursor"],
+    ["windsurf", "Windsurf"],
+  ];
+  return [
+    ...vscodeFamily.map(([scheme, name]) => ({ id: scheme, name, url: `${scheme}://vscode-remote/ssh-remote+${authority}${path}?windowId=_blank` })),
+    { id: "zed", name: "Zed", url: `zed://ssh/${authority}${path}` },
+  ];
 }
 
 /**
@@ -470,6 +532,27 @@ export function nativeConnectFor(routeId: string, sessionId: string, viewId: str
   const command = sshCommandFor(routeId);
   if (!host || !command) return undefined;
   const port = bastion.edgePort() ?? 22;
+  // A CODE VIEW IS AN EDITOR DOOR — a list of one-click links and nothing to type. `command` still
+  // rides along because it IS the truth about the route, and it is what a support conversation
+  // needs; the web renders buttons, because the point of this view type is that the member never
+  // learns an ssh line. No `vscodeUrl`: the daemon-era single button named one editor, and an SPA
+  // old enough to read that field is also old enough to hide this view's button entirely.
+  if (mode === "shell") {
+    return {
+      kind: "code",
+      host,
+      port,
+      user: routeId,
+      routeId,
+      sessionId,
+      viewId,
+      passwordless: true,
+      bastion: true,
+      command,
+      path: EDITOR_PATH,
+      editors: editorLinks(routeId, host, port),
+    };
+  }
   // AN AGENT ROUTE IS A CONVERSATION, opened the way a terminal view is opened: a plain `ssh` that
   // lands in it, rendered. It is a real terminal program, so `sshUrl` works exactly as it does for a
   // terminal — one click, the OS opens a terminal, and you are talking to the agent. Quitting ends

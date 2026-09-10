@@ -816,9 +816,12 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     return json(res, 200, viewJson(nv, id));
   }
 
-  // "Open externally" (the daemon's nativeConnect contract): hand the web a ready-to-run way into
-  // this view. Two doors, and which one a view gets is the view type's business:
-  //   terminal / agent → `ssh <routeId>@<host>` through the bastion (`modeForView`, bastion.ts);
+  // "Open externally" (the daemon's nativeConnect contract): hand the web what it needs to open this
+  // view outside the browser. Which door a view gets is the view type's business:
+  //   terminal / agent → a ready-to-run `ssh <routeId>@<host>` landing in the very thing the page is
+  //                      showing (`modeForView`, bastion.ts);
+  //   code             → editor deep links instead, because an IDE drives the ssh itself and there
+  //                      is nothing for a person to type;
   //   directory        → a WebDAV MOUNT through the doorman (webdav.ts) — no bastion, no sshd, no
   //                      port but the one the view plane already answers on.
   const nc = /^\/sessions\/(s-[a-z0-9]+)\/views\/([a-zA-Z0-9-]+)\/connect$/.exec(url);
@@ -865,8 +868,9 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // so a dark bastion is a 503 here — the reconnect loop makes this answerable again on its own.
     if (!bastion.isLive()) return json(res, 503, { error: "the ssh bastion is not reachable right now" });
     syncRoutes(id, s2.sandboxId);
-    // ONE LINE FOR EITHER MODE — `ssh <routeId>@<host>` — because the route already says what it
-    // opens. The mode still reaches the payload: it decides what the page is told it is opening.
+    // ONE LINE FOR EVERY MODE — `ssh <routeId>@<host>` — because the route already says what it
+    // opens. The mode still reaches the payload: it decides what the page is told it is opening, and
+    // for a code view it is what turns the answer into editor links instead of a line to type.
     const out = nativeConnectFor(routeId, id, vid, modeForView(v.type));
     return out ? json(res, 200, out) : json(res, 503, { error: "the ssh bastion is not reachable right now" });
   }
