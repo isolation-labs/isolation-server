@@ -95,7 +95,6 @@ async function fetchBastionConfig(backendUrl: string, connectionId: string, secr
       publicHost: typeof b.publicHost === "string" ? b.publicHost : b.controlHost,
       edgePort: Number(b.edgePort ?? 22),
       daemonLabel: typeof b.daemonLabel === "string" ? b.daemonLabel : connectionId,
-      ...(typeof b.smbHost === "string" ? { smbHost: b.smbHost } : {}),
       registerSecret: b.registerSecret,
       ...(hostKey ? { hostKey } : {}),
     });

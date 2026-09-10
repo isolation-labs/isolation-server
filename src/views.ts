@@ -196,16 +196,41 @@ export function verifyDavPassword(candidate: string | undefined, viewId: string)
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-export function verifyViewToken(token: string | undefined, viewId: string): boolean {
-  if (!token || !token.includes(".")) return false;
+/**
+ * Is this string the mount password of ANY live files view?
+ *
+ * Per-view is not enough for the doorman's credential strip. A view cookie is scoped with
+ * `Path=/v/<id>`, so the browser never offers it to another view; HTTP Basic has NO path scoping at
+ * all, so a client holding one view's mount password can attach it to a request for a DIFFERENT
+ * view on the same origin — and that view's app is arbitrary sandbox code. This password is also
+ * the one credential here that never expires, so leaking it hands over the folder for the life of
+ * the view. Checked against every files view, not just the one being proxied.
+ */
+export function isAnyDavPassword(candidate: string | undefined): boolean {
+  if (!candidate || candidate.length !== DAV_PASSWORD_LEN) return false;
+  return Object.values(views).some((v) => v.type === "directory" && verifyDavPassword(candidate, v.id));
+}
+
+// The view a token was minted for, when the signature is ours and it has not expired — undefined
+// otherwise. Both the per-view check and the "is this ours at all" check the doorman strips on are
+// this one function, so they can never disagree about what a valid token is.
+function viewTokenSubject(token: string | undefined): string | undefined {
+  if (!token || !token.includes(".")) return undefined;
   const [body, mac] = token.split(".");
   const a = Buffer.from(mac);
   const b = Buffer.from(sign(body));
-  if (a.length !== b.length || !timingSafeEqual(a, b)) return false;
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return undefined;
   try {
     const p = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as Payload;
-    return p.v === viewId && p.exp > Math.floor(Date.now() / 1000);
+    return typeof p.v === "string" && p.exp > Math.floor(Date.now() / 1000) ? p.v : undefined;
   } catch {
-    return false;
+    return undefined;
   }
 }
+
+export function verifyViewToken(token: string | undefined, viewId: string): boolean {
+  return viewTokenSubject(token) === viewId;
+}
+
+/** A token WE minted that is still live, whichever view it names — the strip-before-proxy test. */
+export const isOurViewToken = (token: string | undefined): boolean => viewTokenSubject(token) !== undefined;

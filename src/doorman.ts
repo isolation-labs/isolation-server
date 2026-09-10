@@ -12,7 +12,7 @@ import type { Duplex } from "node:stream";
 import httpProxy from "http-proxy-3";
 import { getSandbox, tokenMatches } from "./config.js";
 import { endpointFor } from "./opensandbox.js";
-import { getView, verifyDavPassword, verifyViewToken, viewBySlug, type View } from "./views.js";
+import { getView, isAnyDavPassword, isOurViewToken, verifyDavPassword, verifyViewToken, viewBySlug, type View } from "./views.js";
 import { startWebForwarder, webForwarderAlive } from "./launch.js";
 import { handleCodeView } from "./codeview.js";
 import { handleAgentView } from "./agentview.js";
@@ -76,31 +76,48 @@ export function basicToken(auth: string | undefined): string | undefined {
   return decoded.slice(colon + 1) || decoded.slice(0, colon) || undefined;
 }
 
-function tokenFromRequest(req: IncomingMessage, viewId: string): string | undefined {
+// EVERY credential the request carries, in preference order — not the first one present. The
+// difference matters because an Authorization header is not necessarily ours: a view app inside the
+// sandbox may run its OWN basic auth, and once a browser has been prompted by it, it attaches that
+// credential to every request on this origin. Returning it and stopping would make the doorman
+// reject a request whose cookie was valid all along, locking the view out until the browser's saved
+// password is cleared. Each candidate is simply tried.
+export function tokensFromRequest(req: IncomingMessage): string[] {
+  const out: string[] = [];
   const u = new URL(req.url ?? "/", "http://x");
   const q = u.searchParams.get("token");
-  if (q) return q;
+  if (q) out.push(q);
   const auth = req.headers.authorization;
-  if (auth?.startsWith("Bearer ")) return auth.slice(7);
+  if (auth?.startsWith("Bearer ")) out.push(auth.slice(7));
   const basic = basicToken(auth);
-  if (basic) return basic;
+  if (basic) out.push(basic);
   const cookies = req.headers.cookie ?? "";
   for (const c of cookies.split(";")) {
     const [k, ...rest] = c.trim().split("=");
-    if (k === "isolation-server_token") return decodeURIComponent(rest.join("="));
+    if (k !== "isolation-server_token") continue;
+    const raw = rest.join("=");
+    try {
+      out.push(decodeURIComponent(raw));
+    } catch {
+      out.push(raw); // malformed escape — judge the raw form, which is what we would have compared anyway
+    }
   }
-  void viewId;
-  return undefined;
+  return out;
 }
 
 // `isDav` widens the accepted credentials by exactly one: the view's stable mount password
 // (views.ts davPassword), which is deliberately confined to that view's own /dav path. It is the
 // one credential here that never expires, so it must not become a way in anywhere else.
 const authorized = (req: IncomingMessage, viewId: string, isDav = false): { ok: boolean; queryToken?: string } => {
-  const t = tokenFromRequest(req, viewId);
-  const ok = !!t && (tokenMatches(t) || verifyViewToken(t, viewId) || (isDav && verifyDavPassword(t, viewId)));
+  const ok = tokensFromRequest(req).some((t) => tokenMatches(t) || verifyViewToken(t, viewId) || (isDav && verifyDavPassword(t, viewId)));
   const u = new URL(req.url ?? "/", "http://x");
-  return { ok, queryToken: u.searchParams.get("token") ?? undefined };
+  // Only a `?token=` that is ITSELF valid may be promoted to the view cookie below. Now that every
+  // credential on the request is tried, `ok` can come from the cookie while the query carries a
+  // stale or hostile value — promoting that would overwrite a working cookie with a dead one and
+  // lock the view out of its own frame. The mount password is deliberately not promotable either:
+  // it never expires, and a long-lived cookie is not where a credential like that belongs.
+  const q = u.searchParams.get("token") ?? undefined;
+  return { ok, queryToken: q && (tokenMatches(q) || verifyViewToken(q, viewId)) ? q : undefined };
 };
 
 // Our own credentials must NEVER be handed to a sandbox: the app behind a view — a dev server, a
@@ -110,18 +127,24 @@ const authorized = (req: IncomingMessage, viewId: string, isDav = false): { ok: 
 // the caller's other headers verbatim — and `x-forwarded-host` is one of those, so a caller can
 // steer such a request onto the public plane. Strip OURS only: a view app's own Bearer or cookie
 // auth is its business and passes through untouched.
-export function stripOurCredentials(req: IncomingMessage, viewId?: string): void {
+export function stripOurCredentials(req: IncomingMessage): void {
   const auth = req.headers.authorization;
-  if (auth?.startsWith("Bearer ") && tokenMatches(auth.slice(7))) delete req.headers.authorization;
+  // "Ours" is judged WITHOUT pinning to the view being proxied. A credential of ours is ours
+  // wherever it turns up, and a sandbox app is exactly the party that must not see one — while the
+  // request that carries it is not necessarily the view it belongs to (see the Basic note below).
+  // Nothing a sandbox could invent passes these checks: each is an HMAC under this server's token.
+  const ours = (t: string): boolean => tokenMatches(t) || isOurViewToken(t) || isAnyDavPassword(t);
+  if (auth?.startsWith("Bearer ") && ours(auth.slice(7))) delete req.headers.authorization;
   // The same rule for the Basic form a mount client sends: a view app must never be handed the
   // credential that authenticated the request to US. An app's OWN basic auth is left alone.
   //
   // The mount password is stripped too, even though it does not authorize a proxied path: a request
   // can be authorized by its query token and STILL carry one in a Basic header, and that password
   // never expires — leaking it to whatever the sandbox is serving would hand out the folder for the
-  // life of the view.
+  // life of the view. And unlike the view cookie (`Path=/v/<id>`), HTTP Basic has NO path scoping,
+  // so the view it arrives on is NOT necessarily the view it opens — hence `isAnyDavPassword`.
   const basic = basicToken(auth);
-  if (basic && (tokenMatches(basic) || (viewId && (verifyViewToken(basic, viewId) || verifyDavPassword(basic, viewId))))) delete req.headers.authorization;
+  if (basic && ours(basic)) delete req.headers.authorization;
   const cookie = req.headers.cookie;
   if (!cookie) return;
   const parts = cookie.split(";");
@@ -209,7 +232,7 @@ export async function handleViewRequest(req: IncomingMessage, res: ServerRespons
   try {
     const t = await resolveTarget(view.sandboxId, view.port);
     req.url = `${t.basePath}${viewPath(view, req.url, viewId)}`;
-    stripOurCredentials(req, viewId);
+    stripOurCredentials(req);
     proxy.web(req, res, { target: `http://${t.host}` });
   } catch (e) {
     targets.delete(`${view.sandboxId}:${view.port}`);

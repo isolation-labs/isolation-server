@@ -1,2 +1,9 @@
 node_modules/
 dist/
+
+# Claude Code. Worktrees and per-machine state under here are never committed — but the project
+# SETTINGS are, because they carry Rule 0 (no AI attribution). They live in the repo rather than
+# only in the umbrella folder above it: a session started HERE, which CLAUDE.md Rule 2 tells you to
+# do before a push, does not load the umbrella's settings, and the harness default is attribution ON.
+.claude/*
+!.claude/settings.json

@@ -162,6 +162,7 @@ before(async () => {
     servers: [execd, osb, front],
     port: front.address().port,
     base: `http://127.0.0.1:${front.address().port}/v/${viewId}/dav`,
+    password: davPassword(viewId),
     auth: `Basic ${Buffer.from(`isolation:${davPassword(viewId)}`, "utf8").toString("base64")}`,
     rangeAware: false,
     home,
@@ -209,6 +210,50 @@ describe("the files view mounts over WebDAV", { skip: SKIP }, () => {
       headers: { Authorization: ctx.auth, Depth: "0" },
     });
     assert.equal(other.status, 404, "an unknown view is not even challenged");
+  });
+
+  test("a view app's OWN basic credential does not shadow the cookie that authorizes us", async () => {
+    // Once a browser has been prompted by an app inside the sandbox, it attaches THAT credential to
+    // every request on this origin. It is not ours and never matches — the request has to be judged
+    // on the cookie it also carries, not rejected because an Authorization header was present.
+    const r = await fetch(`http://127.0.0.1:${ctx.port}/v/${ctx.viewId}/dav/`, {
+      method: "PROPFIND",
+      headers: {
+        Depth: "0",
+        Authorization: `Basic ${Buffer.from("appuser:apppassword").toString("base64")}`,
+        Cookie: "isolation-server_token=test-master-token",
+      },
+    });
+    assert.equal(r.status, 207);
+  });
+
+  test("only a ?token= that is itself valid is promoted to the view cookie", async () => {
+    // Every credential on the request is tried, so a request can be authorized by its COOKIE while
+    // the query string carries a dead token. Promoting that one would overwrite the credential that
+    // actually worked and lock the frame out of its own view on the next request.
+    const stale = await fetch(`http://127.0.0.1:${ctx.port}/v/${ctx.viewId}/dav/?token=not-a-token`, {
+      method: "PROPFIND",
+      headers: { Depth: "0", Cookie: "isolation-server_token=test-master-token" },
+    });
+    assert.equal(stale.status, 207, "the cookie authorizes it");
+    assert.equal(stale.headers.get("set-cookie"), null, "a token that does not verify is never saved");
+
+    // The mount password is not promotable either: it never expires, and a cookie is not where a
+    // credential like that belongs.
+    const mount = await fetch(`http://127.0.0.1:${ctx.port}/v/${ctx.viewId}/dav/?token=${encodeURIComponent(ctx.password)}`, {
+      method: "PROPFIND",
+      headers: { Depth: "0" },
+    });
+    assert.equal(mount.status, 207);
+    assert.equal(mount.headers.get("set-cookie"), null);
+
+    // …and a token that DOES verify still is, which is what the browser frame relies on.
+    const good = await fetch(`http://127.0.0.1:${ctx.port}/v/${ctx.viewId}/dav/?token=test-master-token`, {
+      method: "PROPFIND",
+      headers: { Depth: "0" },
+    });
+    assert.equal(good.status, 207);
+    assert.match(good.headers.get("set-cookie") ?? "", /isolation-server_token=test-master-token/);
   });
 
   test("OPTIONS advertises class 2, without which macOS mounts read-only", async () => {
@@ -369,6 +414,17 @@ describe("the files view mounts over WebDAV", { skip: SKIP }, () => {
     const clash = await dav("/a.txt", { method: "MOVE", headers: { Destination: `${ctx.base}/new.txt`, Overwrite: "F" } });
     assert.equal(clash.status, 412);
     assert.equal(readFileSync(join(ctx.ws, "a.txt"), "utf8"), "hello world", "a refused move must not have happened");
+  });
+
+  test("MOVE onto an ancestor of the source is refused, not obeyed by deleting the tree", async () => {
+    // Overwriting means deleting the destination first, and when the destination CONTAINS the
+    // source that deletes the source too: the whole subtree would be gone and the move would fail
+    // anyway. The guard has to fire before anything runs.
+    for (const method of ["MOVE", "COPY"]) {
+      const r = await dav("/made-copy/-moved%20file.txt", { method, headers: { Destination: `${ctx.base}/made-copy` } });
+      assert.equal(r.status, 409, `${method} onto its own parent`);
+      assert.equal(readFileSync(join(ctx.ws, "made-copy", "-moved file.txt"), "utf8"), "spaced", `${method} must not have touched the tree`);
+    }
   });
 
   test("LOCK, refresh and UNLOCK — the class-2 round trip a write goes through", async () => {

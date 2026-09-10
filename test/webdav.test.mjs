@@ -2,14 +2,36 @@
 // piece that no type checker can vouch for — the streamed multipart upload, exercised against a
 // real HTTP server so the framing and the Content-Length/chunked question are answered by undici
 // rather than by hope.
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// config.ts resolves its home and views.ts loads views.json at IMPORT time, so a throwaway home
+// with two known files views has to exist before the first dist/ import below — otherwise these
+// tests would read (and `getToken()` could write to) the real `~/.isolation-server`.
+const HOME = mkdtempSync(join(tmpdir(), "iso-dav-unit-"));
+mkdirSync(join(HOME, "data"), { recursive: true });
+writeFileSync(join(HOME, "config.json"), JSON.stringify({ token: "test-master-token" }));
+const VIEW_A = "v-davunit-a";
+const VIEW_B = "v-davunit-b";
+writeFileSync(
+  join(HOME, "data", "views.json"),
+  JSON.stringify({
+    [VIEW_A]: { id: VIEW_A, sandboxId: "sbx-unit", type: "directory", port: 8081, label: "Files" },
+    [VIEW_B]: { id: VIEW_B, sandboxId: "sbx-unit", type: "directory", port: 8082, label: "More files" },
+  }),
+);
+process.env.ISOLATION_SERVER_HOME = HOME;
+after(() => rmSync(HOME, { recursive: true, force: true }));
 
 const { davRelPath, parsePropfind, parseRange, destinationRel, ifTokens } = await import("../dist/webdav.js");
 const { uploadBody, UploadTooLarge, writeFileStream } = await import("../dist/execd.js");
-const { basicToken } = await import("../dist/doorman.js");
+const { basicToken, stripOurCredentials } = await import("../dist/doorman.js");
+const { davPassword, mintViewToken } = await import("../dist/views.js");
 
 // ── paths ────────────────────────────────────────────────────────────────────────────────────────
 
@@ -129,6 +151,40 @@ test("basicToken reads the password, and falls back to the username", () => {
   assert.equal(basicToken(`Basic ${b64("tokenonly:")}`), "tokenonly", "an empty password falls back to the username");
   assert.equal(basicToken("Bearer abc"), undefined);
   assert.equal(basicToken(undefined), undefined);
+});
+
+test("a credential of OURS is never proxied into a sandbox, whichever view it arrives on", () => {
+  const b64 = (s) => Buffer.from(s, "utf8").toString("base64");
+  const strip = (headers) => {
+    const req = { headers: { ...headers } };
+    stripOurCredentials(req);
+    return req.headers;
+  };
+
+  // The app's own credential is the app's business.
+  const app = `Basic ${b64("appuser:apppassword")}`;
+  assert.equal(strip({ authorization: app }).authorization, app);
+  assert.equal(strip({ authorization: "Bearer an-app-token" }).authorization, "Bearer an-app-token");
+
+  // Ours, in every form it can arrive in.
+  assert.equal(strip({ authorization: "Bearer test-master-token" }).authorization, undefined);
+  assert.equal(strip({ authorization: `Basic ${b64(`isolation:test-master-token`)}` }).authorization, undefined);
+  assert.equal(strip({ authorization: `Bearer ${mintViewToken(VIEW_A)}` }).authorization, undefined);
+  assert.equal(strip({ authorization: `Basic ${b64(`isolation:${davPassword(VIEW_A)}`)}` }).authorization, undefined);
+
+  // …and the one that has no path scoping to protect it. HTTP Basic is offered per ORIGIN, and the
+  // view plane is one origin for every view on this server, so view A's mount password can ride a
+  // request bound for view B — whose app is arbitrary sandbox code. It never expires, so handing it
+  // over would hand over A's folder for the life of the view. The strip is not per-view for exactly
+  // this reason.
+  assert.equal(
+    strip({ authorization: `Basic ${b64(`isolation:${davPassword(VIEW_A)}`)}`, host: `${VIEW_B}.example` }).authorization,
+    undefined,
+    "view A's mount password must not reach view B's app",
+  );
+  // A near-miss must not be mistaken for ours (and must not be eaten from the app).
+  const nearMiss = `Basic ${b64(`isolation:${davPassword(VIEW_A).slice(0, -1)}x`)}`;
+  assert.equal(strip({ authorization: nearMiss }).authorization, nearMiss);
 });
 
 // ── the streamed upload, against a real server ───────────────────────────────────────────────────

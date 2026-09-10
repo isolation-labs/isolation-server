@@ -213,7 +213,7 @@ export function parsePropfind(body: string): PropfindRequest {
     const prefix = (m[1] ?? "").replace(/:$/, "");
     const name = m[2];
     const ns = nsByPrefix.get(prefix) ?? "DAV:";
-    const key = `${ns} ${name}`;
+    const key = `${ns}\u0000${name}`;
     if (seen.has(key)) continue;
     seen.add(key);
     props.push({ ns, name });
@@ -457,6 +457,11 @@ export async function handleWebdav(req: IncomingMessage, res: ServerResponse, vi
         return void res.end();
     }
   } catch (e) {
+    // A GET that fails MID-BODY (the sandbox dies under a large read) has already sent its headers,
+    // and writing a status onto that throws ERR_HTTP_HEADERS_SENT — which would replace a truncated
+    // download with a rejected promise and a response nothing ever ends, one hung socket per
+    // failure. Destroy the connection instead: a torn-off body is what the client must see anyway.
+    if (res.headersSent) return void res.destroy();
     return plain(res, 502, String((e as Error)?.message ?? e).slice(0, 300));
   }
 }
@@ -632,7 +637,23 @@ async function getFile(req: IncomingMessage, res: ServerResponse, view: View, re
         seen += chunk.length;
       }
       written += chunk.length;
-      if (!res.write(chunk)) await new Promise((r) => res.once("drain", r));
+      if (res.destroyed) break;
+      if (!res.write(chunk)) {
+        // A client that walks away mid-download — Finder cancels a preview on every arrow key —
+        // never emits `drain`. Waiting on that alone would park this handler forever and hold the
+        // execd response open with it, one leaked connection per abandoned read. Whichever of the
+        // two fires first wins.
+        await new Promise<void>((resolve) => {
+          const done = (): void => {
+            res.off("drain", done);
+            res.off("close", done);
+            resolve();
+          };
+          res.once("drain", done);
+          res.once("close", done);
+        });
+      }
+      if (res.destroyed) break;
       if (written >= length) break;
     }
   } finally {
@@ -768,6 +789,10 @@ async function moveOrCopy(req: IncomingMessage, res: ServerResponse, view: View,
   if (to === rel) return plain(res, 403, "source and destination are the same");
   // Moving a collection into itself would recurse; `mv` catches it but with a confusing message.
   if (to.startsWith(`${rel}/`)) return plain(res, 409, "destination is inside the source");
+  // …and the other direction is the DESTRUCTIVE one: an overwriting move onto an ANCESTOR of the
+  // source (`a/b` → `a`) starts by deleting the destination, which deletes the source with it — the
+  // whole subtree gone and the `mv` that followed failing anyway. Refuse it before anything runs.
+  if (rel.startsWith(`${to}/`)) return plain(res, 409, "destination contains the source");
 
   const overwrite = String(req.headers.overwrite ?? "T").trim().toUpperCase() !== "F";
   const source = await statTree(view.sandboxId, absOf(view, rel), 0);
