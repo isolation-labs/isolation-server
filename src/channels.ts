@@ -176,14 +176,21 @@ interface CloudCall {
  */
 export async function cloud(call: CloudCall): Promise<Record<string, unknown>> {
   const p = getPairing();
-  if (!p) throw new Error("this server is not paired with a cloud, so it cannot reach the chat");
+  // Said WITHOUT naming the chat: this call is now the tool pump's forward as well, and "cannot
+  // reach the chat" is a wrong answer to `view_create` on an unpaired server.
+  if (!p) throw new Error("this server is not paired with a cloud, so it cannot reach it");
   const r = await fetch(`${p.backendUrl.replace(/\/+$/, "")}/api/pair/channel`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     // The pairing secret is this server's identity to the cloud — the same credential the
     // heartbeat and the boot log use. A binding id is meaningless without it.
     body: JSON.stringify({ connectionId: p.connectionId, secret: p.secret, ...call }),
-    signal: AbortSignal.timeout(20_000),
+    // An ACTION is not a chat post: its body reaches BACK into this server through the tunnel
+    // (`session_save` commits the session's tree and pushes a bundle to R2), so it gets the longer
+    // budget — the local call it replaced had 30s and no Worker hop. Still comfortably inside the
+    // 60s the sandbox bridge gives a parked tool call, so an agent hears the real answer rather
+    // than a timeout on both ends.
+    signal: AbortSignal.timeout(call.op === "action" ? 40_000 : 20_000),
   });
   const body = (await r.json().catch(() => ({}))) as Record<string, unknown>;
   if (!r.ok) throw new Error(String(body.error ?? `the cloud answered HTTP ${r.status}`));

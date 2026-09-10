@@ -12,12 +12,13 @@
 // the only direction that works — and it needs no WebSocket client, no framing, no reconnect state
 // machine: a failed poll is simply the next poll.
 //
-// A handler does NOT re-implement anything. It calls this server's own HTTP API over loopback with
-// the master token and the session owner's actor headers — the same door the Worker's proxy comes
-// through — so every ownership rule, every refusal and every future change applies to an agent's
-// tool call exactly as it does to the browser's click. The tool map below is the entire surface an
-// agent can reach, and each entry is pinned to the CALLING view's own session: an argument never
-// names another one.
+// A handler does NOT re-implement anything. What an agent asks for that a person could also ask for
+// is an ACTION, and it is FORWARDED to the cloud (`op: "action"` on the pairing channel), which runs
+// the one body every other door runs — so every ownership rule, every refusal and every future
+// change applies to an agent's tool call exactly as it does to the browser's click. What is left
+// here is the agent's own work plane: the chat it was spoken to in, which has no meaning outside
+// this session. The tool map below is the entire surface an agent can reach, and each entry is
+// pinned to the CALLING view's own session: an argument never names another one.
 import { endpointFor } from "./opensandbox.js";
 import { sessionForSandbox } from "./sessions.js";
 import { getView, viewsForSandbox, type View } from "./views.js";
@@ -139,8 +140,19 @@ const str = (v: unknown, max = 500): string | undefined => (typeof v === "string
 
 async function cloudAction(view: View, sessionId: string, call: ToolCall): Promise<unknown> {
   const rec = agentForView(view);
-  const name = call.tool === "ssh_command" ? "view_connect" : call.tool;
-  const args: Record<string, unknown> = call.tool === "ssh_command" ? { view: "terminal" } : { ...(call.args ?? {}) };
+  let name = call.tool;
+  let args: Record<string, unknown> = { ...(call.args ?? {}) };
+  // `ssh_command` IS `view_connect` on the session's TERMINAL — but that action names a window by
+  // id, by the label a person gave it, or by an agent's name (catalog.ts resolveView); a TYPE is not
+  // something it can resolve, so "terminal" would come back as "this session has no window called
+  // terminal". Which window it means is known here, where the view registry is, so the tool names it
+  // by id — and the answer for a session with no terminal stays the one that says what to do.
+  if (call.tool === "ssh_command") {
+    const term = viewsForSandbox(view.sandboxId).find((v) => v.type === "terminal");
+    if (!term) throw new Error("this session has no terminal to attach to — create one with view_create first");
+    name = "view_connect";
+    args = { view: term.id };
+  }
   const out = await cloud({
     op: "action",
     name,
@@ -158,7 +170,6 @@ async function cloudAction(view: View, sessionId: string, call: ToolCall): Promi
 async function runTool(view: View, call: ToolCall): Promise<unknown> {
   const s = sessionForSandbox(view.sandboxId);
   if (!s) throw new Error("this session is gone");
-  const id = encodeURIComponent(s.id);
   const args = call.args ?? {};
 
   switch (call.tool) {
@@ -245,7 +256,6 @@ async function runTool(view: View, call: ToolCall): Promise<unknown> {
       return await notifyOwner(s.id, text, b?.connector);
     }
 
-    // Commit the session's file tree back into the workspace, so the work survives the session.
     default:
       throw new Error(`unknown tool: ${call.tool}`);
   }

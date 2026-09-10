@@ -786,11 +786,17 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       if (method === "GET" && action === "changes") return json(res, 200, await sessionChanges(s));
       if (method === "GET" && action === "logs") {
         if (!s.sandboxId) return json(res, 200, { available: false, lines: [] });
-        const text = await sandboxLogs(s.sandboxId).catch(() => undefined);
+        // `tail` is HONOURED, not merely accepted. Every caller asks for a window — the session
+        // screen, the `session_logs` action, an agent's own tool — and a route that always answered
+        // with its own last 500 lines turned "show me the last 20" into 500 lines in somebody's
+        // context. The clamp used to live in the tool pump, which no longer sees this call.
+        const asked = Number(new URL(req.url ?? "/", "http://x").searchParams.get("tail"));
+        const tail = Number.isFinite(asked) && asked >= 1 ? Math.min(Math.floor(asked), 500) : 500;
+        const text = await sandboxLogs(s.sandboxId, tail).catch(() => undefined);
         if (text === undefined) return json(res, 200, { available: false, lines: [] });
         return json(res, 200, {
           available: true,
-          lines: text.split("\n").filter(Boolean).slice(-500).map((line) => ({ ts: "", stream: "out" as const, line })),
+          lines: text.split("\n").filter(Boolean).slice(-tail).map((line) => ({ ts: "", stream: "out" as const, line })),
         });
       }
       if (method === "GET" && action === "claude-usage") return json(res, 200, { usage: [] });

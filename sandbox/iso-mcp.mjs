@@ -84,7 +84,8 @@ const TOOLS = [
   },
   {
     name: "view_link",
-    description: "The address of one window. A web view's link is public — anyone who has it can open it. Everything else opens only in a signed-in browser.",
+    description:
+      "The PUBLIC address of a web view — the link anyone who has it can open, which is what \"send me the preview\" means. Only a web view has one: every other kind of window is a door someone goes through rather than a link you send, and naming one here answers with that instead.",
     inputSchema: { type: "object", properties: { viewId: { type: "string" } }, required: ["viewId"], additionalProperties: false },
   },
   {
