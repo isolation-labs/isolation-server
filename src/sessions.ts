@@ -540,8 +540,10 @@ export function viewJson(v: View, sessionId: string): Record<string, unknown> {
 function sshJson(v: View): Record<string, unknown> {
   const mode = modeForView(v.type);
   if (!v.sshRouteId || !mode) return {};
-  // The MODE has to reach the line: an agent route refuses a plain `ssh` at the edge, so publishing
-  // the terminal form for one would hand the web a command whose only possible answer is a refusal.
+  // The MODE has to reach the line. An agent route answers BOTH forms — a plain `ssh` lands in the
+  // conversation rendered, `ssh -s … acp` hands over the raw protocol — and this block is the one a
+  // client config is copied from, so it publishes the subsystem form. The plain line rides the
+  // `nativeConnect` payload, which is what the page offers for opening a terminal.
   const command = sshCommandFor(v.sshRouteId, mode);
   return command ? { ssh: { routeId: v.sshRouteId, command, ...(mode === "acp" ? { subsystem: "acp", protocol: "acp" } : {}) } } : {};
 }

@@ -447,11 +447,13 @@ export function modeForView(type: string): RouteMode | undefined {
 /**
  * The line a person types for a route, when the bastion is configured and the type is reachable.
  *
- * THE MODE DECIDES THE LINE, and getting that wrong publishes a command that cannot work: the edge
- * refuses a plain `ssh` on an acp route (a shell there would drop somebody into bash where they
- * expected a conversation), so an agent view must be told the subsystem form. `-s` takes the
- * subsystem name in the COMMAND position — after the destination — so `ssh -s acp <route>@<host>`
- * would dial a host literally called "acp" and never reach the bastion. The order is the contract.
+ * THE MODE DECIDES THE LINE. `acp` builds the SUBSYSTEM form — the raw protocol, for a client that
+ * speaks ACP; the plain form is the other door on the same route (`nativeConnectFor`), which lands
+ * a person in the conversation rendered. Neither is a shell: an agent route never opens one.
+ *
+ * `-s` takes the subsystem name in the COMMAND position — after the destination — so
+ * `ssh -s acp <route>@<host>` would dial a host literally called "acp" and never reach the bastion.
+ * The order is the contract, and it is a string a person copies: nothing downstream would catch it.
  */
 export function sshCommandFor(routeId: string, mode: RouteMode = "tmux"): string | undefined {
   const host = bastion.publicHost();

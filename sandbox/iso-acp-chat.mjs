@@ -17,13 +17,18 @@
 // the two would drift. So this file is only a renderer, and its first job is proving that door works.
 import { spawn } from "node:child_process";
 import readline from "node:readline";
+import { StringDecoder } from "node:string_decoder";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PORT = process.argv[2];
 const VIEW_ID = process.argv[3];
 const NAME = process.argv[4] || "agent";
-const ATTACH = join(dirname(fileURLToPath(import.meta.url)), "iso-acp-attach.mjs");
+// THE LEADING DOT IS PART OF THE NAME. `acpview.ts` writes both scripts into the sandbox's /tmp as
+// DOTFILES (`ATTACH_PATH` = `/tmp/.iso-acp-attach.mjs`, `CHAT_PATH` = `/tmp/.iso-acp-chat.mjs`), so
+// a sibling resolved without it names a file that is never there — and the whole door then dies at
+// spawn with a module-not-found, which reads as "the conversation closed" and nothing else.
+const ATTACH = join(dirname(fileURLToPath(import.meta.url)), ".iso-acp-attach.mjs");
 
 if (!PORT) {
   process.stderr.write("usage: iso-acp-chat.mjs <port> <viewId> [name]\n");
@@ -41,7 +46,19 @@ const yellow = c("33");
 const red = c("31");
 
 const child = spawn(process.execPath, [ATTACH, PORT, VIEW_ID ?? ""], { stdio: ["pipe", "pipe", "inherit"] });
-const send = (msg) => child.stdin.write(`${JSON.stringify(msg)}\n`);
+// A pipe whose far end is gone raises `error` (EPIPE) on the stream, and an unhandled one is an
+// uncaught exception — a stack trace where a closing conversation belongs. The child's own exit is
+// what ends this process; a failed write is only the same news arriving a moment earlier.
+child.stdin.on("error", () => {});
+// `spawn` reports "could not start at all" as `error`, never as `exit`, and unhandled it is again a
+// stack trace. This is the case a broken attach path lands in, so it must say what happened.
+child.on("error", (e) => {
+  process.stderr.write(`the agent view could not be opened: ${e.message}\n`);
+  process.exit(1);
+});
+const send = (msg) => {
+  if (!child.stdin.destroyed) child.stdin.write(`${JSON.stringify(msg)}\n`);
+};
 
 // ── A transcript, not a canvas ─────────────────────────────────────────────────────────────────
 // The browser view groups chunks into bubbles; a terminal is a stream, so the only grouping that
@@ -80,6 +97,8 @@ const textOf = (content) => {
 let sessionId = "";
 let nextId = 1;
 let busy = false;
+// The id of the prompt we are waiting on, so its answer can be told from any other response.
+let promptId;
 // A permission request is a QUESTION THE AGENT IS BLOCKED ON, so it takes over the prompt: anything
 // else typed would go to a turn that is not running.
 let pending;
@@ -117,9 +136,14 @@ function render(u) {
 }
 
 // ── The stream ─────────────────────────────────────────────────────────────────────────────────
+// A CHUNK BOUNDARY IS NOT A CHARACTER BOUNDARY: the attach script's stdout arrives in pipe-sized
+// pieces, and an agent's prose is full of things outside ASCII (an em-dash, an accent, an emoji).
+// `Buffer.toString("utf8")` turns each half of a split sequence into U+FFFD, so the transcript
+// quietly stops being what the agent said. The decoder holds the partial sequence instead.
+const outDecoder = new StringDecoder("utf8");
 let acc = "";
 child.stdout.on("data", (d) => {
-  acc += d.toString("utf8");
+  acc += outDecoder.write(d);
   for (;;) {
     const nl = acc.indexOf("\n");
     if (nl === -1) break;
@@ -145,9 +169,16 @@ function handle(m) {
   if (m.method === "session/update") return render(m.params?.update ?? m.params);
   if (m.method === "_iso/hello") {
     sessionId = m.params?.sessionId ?? "";
-    const updates = m.params?.updates ?? [];
+    // THE REPLAY BUFFER HOLDS WHOLE NOTIFICATIONS, not bare updates: the bridge pushes the
+    // `session/update` MESSAGE it received, so what renders is `params.update` — the same reach the
+    // browser store makes. Taking the outer object for an update finds no `sessionUpdate`, falls to
+    // the default case, and replays an empty transcript under a line announcing how much it replayed.
+    const updates = (m.params?.updates ?? []).filter((u) => u?.method === "session/update");
     line(dim(`— ${NAME}${updates.length ? `, ${updates.length} earlier update${updates.length === 1 ? "" : "s"} replayed` : ""} — /exit to leave, /cancel to interrupt —`));
-    for (const u of updates) render(u?.update ?? u);
+    for (const u of updates) render(u.params?.update);
+    // A TURN MAY ALREADY BE RUNNING when we join — somebody else's prompt, from another window. The
+    // hello says so, and without reading it the first thing typed here goes into a refusal.
+    busy = !!m.params?.turn?.active;
     return prompt();
   }
   if (m.method === "_iso/session") {
@@ -171,7 +202,21 @@ function handle(m) {
     }
     return;
   }
-  if (m.id !== undefined && m.method === undefined && m.error) return line(red(`  ! ${m.error.message ?? "refused"}`));
+  if (m.id !== undefined && m.method === undefined) {
+    if (m.error) line(red(`  ! ${m.error.message ?? "refused"}`));
+    // THE BRIDGE ANSWERS A PROMPT WHEN ITS TURN ENDS — and also when the turn never started (the
+    // agent would not spawn, a turn was already running). In that second case no `_iso/turn` ever
+    // follows, so without clearing it here the client sits at "…" forever, refusing everything
+    // typed with "still working" while there is nothing to cancel.
+    if (m.id === promptId) {
+      promptId = undefined;
+      if (busy) {
+        busy = false;
+        prompt();
+      }
+    }
+    return;
+  }
 }
 
 // ── Leaving ────────────────────────────────────────────────────────────────────────────────────
@@ -216,7 +261,8 @@ rl.on("line", (raw) => {
     line(dim("  · still working — /cancel to interrupt"));
     return prompt();
   }
-  send({ jsonrpc: "2.0", id: nextId++, method: "session/prompt", params: { sessionId, prompt: [{ type: "text", text }] } });
+  promptId = nextId++;
+  send({ jsonrpc: "2.0", id: promptId, method: "session/prompt", params: { sessionId, prompt: [{ type: "text", text }] } });
   busy = true;
   prompt();
 });

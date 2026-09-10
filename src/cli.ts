@@ -178,4 +178,6 @@ function fail(msg: string): never {
   process.exit(1);
 }
 
-void main();
+// A thrown error here is an ordinary failure — the gate refusing a socket, ssh missing, a view that
+// went away mid-connect — and an unhandled rejection would print a stack trace over the message.
+void main().catch((e: unknown) => fail(String((e as Error)?.message ?? e)));

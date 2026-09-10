@@ -21,6 +21,7 @@ import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import net from "node:net";
 import readline from "node:readline";
+import { StringDecoder } from "node:string_decoder";
 import type { Duplex } from "node:stream";
 
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -55,8 +56,21 @@ function wsConnect(base: string, viewId: string, token: string): Promise<Wire> {
     let fragOp = 0;
     const key = randomBytes(16).toString("base64");
     const expect = createHash("sha1").update(key + GUID).digest("base64");
-    let onMessage: (m: any) => void = () => {};
-    let onClose: (w?: string) => void = () => {};
+    // THE FIRST MESSAGE ARRIVES BEFORE ANYBODY IS LISTENING. `resolve` only schedules the awaiting
+    // caller, while this very `data` handler runs straight on into the frame loop — and the bridge's
+    // `_iso/hello`, which carries the session id and the whole replay, is routinely in the SAME TCP
+    // chunk as the 101. Handing it to a no-op default would lose the transcript and the prompt would
+    // never appear. So hold what lands early and flush it the moment a handler is registered.
+    let onMessage: ((m: any) => void) | undefined;
+    let onClose: ((w?: string) => void) | undefined;
+    const early: any[] = [];
+    let closed = false;
+    const emit = (m: any) => (onMessage ? onMessage(m) : early.push(m));
+    const shut = () => {
+      if (closed) return; // a socket both frames a close and then ends; the client hears it once
+      closed = true;
+      onClose?.();
+    };
 
     const fail = (why: string) => {
       sock.destroy();
@@ -64,7 +78,7 @@ function wsConnect(base: string, viewId: string, token: string): Promise<Wire> {
     };
 
     sock.on("error", (e) => fail(e.message));
-    sock.on("close", () => onClose());
+    sock.on("close", () => shut());
     sock.on("connect", () => {
       sock.write(
         [
@@ -96,8 +110,14 @@ function wsConnect(base: string, viewId: string, token: string): Promise<Wire> {
         resolve({
           send: (msg) => sendFrame(sock, 0x1, Buffer.from(JSON.stringify(msg), "utf8")),
           close: () => sock.destroy(),
-          onMessage: (fn) => (onMessage = fn),
-          onClose: (fn) => (onClose = fn),
+          onMessage: (fn) => {
+            onMessage = fn;
+            for (const m of early.splice(0)) fn(m);
+          },
+          onClose: (fn) => {
+            onClose = fn;
+            if (closed) fn();
+          },
         });
       }
       // Frames.
@@ -130,9 +150,11 @@ function wsConnect(base: string, viewId: string, token: string): Promise<Wire> {
         if (mask) for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
         buf = buf.subarray(off + len);
 
-        if (opcode === 0x8) return void onClose();
+        if (opcode === 0x8) return void shut();
         if (opcode === 0x9) {
-          sendFrame(sock, 0xa, payload);
+          // Capped at 125: a control frame may carry no more, and an extended-length one is exactly
+          // the malformed thing a compliant peer closes the connection over.
+          sendFrame(sock, 0xa, payload.subarray(0, 125));
           continue;
         }
         if (opcode === 0xa) continue;
@@ -156,7 +178,7 @@ function wsConnect(base: string, viewId: string, token: string): Promise<Wire> {
     function deliver(opcode: number, payload: Buffer) {
       if (opcode !== 0x1) return;
       try {
-        onMessage(JSON.parse(payload.toString("utf8")));
+        emit(JSON.parse(payload.toString("utf8")));
       } catch {
         /* a frame that is not JSON is not ours to render */
       }
@@ -194,9 +216,13 @@ function sshWire(destination: string): Wire {
   const child = spawn("ssh", ["-s", destination, "acp"], { stdio: ["pipe", "pipe", "inherit"] });
   let onMessage: (m: any) => void = () => {};
   let onClose: (w?: string) => void = () => {};
+  // A CHUNK BOUNDARY IS NOT A CHARACTER BOUNDARY: ssh's stdout arrives in pipe-sized pieces, and an
+  // agent's prose is full of things outside ASCII. `Buffer.toString("utf8")` turns each half of a
+  // split sequence into U+FFFD, so the transcript quietly stops being what the agent said.
+  const decoder = new StringDecoder("utf8");
   let acc = "";
   child.stdout.on("data", (d: Buffer) => {
-    acc += d.toString("utf8");
+    acc += decoder.write(d);
     for (;;) {
       const nl = acc.indexOf("\n");
       if (nl === -1) break;
@@ -210,9 +236,20 @@ function sshWire(destination: string): Wire {
       }
     }
   });
+  // `ssh` missing from PATH raises `error`, not `exit`, and an unhandled one on a ChildProcess is an
+  // uncaught exception — a stack trace where "ssh isn't installed" belongs.
+  child.on("error", (e: Error) => {
+    process.stderr.write(`could not run ssh: ${e.message}\n`);
+    onClose();
+  });
   child.on("exit", () => onClose());
+  // A pipe whose far end is gone raises `error` (EPIPE), and an unhandled one on a stream is an
+  // uncaught exception — a stack trace where a closing conversation belongs.
+  child.stdin.on("error", () => {});
   return {
-    send: (msg) => child.stdin.write(`${JSON.stringify(msg)}\n`),
+    send: (msg) => {
+      if (!child.stdin.destroyed) child.stdin.write(`${JSON.stringify(msg)}\n`);
+    },
     close: () => child.kill(),
     onMessage: (fn) => (onMessage = fn),
     onClose: (fn) => (onClose = fn),
@@ -278,6 +315,8 @@ export async function runAgentCli(opts: AgentCliOptions): Promise<number> {
   let sessionId = "";
   let nextId = 1;
   let busy = false;
+  // The id of the prompt we are waiting on, so its answer can be told from any other response.
+  let promptId: number | undefined;
   // A permission request is a QUESTION THE AGENT IS BLOCKED ON, so it takes over the prompt until
   // it is answered — anything else typed would go to a turn that is not running.
   let pending: { id: unknown; options: { optionId: string; name: string }[] } | undefined;
@@ -329,9 +368,12 @@ export async function runAgentCli(opts: AgentCliOptions): Promise<number> {
     // The bridge's own notifications.
     if (m.method === "_iso/hello") {
       sessionId = m.params?.sessionId ?? "";
-      const n = (m.params?.updates ?? []).length;
-      r.line(dim(`— connected${n ? `, ${n} earlier update${n === 1 ? "" : "s"} replayed` : ""} —`));
-      for (const u of m.params?.updates ?? []) wireUpdate(u);
+      const updates = (m.params?.updates ?? []).filter((u: any) => u?.method === "session/update");
+      r.line(dim(`— connected${updates.length ? `, ${updates.length} earlier update${updates.length === 1 ? "" : "s"} replayed` : ""} —`));
+      for (const u of updates) wireUpdate(u);
+      // A TURN MAY ALREADY BE RUNNING when we join — somebody else's prompt, from another window.
+      // The hello says so, and without reading it the first thing typed here goes into a refusal.
+      busy = !!m.params?.turn?.active;
       return prompt();
     }
     if (m.method === "_iso/session") {
@@ -358,16 +400,31 @@ export async function runAgentCli(opts: AgentCliOptions): Promise<number> {
     // A response to something we sent.
     if (m.id !== undefined && m.method === undefined) {
       if (m.error) r.line(red(`  ! ${m.error.message ?? "the agent refused that"}`));
+      // THE BRIDGE ANSWERS A PROMPT WHEN ITS TURN ENDS — and also when the turn never started (the
+      // agent would not spawn, a turn was already running). In that second case no `_iso/turn` ever
+      // follows, so without clearing it here the client sits at "…" forever, refusing everything
+      // typed with "it is still working" while there is nothing to cancel.
+      if (m.id === promptId) {
+        promptId = undefined;
+        if (busy) {
+          busy = false;
+          prompt();
+        }
+      }
       return;
     }
   });
 
-  /** Replayed updates arrive inside `_iso/hello`, in the same shape as a live notification. */
+  /**
+   * Replayed updates arrive inside `_iso/hello` as the WHOLE `session/update` notifications the
+   * bridge buffered — so the payload is `params.update`, the same reach the browser store makes.
+   * Reading `sessionUpdate` off the outer object finds nothing and replays an empty transcript,
+   * under a line that has already announced how much it replayed.
+   */
   function wireUpdate(u: any) {
-    const k = u?.sessionUpdate ?? u?.update?.sessionUpdate;
-    const uu = u?.update ?? u;
-    if (k === "agent_message_chunk") r.text("agent", green(bold(agentName)), textOf(uu.content));
-    else if (k === "user_message_chunk") r.text("user", dim("someone"), dim(textOf(uu.content)));
+    const uu = u?.params?.update;
+    if (uu?.sessionUpdate === "agent_message_chunk") r.text("agent", green(bold(agentName)), textOf(uu.content));
+    else if (uu?.sessionUpdate === "user_message_chunk") r.text("user", dim("someone"), dim(textOf(uu.content)));
   }
 
   wire.onClose(() => {
@@ -405,7 +462,8 @@ export async function runAgentCli(opts: AgentCliOptions): Promise<number> {
       r.line(dim("  · it is still working — /cancel to interrupt"));
       return prompt();
     }
-    wire.send({ jsonrpc: "2.0", id: nextId++, method: "session/prompt", params: { sessionId, prompt: [{ type: "text", text: line }] } });
+    promptId = nextId++;
+    wire.send({ jsonrpc: "2.0", id: promptId, method: "session/prompt", params: { sessionId, prompt: [{ type: "text", text: line }] } });
     busy = true;
     prompt();
   });
