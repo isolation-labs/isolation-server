@@ -1,15 +1,14 @@
 // THE AGENT VIEW, IN A TERMINAL — what `ssh <routeId>@<host>` lands you in.
 //
-// The agent view is an ACP conversation whose bridge fans out to N clients. `-s … acp` hands you the
-// raw protocol, which is right for Zed and unreadable by a person. This is the client for the rest of
-// us: the same conversation, live, both ways, with nothing to install — ssh and a key, exactly like
-// opening a terminal view.
+// The agent view is an ACP conversation whose bridge fans out to N clients — the page is one, and so
+// is this. It is the ONE door on an agent route: the same conversation, live, both ways, rendered
+// for a person, with nothing to install — ssh and a key, exactly like opening a terminal view.
 //
 // IT IS THE CHANNEL'S PROCESS, not a program inside a shell. The bastion `exec`s this as the ssh
 // channel itself (the way a terminal route execs `tmux attach`), so quitting it closes the channel
 // and ends the connection. There is no shell behind it to fall back into — which is the point: an
-// agent route is one door, and a shell there would be a way into the sandbox that refusing its
-// subsystem and its exec was meant to prevent.
+// agent route is one door, and a shell there would be a way into the sandbox that forcing this
+// command — whatever the client asks to run — was meant to prevent.
 //
 // IT SPAWNS THE ATTACH SCRIPT rather than opening its own socket. The WebSocket client, the
 // handshake, the framing and the "does this bridge really serve MY view" check all live in
@@ -86,6 +85,20 @@ function line(text) {
   speaker = "";
 }
 
+// A NAME THAT CANNOT DRIVE THE TERMINAL: escapes and every other control character stripped, so a
+// label somebody else chose is printed as the text it claims to be. (C1 too: an 8-bit CSI is one
+// byte, and a terminal in that mode obeys it.)
+const plain = (s) => s.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").trim();
+
+// …AND THE SAME FOR EVERY BODY OF TEXT THIS PRINTS, which is the far bigger surface: a connector
+// posts whole messages (a Slack line anyone in the channel can write), and the AGENT'S OWN PROSE
+// quotes back whatever it just read — a file, a tool's output, a fetched page. All of it is written
+// straight to a terminal, where an escape is an instruction and not text: clear the screen, move the
+// cursor, set the window title, write the clipboard, redraw the transcript as if the agent had said
+// something else. Only the two control characters prose actually uses survive: newline and tab. CR
+// goes with the rest, because a bare one rewrites the line already printed.
+const plainText = (s) => s.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
+
 const textOf = (content) => {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) return content.map(textOf).join("");
@@ -107,6 +120,8 @@ let promptId;
 // And the `from` the bridge sends is "view" for EVERY window, so it cannot tell mine from anybody
 // else's; the text I sent can.
 let mine = [];
+// The text of the prompt in flight, so a REFUSED one can take its note back (below).
+let promptText;
 // A permission request is a QUESTION THE AGENT IS BLOCKED ON, so it takes over the prompt: anything
 // else typed would go to a turn that is not running.
 let pending;
@@ -126,9 +141,9 @@ function render(u, from) {
   const k = u?.sessionUpdate;
   switch (k) {
     case "agent_message_chunk":
-      return say("agent", green(bold(NAME)), textOf(u.content));
+      return say("agent", green(bold(NAME)), plainText(textOf(u.content)));
     case "agent_thought_chunk":
-      return say("thought", dim("thinking"), dim(textOf(u.content)));
+      return say("thought", dim("thinking"), dim(plainText(textOf(u.content))));
     case "user_message_chunk": {
       const text = textOf(u.content);
       // MY OWN ECHO: already on screen, above the prompt I typed it at.
@@ -141,13 +156,24 @@ function render(u, from) {
       // one conversation with several windows on it, and a turn you did not start is the thing you
       // most need to see. `from` names the door where the bridge knows one; "another window" is the
       // honest answer for a second browser tab or terminal, which it reports only as "view".
-      const who = !from || from === "view" ? "another window" : String(from).slice(0, 40);
-      return say("user", dim(who), dim(text));
+      //
+      // IT IS A NAME A STRANGER CHOSE — a connector posts its own `from` (iso-acp-bridge.mjs bounds
+      // the length and nothing else) — and it is written to a TERMINAL, where an escape sequence is
+      // not text but an instruction: move the cursor, clear the screen, redraw a line as if the
+      // agent had said it. So the control characters come out before it is printed, the same way
+      // the shell's metacharacters come out of the label the route carries.
+      const who = !from || from === "view" ? "another window" : plain(String(from)).slice(0, 40) || "another window";
+      // The SENDER is part of the speaker, not just the label: two windows talking in turn are two
+      // blocks, or the second one's prose runs on under the first one's name.
+      return say(`user:${who}`, dim(who), dim(plainText(text)));
     }
+    // A TOOL'S TITLE IS A ONE-LINE LABEL and it is the agent's text: a path it was asked to read, a
+    // command somebody wrote. `plain`, not `plainText` — a newline in it would break the line it is
+    // printed on, and there is no prose here that needs one.
     case "tool_call":
-      return line(dim(`  · ${u.title ?? u.kind ?? "tool"}`));
+      return line(dim(`  · ${plain(String(u.title ?? u.kind ?? "tool"))}`));
     case "tool_call_update":
-      if (u.status === "failed") line(red(`  · ${u.title ?? "tool"} failed`));
+      if (u.status === "failed") line(red(`  · ${plain(String(u.title ?? "tool"))} failed`));
       return;
     default:
       return;
@@ -181,8 +207,12 @@ child.stdout.on("data", (d) => {
 
 function handle(m) {
   if (m.method === "session/request_permission" && m.id !== undefined) {
-    pending = { id: m.id, options: (m.params?.options ?? []).map((o) => ({ optionId: o.optionId, name: o.name ?? o.optionId })) };
-    line(yellow(`⚠ ${m.params?.toolCall?.title ?? "the agent is asking permission"}`));
+    // AN OPTION NAME IS AGENT TEXT TOO, and it goes somewhere worse than the transcript: into the
+    // PROMPT LINE itself. An escape there redraws the question a person is about to answer — "allow?
+    // [1=reject 2=allow]" repainted the other way round is a yes taken for a no. Same treatment as
+    // the title, one line each. `optionId` is never printed, only compared.
+    pending = { id: m.id, options: (m.params?.options ?? []).map((o, i) => ({ optionId: o.optionId, name: plain(String(o.name ?? o.optionId ?? "")) || `option ${i + 1}` })) };
+    line(yellow(`⚠ ${plain(String(m.params?.toolCall?.title ?? "the agent is asking permission"))}`));
     return prompt();
   }
   if (m.method === "session/update") return render(m.params?.update ?? m.params, m.params?._meta?.iso?.from);
@@ -210,7 +240,7 @@ function handle(m) {
     if (was && !busy) prompt();
     return;
   }
-  if (m.method === "_iso/status" && m.params?.error) return line(red(`  ! ${m.params.error}`));
+  if (m.method === "_iso/status" && m.params?.error) return line(red(`  ! ${plain(String(m.params.error))}`));
   if (m.method === "_iso/permission_done") {
     // Another window answered first; the bridge ignores late answers, so drop ours rather than
     // leaving a prompt nobody can satisfy.
@@ -222,13 +252,21 @@ function handle(m) {
     return;
   }
   if (m.id !== undefined && m.method === undefined) {
-    if (m.error) line(red(`  ! ${m.error.message ?? "refused"}`));
+    if (m.error) line(red(`  ! ${plain(String(m.error.message ?? "refused"))}`));
     // THE BRIDGE ANSWERS A PROMPT WHEN ITS TURN ENDS — and also when the turn never started (the
     // agent would not spawn, a turn was already running). In that second case no `_iso/turn` ever
     // follows, so without clearing it here the client sits at "…" forever, refusing everything
     // typed with "still working" while there is nothing to cancel.
     if (m.id === promptId) {
       promptId = undefined;
+      // A REFUSED PROMPT NEVER ECHOES — the bridge echoes only once the turn is really running — so
+      // its note has to come back off the list. Left there it would silently swallow the next
+      // identical line somebody types in another window.
+      if (m.error && promptText !== undefined) {
+        const at = mine.indexOf(promptText);
+        if (at >= 0) mine.splice(at, 1);
+      }
+      promptText = undefined;
       if (busy) {
         busy = false;
         prompt();
@@ -281,6 +319,11 @@ rl.on("line", (raw) => {
     return prompt();
   }
   promptId = nextId++;
+  // THE ECHO IS COMING: the bridge renders every prompt to every window from its own echo, this one
+  // included, so leave a note of what was sent — `render` drops the matching echo instead of
+  // printing the line a second time under the one you typed.
+  promptText = text;
+  mine.push(text);
   send({ jsonrpc: "2.0", id: promptId, method: "session/prompt", params: { sessionId, prompt: [{ type: "text", text }] } });
   busy = true;
   prompt();

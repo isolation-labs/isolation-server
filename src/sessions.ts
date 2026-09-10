@@ -392,9 +392,6 @@ export function syncRoutes(sessionId: string, sandboxId: string): void {
     // An agent route carries the command whose stdio IS the conversation. The bastion execs what it
     // is told rather than knowing anything about ACP — the same division tmux mode already has. No
     // command means no door: register nothing rather than a route the edge can only refuse.
-    // TWO DOORS ON ONE ROUTE: a plain `ssh` gets the conversation rendered (nothing to install),
-    // `ssh -s … acp` gets the raw protocol (for an ACP client). Both are commands the bastion execs
-    // without knowing what either speaks.
     const chat = mode === "acp" ? chatCommand(v.port, v.id, v.label) : undefined;
     if (mode === "acp" && !chat) {
       log(`${v.id}: agent view has no usable bridge port (${String(v.port)}) — no ssh route`);
@@ -411,8 +408,6 @@ export function syncRoutes(sessionId: string, sandboxId: string): void {
       viewType: v.type,
       mode,
       ...(mode === "tmux" ? { tmuxTarget: tmuxTargetFor(v) } : {}),
-      // An agent route carries the one command whose stdio the ssh channel becomes. The bastion
-      // execs what it is told and knows nothing about what it speaks — the division tmux mode has.
       ...(chat ? { chatCommand: chat } : {}),
       ...(v.dir ? { dir: v.dir } : {}),
       ...(v.label ? { label: v.label } : {}),

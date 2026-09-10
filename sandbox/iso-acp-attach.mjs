@@ -1,21 +1,21 @@
-// ACP ON STDIO — the agent view's conversation, for a client that is not a browser.
+// ACP ON STDIO — the agent view's conversation, as a stream rather than a screen.
 //
 // The agent view is an ACP session: `iso-acp-bridge.mjs` spawns the harness, speaks ACP to it over
 // stdio, and FANS THE SESSION OUT to N WebSocket clients. The doorman-served page is one of them.
-// This is another — it just happens to have a terminal on one side instead of a canvas:
+// This is another — it just happens to have a pipe on one side instead of a canvas:
 //
-//   ssh -s <routeId>@ssh.isolation.cc acp        (`-s` takes the subsystem in the command slot)
-//     → the bastion execs THIS in the sandbox
-//     → it joins the same bridge the browser is on
-//     → the client's stdin/stdout carry the same JSON-RPC the browser's socket carries
+//   ssh <routeId>@ssh.isolation.cc
+//     → the bastion execs `iso-acp-chat.mjs` in the sandbox
+//     → which spawns THIS, and renders what it reads
+//     → this end's stdin/stdout carry the same JSON-RPC the browser's socket carries
 //
-// So an external ACP client drives the SAME conversation the session screen is showing, live and
-// both ways, with no relay and no second agent. Nothing is copied, nothing is summarised: the
-// bridge's replay buffer means a late joiner is handed the whole session on connect.
+// So a terminal drives the SAME conversation the session screen is showing, live and both ways,
+// with no relay and no second agent. Nothing is copied, nothing is summarised: the bridge's replay
+// buffer means a late joiner is handed the whole session on connect.
 //
-// NEWLINE-DELIMITED JSON both ways, which is the framing ACP itself uses over stdio — so a client
-// that already speaks ACP to a subprocess needs no adapter, and `ssh -s … acp` is a working "agent
-// command" wherever one is configured.
+// NEWLINE-DELIMITED JSON both ways, which is the framing ACP itself uses over stdio. The renderer
+// is the ONLY caller — an agent route is one door — so this file owns the socket, the handshake and
+// the "is this really my view" check, and nothing else has to know how any of it works.
 //
 // WHY A HAND-WRITTEN WEBSOCKET CLIENT: the same reason the bridge hand-writes the server. This runs
 // on the sandbox's bundled Node with no npm install and nothing on disk but what we wrote there, so

@@ -18,11 +18,12 @@ const log = (...a: unknown[]) => console.log("[acp]", ...a);
 
 const SANDBOX_DIR = join(dirname(fileURLToPath(import.meta.url)), "sandbox");
 const BRIDGE_SRC = readFileSync(join(SANDBOX_DIR, "iso-acp-bridge.mjs"), "utf8");
-// The same conversation, for a client that is not a browser: `ssh -s <route>@… acp` execs this in
-// the sandbox and it joins the bridge as one more of the N clients it already fans out to.
+// The same conversation as a stdio stream: the renderer below spawns this, and it joins the bridge
+// as one more of the N clients it already fans out to.
 const ATTACH_SRC = readFileSync(join(SANDBOX_DIR, "iso-acp-attach.mjs"), "utf8");
-// …and the client for a person: what a plain `ssh <routeId>@<host>` lands in. It spawns the attach
-// script rather than opening its own socket, so the protocol lives in exactly one place.
+// …and the renderer, which is what a plain `ssh <routeId>@<host>` lands in — the route's ONE door.
+// It spawns the attach script rather than opening its own socket, so the protocol lives in exactly
+// one place. Both files are written into the sandbox: the door dies at spawn without the second.
 const CHAT_SRC = readFileSync(join(SANDBOX_DIR, "iso-acp-chat.mjs"), "utf8");
 const MCP_SRC = readFileSync(join(SANDBOX_DIR, "iso-mcp.mjs"), "utf8");
 
@@ -31,26 +32,9 @@ export const ATTACH_PATH = "/tmp/.iso-acp-attach.mjs";
 export const CHAT_PATH = "/tmp/.iso-acp-chat.mjs";
 const VIEW_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
 /**
- * What the bastion execs for an `acp` route: the view's bridge PORT, and the view id that port is
- * supposed to belong to.
- *
- * THE VIEW ID IS NOT DECORATION. Ports are recycled (`nextFree` in launch.ts only avoids LIVE
- * views) and a bridge orphaned by a deleted view is never killed, so this number can be another
- * agent's bridge — which would answer, and hand an ssh client that agent's whole conversation.
- * The attach script refuses unless the bridge's `_iso/hello` names this view, the same check the
- * doorman makes on the browser's path (`bridgeHealthy`).
- *
- * This string is INTERPOLATED INTO A SHELL COMMAND that a shared bastion runs inside the sandbox,
- * so nothing but an integer port and an id of exactly this shape may ever reach it. The view
- * registry is a JSON file parsed with a cast and no runtime validation (views.ts), which makes
- * this the only place the shape is checked; `undefined` means the view gets no route rather than
- * a route carrying something unexpected.
- */
-export const attachCommand = (port: number, viewId: string): string | undefined =>
-  acpArgs(port, viewId) ? `exec "$(command -v iso-node || command -v node)" ${ATTACH_PATH} ${port} ${viewId}` : undefined;
-
-/**
- * What a PLAIN `ssh <routeId>@<host>` runs: the same conversation, rendered, with nothing to install.
+ * WHAT THE BASTION EXECS for an `acp` route — the route's one door: the same conversation, rendered,
+ * with nothing to install. It carries the view's bridge PORT and the view id that port is supposed
+ * to belong to.
  *
  * It is the ssh channel's own process (the bastion `exec`s it, as a terminal route execs `tmux
  * attach`), so quitting it ends the connection — there is no shell behind it, which is what keeps an
@@ -65,9 +49,25 @@ export const chatCommand = (port: number, viewId: string, name?: string | null):
   return `exec "$(command -v iso-node || command -v node)" ${CHAT_PATH} ${port} ${viewId} '${label}'`;
 };
 
-// `typeof` first: `RegExp.test` STRINGIFIES its argument, so a missing id would sail through as the
-// literal "undefined" — a command that is harmless in the shell and then refuses every bridge it
-// meets, which is a door that silently never opens rather than one that is not built.
+/**
+ * THE GATE ON BOTH ARGUMENTS, and the only one there is.
+ *
+ * THE VIEW ID IS NOT DECORATION. Ports are recycled (`nextFree` in launch.ts only avoids LIVE views)
+ * and a bridge orphaned by a deleted view is never killed, so this number can be another agent's
+ * bridge — which would answer, and hand an ssh client that agent's whole conversation. The attach
+ * script refuses unless the bridge's `_iso/hello` names this view, the same check the doorman makes
+ * on the browser's path (`bridgeHealthy`).
+ *
+ * Both values are INTERPOLATED INTO A SHELL COMMAND that a shared bastion runs inside the sandbox,
+ * so nothing but an integer port and an id of exactly this shape may ever reach it. The view
+ * registry is a JSON file parsed with a cast and no runtime validation (views.ts), which makes this
+ * the only place the shape is checked; `undefined` from the caller means the view gets no route
+ * rather than a route carrying something unexpected.
+ *
+ * `typeof` first: `RegExp.test` STRINGIFIES its argument, so a missing id would sail through as the
+ * literal "undefined" — a command that is harmless in the shell and then refuses every bridge it
+ * meets, which is a door that silently never opens rather than one that is not built.
+ */
 const acpArgs = (port: number, viewId: string): boolean =>
   Number.isInteger(port) && port > 0 && port <= 65535 && typeof viewId === "string" && VIEW_ID_RE.test(viewId);
 export const MCP_PATH = "/tmp/.iso-mcp.mjs";

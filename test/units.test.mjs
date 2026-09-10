@@ -408,26 +408,13 @@ test("an agent view opens with a plain ssh — the same line a terminal view use
   }
 });
 
-test("attachCommand refuses anything but a real port and a real view id — it becomes a shell string", async () => {
-  // The route's command is interpolated into a line a SHARED bastion runs inside the sandbox, and
-  // the view registry is a JSON file read back with a cast and no validation (views.ts) — so this
-  // function is the only thing standing between a tampered/garbage record and that shell.
-  const { attachCommand } = await import("../dist/acpview.js");
-  assert.match(attachCommand(45000, "v-abc123"), / \/tmp\/\.iso-acp-attach\.mjs 45000 v-abc123$/);
-  // The view id is carried because A PORT IS NOT IDENTITY: ports are recycled and an orphaned
-  // bridge answers on them, so the attach checks the bridge's `_iso/hello` names this view.
-  assert.equal(attachCommand(45000, "v-a; rm -rf /"), undefined);
-  assert.equal(attachCommand(45000, "$(id)"), undefined);
-  assert.equal(attachCommand(45000, ""), undefined);
-  assert.equal(attachCommand(45000, undefined), undefined);
-  assert.equal(attachCommand(0, "v-abc"), undefined);
-  assert.equal(attachCommand(70000, "v-abc"), undefined);
-  assert.equal(attachCommand(1.5, "v-abc"), undefined);
-  assert.equal(attachCommand(undefined, "v-abc"), undefined);
-});
-
-test("chatCommand takes the same gate, and strips the one part a person chose down to what cannot act", async () => {
-  // The plain-ssh door carries a LABEL, and a label is member-supplied text landing inside single
+test("chatCommand refuses anything but a real port and a real view id, and strips the one part a person chose down to what cannot act", async () => {
+  // It is the ONE command an agent route carries, interpolated into a line a SHARED bastion runs
+  // inside the sandbox — and the view registry is a JSON file read back with a cast and no
+  // validation (views.ts), so this function is the only thing standing between a tampered or
+  // garbage record and that shell.
+  //
+  // It also carries a LABEL, and a label is member-supplied text landing inside single
   // quotes in a line a SHARED bastion runs. A quote in it would close them; everything after would
   // be the member's shell. So the label is reduced to characters with no meaning to a shell at all,
   // rather than escaped — there is nothing here worth the risk of getting an escape subtly wrong.
@@ -443,11 +430,17 @@ test("chatCommand takes the same gate, and strips the one part a person chose do
   assert.match(chatCommand(45000, "v-abc123", "   "), /'agent'$/);
   assert.match(chatCommand(45000, "v-abc123", null), /'agent'$/);
   assert.match(chatCommand(45000, "v-abc123", "x".repeat(200)), /'x{40}'$/);
-  // The port and the view id are the SAME pair the attach line takes, and refused the same way —
-  // no route is registered rather than one whose command is garbage.
+  // THE PORT AND THE VIEW ID ARE TAKEN AS A PAIR, and a bad one registers NO route rather than a
+  // route whose command is garbage. The view id is carried at all because A PORT IS NOT IDENTITY:
+  // ports are recycled and an orphaned bridge answers on them, so the attach script checks the
+  // bridge's `_iso/hello` names this view.
   assert.equal(chatCommand(45000, "v-a; rm -rf /", "Buzz"), undefined);
+  assert.equal(chatCommand(45000, "$(id)", "Buzz"), undefined);
+  assert.equal(chatCommand(45000, "", "Buzz"), undefined);
+  assert.equal(chatCommand(45000, undefined, "Buzz"), undefined);
   assert.equal(chatCommand(0, "v-abc", "Buzz"), undefined);
   assert.equal(chatCommand(70000, "v-abc", "Buzz"), undefined);
+  assert.equal(chatCommand(1.5, "v-abc", "Buzz"), undefined);
   assert.equal(chatCommand(undefined, "v-abc", "Buzz"), undefined);
 });
 
@@ -479,6 +472,86 @@ test("the rendered client spawns the attach script AT THE PATH the server writes
     child.kill();
     assert.ok(ok, `the client never reached the bridge — it renders: ${JSON.stringify(out)}`);
     assert.match(out, /— Buzz/, "and it is THIS agent's conversation the transcript is headed with");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("your own line is not printed back at you, and somebody else's is", async () => {
+  // The bridge echoes EVERY prompt to EVERY window, the sender included — right for a browser, which
+  // has not drawn it yet, and wrong in a terminal, where you typed it at the prompt and it is already
+  // on screen. The client drops its own echo by remembering what it sent; `from` cannot settle it,
+  // because the bridge reports "view" for every window. Forget to record the sent text and nothing
+  // fails — every line simply appears twice, the second time labelled as a stranger.
+  const { ATTACH_PATH, CHAT_PATH } = await import("../dist/acpview.js");
+  const dir = mkdtempSync(join(tmpdir(), "iso-echo-"));
+  try {
+    const chat = join(dir, basename(CHAT_PATH));
+    copyFileSync(fileURLToPath(new URL("../dist/sandbox/iso-acp-chat.mjs", import.meta.url)), chat);
+    // A stand-in bridge: hello, then answer any prompt the way the real one does — an echo of the
+    // sender's own text, and then a turn started in another window. Both carry `from: "view"`.
+    writeFileSync(
+      join(dir, basename(ATTACH_PATH)),
+      [
+        `const notify = (text, from = "view") => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "s-1", update: { sessionUpdate: "user_message_chunk", content: { type: "text", text } }, _meta: { iso: { from } } } }) + "\\n");`,
+        `const agent = (text) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "s-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } } }) + "\\n");`,
+        `process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "_iso/hello", params: { sessionId: "s-1", viewId: process.argv[3], updates: [] } }) + "\\n");`,
+        `let acc = "";`,
+        `process.stdin.on("data", (d) => { acc += d; for (;;) { const i = acc.indexOf("\\n"); if (i < 0) break; const raw = acc.slice(0, i); acc = acc.slice(i + 1); let m; try { m = JSON.parse(raw); } catch { continue; } if (m.method !== "session/prompt") continue; notify(m.params.prompt[0].text); notify("THE-BROWSER-SAID-THIS"); notify("A-CONNECTOR-SAID-THIS\\u001b[2J and\\nstill\\treadable", "Slack\\u001b[2J"); agent("THE-AGENT-QUOTED-THIS\\u001b[2J back"); ask(); } });`,
+        // A permission ask, whose TITLE and OPTION NAMES are both the agent's text — and the options
+        // land in the prompt line itself, which is the worst place on the screen for an escape.
+        `const ask = () => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 99, method: "session/request_permission", params: { toolCall: { title: "A-TOOL-WANTS\\u001b[2J in" }, options: [{ optionId: "no", name: "REJECT-THIS\\u001b[2J" }, { optionId: "yes", name: "ALLOW-THIS" }] } }) + "\\n");`,
+        `setTimeout(() => {}, 5000);`,
+      ].join("\n"),
+    );
+    const child = spawn(process.execPath, [chat, "45000", "v-abc123", "Buzz"], { stdio: ["pipe", "pipe", "pipe"] });
+    let out = "";
+    // WHAT ALREADY ARRIVED COUNTS. Several of these lines are written by the stand-in in one go, so
+    // they routinely land in a SINGLE chunk — and a waiter that only looks at new data would sit out
+    // its whole timeout for a needle that is already on the screen.
+    const wait = (needle) =>
+      new Promise((resolve) => {
+        if (out.includes(needle)) return resolve(true);
+        const done = (v) => {
+          clearTimeout(timer);
+          child.stdout.off("data", on);
+          resolve(v);
+        };
+        const on = (d) => {
+          out += String(d);
+          if (out.includes(needle)) done(true);
+        };
+        const timer = setTimeout(() => done(false), 5000);
+        child.stdout.on("data", on);
+      });
+    try {
+      assert.ok(await wait("— Buzz"), `the client never reached the bridge — it renders: ${JSON.stringify(out)}`);
+      child.stdin.write("I-TYPED-THIS\n");
+      // The other window's line arrives AFTER the echo, so seeing it means the echo has been handled.
+      assert.ok(await wait("THE-BROWSER-SAID-THIS"), `no update was rendered — it renders: ${JSON.stringify(out)}`);
+      assert.match(out, /another window/, "a turn started somewhere else is the thing you most need to see");
+      // A CONNECTOR NAMES ITSELF **AND WRITES THE MESSAGE**, and both are written to a terminal, where
+      // an escape is an instruction and not text — a Slack display name or a Slack line could clear
+      // the screen and redraw the transcript as if the agent had said it. So the control characters
+      // come out of each of them, and only the two that prose really uses survive in the body.
+      assert.ok(await wait("A-CONNECTOR-SAID-THIS"), `the connector's turn was not rendered — it renders: ${JSON.stringify(out)}`);
+      // AND THE AGENT'S OWN PROSE, which is the biggest carrier of all: it quotes back the file it
+      // just read, the tool output it got, the page it fetched. None of that is the agent's text.
+      assert.ok(await wait("THE-AGENT-QUOTED-THIS"), `the agent's own line was not rendered — it renders: ${JSON.stringify(out)}`);
+      // AND THE PERMISSION ASK: its title is one line of the agent's text, and its option names are
+      // written into the PROMPT the person answers — an escape there repaints the question a person
+      // is about to say yes to, which is the worst place on the screen to lose control of.
+      assert.ok(await wait("A-TOOL-WANTS"), `the permission ask was not rendered — it renders: ${JSON.stringify(out)}`);
+      assert.ok(await wait("1=REJECT-THIS"), `the options were not offered — it renders: ${JSON.stringify(out)}`);
+      assert.match(out, /allow\? \[1=REJECT-THIS.* 2=ALLOW-THIS\]/, "…numbered, and both still reading as themselves");
+      assert.ok(!out.includes("\u001b[2J"), `an escape reached the terminal: ${JSON.stringify(out)}`);
+      assert.match(out, /Slack/, "…and the name itself still shows, so the two senders are told apart");
+      assert.match(out, /and\nstill\treadable/, "…and the message keeps the newline and tab prose is written with");
+      // stdin is a pipe here, so readline does not echo: every occurrence would be one the client printed.
+      assert.ok(!out.includes("I-TYPED-THIS"), `the client printed its own line back at you: ${JSON.stringify(out)}`);
+    } finally {
+      child.kill();
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
