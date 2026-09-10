@@ -20,7 +20,7 @@ import { dropViewsForSandbox, ensureRouteId, viewsForSandbox, type View, type Vi
 import { dropSessionAgents, parseAgentSecrets, parseRoster, registerRoster, setAgentCredentials, type AgentDef } from "./agents.js";
 import { installVault, parseVaultManifest, vaultPresent, type VaultSummary } from "./vault.js";
 import { forgetThreads } from "./threads.js";
-import { attachCommand } from "./acpview.js";
+import { attachCommand, chatCommand } from "./acpview.js";
 import { sealedOrInline } from "./envelope.js";
 
 const log = (...a: unknown[]) => console.log("[sessions]", ...a);
@@ -392,7 +392,11 @@ export function syncRoutes(sessionId: string, sandboxId: string): void {
     // An agent route carries the command whose stdio IS the conversation. The bastion execs what it
     // is told rather than knowing anything about ACP — the same division tmux mode already has. No
     // command means no door: register nothing rather than a route the edge can only refuse.
+    // TWO DOORS ON ONE ROUTE: a plain `ssh` gets the conversation rendered (nothing to install),
+    // `ssh -s … acp` gets the raw protocol (for an ACP client). Both are commands the bastion execs
+    // without knowing what either speaks.
     const acpCommand = mode === "acp" ? attachCommand(v.port, v.id) : undefined;
+    const chat = mode === "acp" ? chatCommand(v.port, v.id, v.label) : undefined;
     if (mode === "acp" && !acpCommand) {
       log(`${v.id}: agent view has no usable bridge port (${String(v.port)}) — no ssh route`);
       continue;
@@ -409,6 +413,7 @@ export function syncRoutes(sessionId: string, sandboxId: string): void {
       mode,
       ...(mode === "tmux" ? { tmuxTarget: tmuxTargetFor(v) } : {}),
       ...(acpCommand ? { acpCommand } : {}),
+      ...(chat ? { chatCommand: chat } : {}),
       ...(v.dir ? { dir: v.dir } : {}),
       ...(v.label ? { label: v.label } : {}),
       keys,

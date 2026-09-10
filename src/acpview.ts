@@ -21,10 +21,14 @@ const BRIDGE_SRC = readFileSync(join(SANDBOX_DIR, "iso-acp-bridge.mjs"), "utf8")
 // The same conversation, for a client that is not a browser: `ssh -s <route>@… acp` execs this in
 // the sandbox and it joins the bridge as one more of the N clients it already fans out to.
 const ATTACH_SRC = readFileSync(join(SANDBOX_DIR, "iso-acp-attach.mjs"), "utf8");
+// …and the client for a person: what a plain `ssh <routeId>@<host>` lands in. It spawns the attach
+// script rather than opening its own socket, so the protocol lives in exactly one place.
+const CHAT_SRC = readFileSync(join(SANDBOX_DIR, "iso-acp-chat.mjs"), "utf8");
 const MCP_SRC = readFileSync(join(SANDBOX_DIR, "iso-mcp.mjs"), "utf8");
 
 export const BRIDGE_PATH = "/tmp/.iso-acp-bridge.mjs";
 export const ATTACH_PATH = "/tmp/.iso-acp-attach.mjs";
+export const CHAT_PATH = "/tmp/.iso-acp-chat.mjs";
 const VIEW_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
 /**
  * What the bastion execs for an `acp` route: the view's bridge PORT, and the view id that port is
@@ -43,10 +47,29 @@ const VIEW_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
  * a route carrying something unexpected.
  */
 export const attachCommand = (port: number, viewId: string): string | undefined =>
-  // `typeof` first: `RegExp.test` STRINGIFIES its argument, so a missing id would sail through as
-  // the literal "undefined" — a command that is harmless in the shell and then refuses every
-  // bridge it meets, which is a door that silently never opens rather than one that is not built.
-  Number.isInteger(port) && port > 0 && port <= 65535 && typeof viewId === "string" && VIEW_ID_RE.test(viewId) ? `exec "$(command -v iso-node || command -v node)" ${ATTACH_PATH} ${port} ${viewId}` : undefined;
+  acpArgs(port, viewId) ? `exec "$(command -v iso-node || command -v node)" ${ATTACH_PATH} ${port} ${viewId}` : undefined;
+
+/**
+ * What a PLAIN `ssh <routeId>@<host>` runs: the same conversation, rendered, with nothing to install.
+ *
+ * It is the ssh channel's own process (the bastion `exec`s it, as a terminal route execs `tmux
+ * attach`), so quitting it ends the connection — there is no shell behind it, which is what keeps an
+ * agent route one door rather than a way into the sandbox.
+ *
+ * The NAME is only a label in the transcript, and it is the one part a person chose, so it is
+ * stripped to what cannot act: it lands inside single quotes in a command a shared bastion runs.
+ */
+export const chatCommand = (port: number, viewId: string, name?: string | null): string | undefined => {
+  if (!acpArgs(port, viewId)) return undefined;
+  const label = String(name ?? "").replace(/[^A-Za-z0-9 _.-]/g, "").trim().slice(0, 40) || "agent";
+  return `exec "$(command -v iso-node || command -v node)" ${CHAT_PATH} ${port} ${viewId} '${label}'`;
+};
+
+// `typeof` first: `RegExp.test` STRINGIFIES its argument, so a missing id would sail through as the
+// literal "undefined" — a command that is harmless in the shell and then refuses every bridge it
+// meets, which is a door that silently never opens rather than one that is not built.
+const acpArgs = (port: number, viewId: string): boolean =>
+  Number.isInteger(port) && port > 0 && port <= 65535 && typeof viewId === "string" && VIEW_ID_RE.test(viewId);
 export const MCP_PATH = "/tmp/.iso-mcp.mjs";
 export const MCP_WRAPPER = "/tmp/.iso-mcp.sh";
 export const VIEWS_FILE = "/tmp/.iso-views.json";
@@ -125,6 +148,7 @@ export async function startAgentBridge(view: View): Promise<void> {
   const cfgPath = `/tmp/.iso-acp-${view.id}.json`;
   await writeFile(view.sandboxId, BRIDGE_PATH, BRIDGE_SRC, 0o644);
   await writeFile(view.sandboxId, ATTACH_PATH, ATTACH_SRC, 0o644);
+  await writeFile(view.sandboxId, CHAT_PATH, CHAT_SRC, 0o644);
   await writeFile(view.sandboxId, MCP_PATH, MCP_SRC, 0o644);
   await writeFile(view.sandboxId, MCP_WRAPPER, MCP_WRAPPER_SRC, 0o755);
   // The agent's HOME is under the workspace tree so the conversation persists — and that tree is

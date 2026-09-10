@@ -48,6 +48,8 @@ export interface RouteReg {
   tmuxTarget?: string;
   /** acp only: what the bastion execs in the sandbox. Its stdio IS the ACP stream. */
   acpCommand?: string;
+  /** acp only: what a PLAIN ssh runs — the same conversation, rendered, nothing to install. */
+  chatCommand?: string;
   dir?: string;
   label?: string;
   keys: string[]; // the end-user public keys allowed to open this route
@@ -469,9 +471,14 @@ export function nativeConnectFor(routeId: string, sessionId: string, viewId: str
   const command = sshCommandFor(routeId, mode);
   if (!host || !command) return undefined;
   const port = bastion.edgePort() ?? 22;
-  // AN AGENT ROUTE IS NOT A TERMINAL, and the payload has to say so: no `sshUrl` (there is nothing
-  // for the OS to open — the far end is JSON-RPC, not a screen), and the subsystem line that
-  // `sshCommandFor` builds for this mode. A plain `ssh` to this route is refused at the edge.
+  // AN AGENT ROUTE HAS TWO DOORS, and the payload leads with the one that needs nothing installed.
+  //
+  //   command  — a plain `ssh`, which lands in the conversation RENDERED. It is a real terminal
+  //              program, so `sshUrl` works exactly as it does for a terminal view: one click, the
+  //              OS opens a terminal, and you are talking to the agent. Quitting ends the
+  //              connection — the client IS the channel's process, with no shell behind it.
+  //   acpCommand — `ssh -s … acp`, the RAW protocol, for somebody pointing their own ACP client
+  //              (Zed, an editor) at this conversation.
   if (mode === "acp") {
     return {
       kind: "agent",
@@ -483,11 +490,13 @@ export function nativeConnectFor(routeId: string, sessionId: string, viewId: str
       viewId,
       passwordless: true,
       bastion: true,
-      command,
+      command: sshCommandFor(routeId, "tmux"), // the plain line: `ssh <routeId>@<host>`
+      sshUrl: `ssh://${routeId}@${host}${port === 22 ? "" : `:${port}`}`,
+      acpCommand: command,
       subsystem: "acp",
-      // What it IS, for a page that has to explain it: newline-delimited JSON-RPC on stdio, which is
-      // the framing ACP uses over stdio anyway — so this line works wherever an "agent command" is
-      // configured, and the browser view stays live on the same conversation.
+      // What the SECOND line is, for a page that has to explain it: newline-delimited JSON-RPC on
+      // stdio, which is the framing ACP uses over stdio anyway — so it works wherever an "agent
+      // command" is configured, and the browser view stays live on the same conversation.
       protocol: "acp",
     };
   }
