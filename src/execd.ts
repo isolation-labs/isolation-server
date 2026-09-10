@@ -2,6 +2,7 @@
 // isolation-server reaches it on the sandbox's published host port (endpoints API, port
 // 44772) and uses it for everything that happens INSIDE a sandbox: view processes,
 // clones, secret-file materialization, and (later) the persistence choreography.
+import { randomBytes } from "node:crypto";
 import { endpointFor } from "./opensandbox.js";
 
 const EXECD_PORT = 44772;
@@ -104,9 +105,120 @@ export async function run(sandboxId: string, command: string, opts: RunOpts = {}
 
 // Fetch a file's bytes out of the sandbox as a streaming Response — the caller owns
 // the body (and any size cap; execd sends the whole file otherwise).
-export async function downloadFile(sandboxId: string, path: string): Promise<Response> {
+//
+// `range` is a REQUEST, not a guarantee: it is forwarded as a Range header, and execd may answer
+// 206 with the slice or 200 with the whole file. Callers that need the slice must check the status
+// (webdav.ts does) rather than assume.
+export async function downloadFile(sandboxId: string, path: string, range?: { start: number; end: number }): Promise<Response> {
   const host = await execdHost(sandboxId);
-  return fetch(`http://${host}/files/download?path=${encodeURIComponent(path)}`);
+  return fetch(`http://${host}/files/download?path=${encodeURIComponent(path)}`, {
+    ...(range ? { headers: { Range: `bytes=${range.start}-${range.end}` } } : {}),
+  });
+}
+
+/** Thrown by writeFileStream when the body runs past the caller's cap. */
+export class UploadTooLarge extends Error {
+  constructor(limit: number) {
+    super(`upload exceeds ${limit} bytes`);
+    this.name = "UploadTooLarge";
+  }
+}
+
+// Write a file inside the sandbox WITHOUT buffering it — the multipart envelope is generated here
+// and the caller's body is spliced into the middle of it, so a 100MB upload costs one chunk of
+// memory rather than 100MB of it. `writeFile` above stays the path for the small, known-length
+// writes everything else does (secrets, config, editor saves).
+//
+// The framing is hand-rolled for one reason: FormData/Blob is a whole-buffer API. execd's quirks
+// are unchanged and must be preserved — metadata is a FILE part, and `mode` is a JSON number whose
+// DECIMAL DIGITS are read as octal.
+export async function writeFileStream(
+  sandboxId: string,
+  path: string,
+  body: AsyncIterable<Uint8Array | Buffer>,
+  opts: { mode?: number; maxBytes?: number; contentLength?: number } = {},
+): Promise<void> {
+  const host = await execdHost(sandboxId);
+  const { stream, headers } = uploadBody(path, body, opts);
+  const r = await fetch(`http://${host}/files/upload`, {
+    method: "POST",
+    headers,
+    body: stream,
+    // Node requires this whenever the body is a stream: we are not reading the response before the
+    // request finishes.
+    duplex: "half",
+  } as RequestInit & { duplex: "half" });
+  if (!r.ok) throw new Error(`execd upload ${path} → HTTP ${r.status}: ${(await r.text().catch(() => "")).slice(0, 200)}`);
+}
+
+/**
+ * The multipart envelope writeFileStream sends, split out so it can be exercised against a real
+ * HTTP server in a test without a sandbox in the picture — the framing is the part that has to be
+ * exactly right, and the part no type checker can vouch for.
+ */
+export function uploadBody(
+  path: string,
+  body: AsyncIterable<Uint8Array | Buffer>,
+  opts: { mode?: number; maxBytes?: number; contentLength?: number } = {},
+): { stream: ReadableStream<Uint8Array>; headers: Record<string, string> } {
+  const boundary = `----isolation${randomBytes(16).toString("hex")}`;
+  const head = Buffer.from(
+    `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="metadata"; filename="metadata.json"\r\n` +
+      `Content-Type: application/json\r\n\r\n` +
+      `${JSON.stringify({ path, mode: Number((opts.mode ?? 0o600).toString(8)) })}\r\n` +
+      `--${boundary}\r\n` +
+      // "blob" is the filename FormData would have generated for an unnamed Blob part, which is what
+      // the proven buffered path sends; execd takes the path from the metadata part either way.
+      `Content-Disposition: form-data; name="file"; filename="blob"\r\n` +
+      `Content-Type: application/octet-stream\r\n\r\n`,
+    "utf8",
+  );
+  const tail = Buffer.from(`\r\n--${boundary}--\r\n`, "utf8");
+
+  const max = opts.maxBytes ?? Number.POSITIVE_INFINITY;
+  let sent = 0;
+  const iterator = body[Symbol.asyncIterator]();
+  let stage: "head" | "body" | "tail" | "done" = "head";
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (stage === "head") {
+        stage = "body";
+        return void controller.enqueue(new Uint8Array(head));
+      }
+      if (stage === "body") {
+        const next = await iterator.next();
+        if (next.done) {
+          stage = "done";
+          controller.enqueue(new Uint8Array(tail));
+          return void controller.close();
+        }
+        const chunk = next.value instanceof Buffer ? next.value : Buffer.from(next.value);
+        sent += chunk.length;
+        if (sent > max) {
+          await iterator.return?.().catch(() => undefined);
+          throw new UploadTooLarge(max);
+        }
+        return void controller.enqueue(new Uint8Array(chunk));
+      }
+      controller.close();
+    },
+    async cancel() {
+      await iterator.return?.().catch(() => undefined);
+    },
+  });
+
+  // A known length keeps the request off chunked encoding, which is the shape execd's parser has
+  // always been fed. Unknown length still works — Go's multipart reader is streaming — but only the
+  // known case is exercised by everything else in this file.
+  const known = Number.isFinite(opts.contentLength) ? head.length + (opts.contentLength as number) + tail.length : undefined;
+  return {
+    stream,
+    headers: {
+      "Content-Type": `multipart/form-data; boundary=${boundary}`,
+      ...(known !== undefined ? { "Content-Length": String(known) } : {}),
+    },
+  };
 }
 
 // Write a file inside the sandbox (multipart upload; parent dirs created by execd).

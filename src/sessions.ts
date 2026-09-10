@@ -9,14 +9,15 @@
 import { randomBytes } from "node:crypto";
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { DATA, PORT, ensureDataDir, getSandbox } from "./config.js";
+import { DATA, HOST, PORT, ensureDataDir, getSandbox } from "./config.js";
 import { authorizedKeysFile, launch, scaffoldView, type LaunchRequest, type ViewSpec } from "./launch.js";
 import { deleteSandbox } from "./opensandbox.js";
 import { closeSsh, openSsh } from "./sshfwd.js";
 import { bastion, modeForView, sshCommandFor, CONTAINER_SSH_PORT } from "./bastion.js";
 import { run } from "./execd.js";
 import { dropSink, sinkFor } from "./persistence.js";
-import { dropViewsForSandbox, ensureRouteId, viewsForSandbox, type View, type ViewType } from "./views.js";
+import { dropLocksForSandbox } from "./webdav.js";
+import { davPassword, dropViewsForSandbox, ensureRouteId, viewsForSandbox, type View, type ViewType } from "./views.js";
 import { dropSessionAgents, parseAgentSecrets, parseRoster, registerRoster, setAgentCredentials, type AgentDef } from "./agents.js";
 import { installVault, parseVaultManifest, vaultPresent, type VaultSummary } from "./vault.js";
 import { forgetThreads } from "./threads.js";
@@ -309,6 +310,7 @@ export function startSession(body: DaemonLaunchBody, owner?: string): SessionRec
         // `dropViewsForSandbox` had already emptied the list and would stop nothing at all.
         await stopPumps(dead);
         dropViewsForSandbox(dead);
+        dropLocksForSandbox(dead); // the mount is gone with the sandbox
         dropSink(dead);
         forgetThreads(dead);
       }
@@ -349,6 +351,7 @@ export async function finishSession(id: string): Promise<void> {
     await stopPumps(s.sandboxId); // stop polling a bridge that is about to stop existing
     await deleteSandbox(s.sandboxId).catch(() => undefined);
     dropViewsForSandbox(s.sandboxId);
+    dropLocksForSandbox(s.sandboxId);
     dropSink(s.sandboxId);
     forgetThreads(s.sandboxId);
   }
@@ -529,6 +532,61 @@ export function viewJson(v: View, sessionId: string): Record<string, unknown> {
     // How to reach this view over ssh, when there is a bastion and the view is ssh-shaped. A
     // routeId, never an address: the whole point is that no host IP or port reaches a user.
     ...sshJson(v),
+    // …and how to MOUNT a files view as a drive (webdav.ts).
+    ...davJson(v),
+  };
+}
+
+// Any name works — the password is the whole credential — so it is a fixed, recognisable one: it
+// labels the entry a keychain saves and tells a person which mount they are looking at.
+const DAV_USERNAME = "isolation";
+
+/**
+ * The files view's external door, as the VIEWS LIST reports it: that a mount exists, and where.
+ *
+ * No credential here. This list is polled for as long as a session screen is open, so the password
+ * is revealed once, on the explicit `POST …/connect` a person triggers (davConnect below) — the same
+ * shape the ssh door has, where the list carries the route and the connect call carries the way in.
+ */
+function davJson(v: View): Record<string, unknown> {
+  if (v.type !== "directory") return {};
+  return { dav: { protocol: "webdav", path: davPath(v.id) } };
+}
+
+const davPath = (viewId: string): string => `/v/${viewId}/dav/`;
+
+/**
+ * Everything a person needs to MOUNT a files view as a drive — the daemon's `nativeConnect` payload
+ * for `kind: "webdav"`.
+ *
+ * A PATH, not an absolute URL, because this server does not know the name a browser reaches it by:
+ * the cloud does (its view plane is `v--<serverId>.<preview domain>`, preview.ts viewOriginFor) and
+ * joins the two. `localUrl` is the exception and is only ever right for someone sitting at the
+ * machine this server runs on — which for a connected server is the common case, and is also the
+ * FASTEST path: straight to loopback, no tunnel, no Worker, and none of the proxy's request-size
+ * ceiling on uploads.
+ *
+ * The password is stable for the life of the view (views.ts davPassword) rather than minted per
+ * call, because a mounted drive is saved in a keychain and has to keep working: a rotating password
+ * would break every mount on the next restart, and a person cannot retype one they never see again.
+ */
+export function davConnect(v: View, sessionId: string): Record<string, unknown> {
+  const path = davPath(v.id);
+  const password = davPassword(v.id);
+  return {
+    kind: "webdav",
+    protocol: "webdav",
+    sessionId,
+    viewId: v.id,
+    host: HOST,
+    port: PORT,
+    user: DAV_USERNAME,
+    username: DAV_USERNAME,
+    password,
+    passwordless: false,
+    path,
+    share: v.dir ? `/workspace/${v.dir}` : "/workspace",
+    localUrl: `http://127.0.0.1:${PORT}${path}`,
   };
 }
 

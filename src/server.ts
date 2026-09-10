@@ -12,6 +12,7 @@ import { launch, restartTerminal, sanitizeStyle, type LaunchRequest } from "./la
 import { sinkFor, abortMerge, dropSink, saveWorkspace, syncWorkspace } from "./persistence.js";
 import { dropView, dropViewsForSandbox, ensureRouteId, getView, isSlugPrefix, mintViewToken, updateView, viewsForSandbox, type View } from "./views.js";
 import { forgetExecd, run } from "./execd.js";
+import { dropLocksForSandbox } from "./webdav.js";
 import { agentJson, getAgent, listAgents, parseRoster, spawnAgent, startAgent, stopAgent } from "./agents.js";
 import { bridgePattern, connectorTurn, syncViewsFile } from "./acpview.js";
 import { attachChannel, channelBinding, channelThreadKey, channelsForSession, detachChannel, rememberEnvelope, type ChatEnvelope } from "./channels.js";
@@ -20,6 +21,7 @@ import { sealedOrInline } from "./envelope.js";
 import { pauseSession, resumeSession,
   actorFrom,
   createSessionView,
+  davConnect,
   dropSshForSandbox,
   finishSession,
   getSessionRecord,
@@ -93,7 +95,6 @@ async function fetchBastionConfig(backendUrl: string, connectionId: string, secr
       publicHost: typeof b.publicHost === "string" ? b.publicHost : b.controlHost,
       edgePort: Number(b.edgePort ?? 22),
       daemonLabel: typeof b.daemonLabel === "string" ? b.daemonLabel : connectionId,
-      ...(typeof b.smbHost === "string" ? { smbHost: b.smbHost } : {}),
       registerSecret: b.registerSecret,
       ...(hostKey ? { hostKey } : {}),
     });
@@ -275,7 +276,10 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
   }
-  if (method === "OPTIONS") return void res.writeHead(204).end();
+  // A blanket 204 for OPTIONS is right for a CORS preflight and WRONG for WebDAV: OPTIONS is how a
+  // file client discovers the mount, and answering it here would hide the `DAV: 1, 2` header the
+  // client needs to mount read-WRITE. A files view's /dav path answers for itself (webdav.ts).
+  if (method === "OPTIONS" && !/^\/v\/[a-zA-Z0-9-]+\/dav(\/|$)/.test(url)) return void res.writeHead(204).end();
 
   // The public web plane claims its hostnames FIRST — those hosts never reach /v/ or the API.
   if (await handlePublicWebRequest(req, res)) return;
@@ -813,16 +817,27 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   }
 
   // "Open externally" (the daemon's nativeConnect contract): hand the web what it needs to open this
-  // view outside the browser. A terminal or agent view gets a ready-to-run `ssh` line landing in the
-  // very thing the page is showing; a CODE view gets editor deep links instead, because an IDE
-  // drives the ssh itself and there is nothing for a person to type. A directory view is still
-  // deliberately not connectable (`modeForView`, bastion.ts).
+  // view outside the browser. Which door a view gets is the view type's business:
+  //   terminal / agent → a ready-to-run `ssh <routeId>@<host>` landing in the very thing the page is
+  //                      showing (`modeForView`, bastion.ts);
+  //   code             → editor deep links instead, because an IDE drives the ssh itself and there
+  //                      is nothing for a person to type;
+  //   directory        → a WebDAV MOUNT through the doorman (webdav.ts) — no bastion, no sshd, no
+  //                      port but the one the view plane already answers on.
   const nc = /^\/sessions\/(s-[a-z0-9]+)\/views\/([a-zA-Z0-9-]+)\/connect$/.exec(url);
   if (nc && method === "POST") {
     const [, id, vid] = nc;
     const s2 = getSessionRecord(id);
     const v = getView(vid);
     if (!s2 || !v || v.sandboxId !== s2.sandboxId || !mayOpen(actor, s2)) return json(res, 404, { error: "unknown view" });
+    // A files view answers here and returns before every ssh precondition below: none of them apply
+    // to it, and a session with no ssh key would otherwise be told it cannot mount its own files.
+    if (v.type === "directory") {
+      if (s2.state === "creating") return json(res, 503, { error: "this session is still starting" });
+      // The credential is REVEALED here and nowhere else: the views list is polled continuously, so
+      // it carries only the fact that a mount exists (sessions.ts davJson), never the password.
+      return json(res, 200, davConnect(v, id));
+    }
     if (!modeForView(v.type)) return json(res, 400, { error: `${v.type} views cannot be opened externally` });
     if (!bastion.enabled()) return json(res, 503, { error: "this server has no ssh bastion configured" });
     // sshd never came up in this sandbox. Two causes, both settled at launch time: the image had no
@@ -899,6 +914,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         // sandbox's views, so a call placed below would have nothing left to stop (PLAN §1 I3).
         await import("./toolpump.js").then((m) => m.stopToolPumpsFor(id));
         dropViewsForSandbox(id);
+        dropLocksForSandbox(id);
         invalidateEndpoints(id);
         forgetExecd(id);
         dropSink(id);

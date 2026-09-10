@@ -69,7 +69,6 @@ export interface BastionConfig {
   publicHost: string; // what users type: ssh <routeId>@<publicHost>
   edgePort: number;
   daemonLabel: string; // the control-plane username — our connectionId, so the edge can recompute our token
-  smbHost?: string;
   registerSecret: string; // per-connection token: HMAC(cloud signing key, daemonLabel)
   // The bastion's SSH host public key, base64 of the raw blob — PINNED. ssh2 accepts any host key
   // unless told otherwise, and this is the connection that carries our register credential and is

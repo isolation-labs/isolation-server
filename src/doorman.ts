@@ -12,10 +12,11 @@ import type { Duplex } from "node:stream";
 import httpProxy from "http-proxy-3";
 import { getSandbox, tokenMatches } from "./config.js";
 import { endpointFor } from "./opensandbox.js";
-import { getView, verifyViewToken, viewBySlug, type View } from "./views.js";
+import { getView, isAnyDavPassword, isOurViewToken, verifyDavPassword, verifyViewToken, viewBySlug, type View } from "./views.js";
 import { startWebForwarder, webForwarderAlive } from "./launch.js";
 import { handleCodeView } from "./codeview.js";
 import { handleAgentView } from "./agentview.js";
+import { handleWebdav } from "./webdav.js";
 import { ensureBridge } from "./acpview.js";
 
 const proxy = httpProxy.createProxyServer({ ws: true, xfwd: true });
@@ -51,28 +52,72 @@ proxy.on("proxyRes", (proxyRes) => {
 
 const VIEW_RE = /^\/v\/([a-zA-Z0-9-]+)(\/.*)?$/;
 
+// The name a file client shows in its credential prompt and saves the mount under. The view's own
+// label when it has one, so a member with two files views can tell the two keychain entries apart.
+const davRealm = (view: View): string => (view.label ?? "Files").replace(/[^\x20-\x7e]/g, "").replace(/["\\]/g, "").slice(0, 60) || "Files";
+
 export const viewIdFromUrl = (url: string | undefined): string | undefined => VIEW_RE.exec((url ?? "").split("?")[0])?.[1];
 
-function tokenFromRequest(req: IncomingMessage, viewId: string): string | undefined {
+// The token an HTTP Basic credential carries, if any. A native file client (Finder, Explorer,
+// GNOME Files) has NO other way to authenticate a mount: it cannot append a query parameter to the
+// requests it generates itself and it will not carry a bearer. The token is taken from the password
+// — where a client stores it in the OS keychain and where the username is free to be a label — and
+// from the username as a fallback, for clients that send a password-less credential.
+export function basicToken(auth: string | undefined): string | undefined {
+  if (!auth || !/^basic /i.test(auth)) return undefined;
+  let decoded: string;
+  try {
+    decoded = Buffer.from(auth.slice(6).trim(), "base64").toString("utf8");
+  } catch {
+    return undefined;
+  }
+  const colon = decoded.indexOf(":");
+  if (colon < 0) return decoded || undefined;
+  return decoded.slice(colon + 1) || decoded.slice(0, colon) || undefined;
+}
+
+// EVERY credential the request carries, in preference order — not the first one present. The
+// difference matters because an Authorization header is not necessarily ours: a view app inside the
+// sandbox may run its OWN basic auth, and once a browser has been prompted by it, it attaches that
+// credential to every request on this origin. Returning it and stopping would make the doorman
+// reject a request whose cookie was valid all along, locking the view out until the browser's saved
+// password is cleared. Each candidate is simply tried.
+export function tokensFromRequest(req: IncomingMessage): string[] {
+  const out: string[] = [];
   const u = new URL(req.url ?? "/", "http://x");
   const q = u.searchParams.get("token");
-  if (q) return q;
+  if (q) out.push(q);
   const auth = req.headers.authorization;
-  if (auth?.startsWith("Bearer ")) return auth.slice(7);
+  if (auth?.startsWith("Bearer ")) out.push(auth.slice(7));
+  const basic = basicToken(auth);
+  if (basic) out.push(basic);
   const cookies = req.headers.cookie ?? "";
   for (const c of cookies.split(";")) {
     const [k, ...rest] = c.trim().split("=");
-    if (k === "isolation-server_token") return decodeURIComponent(rest.join("="));
+    if (k !== "isolation-server_token") continue;
+    const raw = rest.join("=");
+    try {
+      out.push(decodeURIComponent(raw));
+    } catch {
+      out.push(raw); // malformed escape — judge the raw form, which is what we would have compared anyway
+    }
   }
-  void viewId;
-  return undefined;
+  return out;
 }
 
-const authorized = (req: IncomingMessage, viewId: string): { ok: boolean; queryToken?: string } => {
-  const t = tokenFromRequest(req, viewId);
-  const ok = !!t && (tokenMatches(t) || verifyViewToken(t, viewId));
+// `isDav` widens the accepted credentials by exactly one: the view's stable mount password
+// (views.ts davPassword), which is deliberately confined to that view's own /dav path. It is the
+// one credential here that never expires, so it must not become a way in anywhere else.
+const authorized = (req: IncomingMessage, viewId: string, isDav = false): { ok: boolean; queryToken?: string } => {
+  const ok = tokensFromRequest(req).some((t) => tokenMatches(t) || verifyViewToken(t, viewId) || (isDav && verifyDavPassword(t, viewId)));
   const u = new URL(req.url ?? "/", "http://x");
-  return { ok, queryToken: u.searchParams.get("token") ?? undefined };
+  // Only a `?token=` that is ITSELF valid may be promoted to the view cookie below. Now that every
+  // credential on the request is tried, `ok` can come from the cookie while the query carries a
+  // stale or hostile value — promoting that would overwrite a working cookie with a dead one and
+  // lock the view out of its own frame. The mount password is deliberately not promotable either:
+  // it never expires, and a long-lived cookie is not where a credential like that belongs.
+  const q = u.searchParams.get("token") ?? undefined;
+  return { ok, queryToken: q && (tokenMatches(q) || verifyViewToken(q, viewId)) ? q : undefined };
 };
 
 // Our own credentials must NEVER be handed to a sandbox: the app behind a view — a dev server, a
@@ -84,7 +129,22 @@ const authorized = (req: IncomingMessage, viewId: string): { ok: boolean; queryT
 // auth is its business and passes through untouched.
 export function stripOurCredentials(req: IncomingMessage): void {
   const auth = req.headers.authorization;
-  if (auth?.startsWith("Bearer ") && tokenMatches(auth.slice(7))) delete req.headers.authorization;
+  // "Ours" is judged WITHOUT pinning to the view being proxied. A credential of ours is ours
+  // wherever it turns up, and a sandbox app is exactly the party that must not see one — while the
+  // request that carries it is not necessarily the view it belongs to (see the Basic note below).
+  // Nothing a sandbox could invent passes these checks: each is an HMAC under this server's token.
+  const ours = (t: string): boolean => tokenMatches(t) || isOurViewToken(t) || isAnyDavPassword(t);
+  if (auth?.startsWith("Bearer ") && ours(auth.slice(7))) delete req.headers.authorization;
+  // The same rule for the Basic form a mount client sends: a view app must never be handed the
+  // credential that authenticated the request to US. An app's OWN basic auth is left alone.
+  //
+  // The mount password is stripped too, even though it does not authorize a proxied path: a request
+  // can be authorized by its query token and STILL carry one in a Basic header, and that password
+  // never expires — leaking it to whatever the sandbox is serving would hand out the folder for the
+  // life of the view. And unlike the view cookie (`Path=/v/<id>`), HTTP Basic has NO path scoping,
+  // so the view it arrives on is NOT necessarily the view it opens — hence `isAnyDavPassword`.
+  const basic = basicToken(auth);
+  if (basic && ours(basic)) delete req.headers.authorization;
   const cookie = req.headers.cookie;
   if (!cookie) return;
   const parts = cookie.split(";");
@@ -133,8 +193,13 @@ export async function handleViewRequest(req: IncomingMessage, res: ServerRespons
     res.writeHead(404, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "unknown view" }));
     return true;
   }
-  const { ok, queryToken } = authorized(req, viewId);
+  const rest = m[2] || "/";
+  const isDav = view.type === "directory" && (rest === "/dav" || rest.startsWith("/dav/"));
+  const { ok, queryToken } = authorized(req, viewId, isDav);
   if (!ok) {
+    // A file client has no login page: it authenticates only after a Basic challenge, and it needs
+    // the realm to label the keychain entry it saves the mount's token under.
+    if (isDav) res.setHeader("WWW-Authenticate", `Basic realm="${davRealm(view)}", charset="UTF-8"`);
     res.writeHead(401, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "unauthorized" }));
     return true;
   }
@@ -146,11 +211,22 @@ export async function handleViewRequest(req: IncomingMessage, res: ServerRespons
   // code view's API) itself. An agent view's WebSocket is the one thing proxied — to the
   // in-sandbox ACP bridge (handleViewUpgrade).
   if (view.type === "code") {
-    await handleCodeView(req, res, view, m[2] || "/");
+    await handleCodeView(req, res, view, rest);
     return true;
   }
   if (view.type === "agent") {
-    await handleAgentView(req, res, view, m[2] || "/");
+    await handleAgentView(req, res, view, rest);
+    return true;
+  }
+  // A files view's external door: `/v/<id>/dav/*` is WebDAV, served here over execd, so the same
+  // view a browser renders through filebrowser can be MOUNTED as a drive with nothing installed
+  // (webdav.ts). The rest of the view path stays filebrowser's.
+  if (isDav) {
+    const pathname = (req.url ?? "/").split("?")[0];
+    // The prefix the mount is addressed at, taken from THIS request rather than assumed, so hrefs
+    // stay followable when something in front adds a path prefix of its own.
+    const prefix = `${pathname.slice(0, pathname.length - rest.length)}/dav`;
+    await handleWebdav(req, res, view, rest.slice("/dav".length), prefix);
     return true;
   }
   try {

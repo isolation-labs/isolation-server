@@ -432,9 +432,10 @@ export const bastion = new BastionClient();
  *                     that carries exec, sftp and `ssh -L` (proxy.ts). Nobody is meant to type this
  *                     one: the web hands out an editor deep link and the editor drives the ssh.
  *
- * A DIRECTORY view still has no door. Files means a native mount (SMB), not a shell wearing a
- * folder's label, and that product decision is still open — so it answers `undefined` and the web
- * hides the button rather than shipping a shell by accident.
+ * A DIRECTORY view answers `undefined` here, and that is not a gap: its door is not ssh at all. It
+ * mounts over WebDAV through the doorman (webdav.ts) — plain HTTPS on the port the view plane
+ * already answers on, which every desktop opens with nothing installed. `davConnect` (sessions.ts)
+ * is what the web hands out for it, so `undefined` is what keeps it from ALSO getting a shell.
  */
 export function modeForView(type: string): RouteMode | undefined {
   if (type === "terminal") return "tmux";
