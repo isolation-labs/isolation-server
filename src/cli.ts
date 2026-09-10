@@ -6,8 +6,6 @@
 //   isolation-server connect <code>      link this server to the cloud account that minted the code
 //   isolation-server disconnect          unlink (detach pairing + drop the tunnel)
 //   isolation-server status              show gate / runtime / tunnel / pairing state
-//   isolation-server agent [<name>]      talk to a session's agent in this terminal (the agent view,
-//                                        as a client rather than as a protocol stream)
 //
 // What `connect` takes is the SHORT code the web shows — six unambiguous characters a human
 // reads off a screen and types ("isolation connect UDWYUV"). It pairs against the production
@@ -120,49 +118,6 @@ async function main(): Promise<void> {
   process.exit(0);
 }
 
-  /**
-   * `isolation agent [<name>]` — the agent view, in this terminal.
-   *
-   * The ssh door (`ssh -s <route>@<host> acp`) and the browser page both speak the same protocol to
-   * the same bridge; this is a CLIENT for it, which is what makes the door usable by a person rather
-   * than only by Zed. On THIS machine it needs neither: the doorman's own view socket, authorized
-   * with the token this CLI already holds.
-   */
-  if (cmd === "agent") {
-    const { runAgentCli } = await import("./agentcli.js");
-    // A remote server is named the way ssh names one, and then ssh is the transport.
-    if (arg && arg.includes("@")) return void (await runAgentCli({ target: { kind: "ssh", destination: arg } }));
-
-    const sessions = (await fetch(`${base}/sessions`, authed())
-      .then((r) => (r.ok ? r.json() : []))
-      .catch(() => undefined)) as { id: string; name?: string | null; state?: string }[] | undefined;
-    if (!sessions) return fail(`the gate isn't running on ${base} — start it with: isolation-server up`);
-    const live = sessions.filter((x) => !["closed", "stopped", "error"].includes(String(x.state ?? "")));
-    if (!live.length) return fail("no session is running here — launch one from the web first");
-
-    // Every agent view across the live sessions, because a person says a NAME and does not care
-    // which session it is in — and if the name is ambiguous, saying so beats picking.
-    const found: { sessionId: string; viewId: string; label: string }[] = [];
-    for (const s2 of live) {
-      const views = (await fetch(`${base}/sessions/${encodeURIComponent(s2.id)}/views`, authed())
-        .then((r) => (r.ok ? r.json() : []))
-        .catch(() => [])) as { id: string; type: string; label?: string | null }[];
-      for (const v of views) if (v.type === "agent") found.push({ sessionId: s2.id, viewId: v.id, label: v.label ?? v.id });
-    }
-    if (!found.length) return fail("no agent views are open in the running sessions");
-
-    const want = (arg ?? "").trim().toLowerCase();
-    const picks = want ? found.filter((f) => f.viewId === arg || f.label.toLowerCase() === want) : found;
-    if (!picks.length) return fail(`no agent called "${arg}" — open: ${found.map((f) => f.label).join(", ")}`);
-    if (picks.length > 1) return fail(`several agents match: ${picks.map((f) => f.label).join(", ")} — name one`);
-
-    const token = getToken();
-    if (!token) return fail("this server has no local token — run: isolation-server up");
-    console.log(`connecting to ${picks[0].label}… (/exit to leave, /cancel to interrupt a turn)`);
-    await runAgentCli({ target: { kind: "local", base, token, viewId: picks[0].viewId, label: picks[0].label } });
-    return;
-  }
-
   if (cmd === "status") {
     const r = await fetch(`${base}/status`, authed()).catch(() => undefined);
     if (!r) return fail(`the gate isn't running on ${base} — start it with: isolation-server run`);
@@ -170,7 +125,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  console.log("usage: isolation-server <up|down|run|connect <code> [--backend <url>]|disconnect|status|agent [<name>|<routeId>@<host>]>");
+  console.log("usage: isolation-server <up|down|run|connect <code> [--backend <url>]|disconnect|status>");
 }
 
 function fail(msg: string): never {

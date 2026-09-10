@@ -46,9 +46,10 @@ export interface RouteReg {
   mode: RouteMode; // tmux = attach the view's live tmux session; shell = transparent (VS Code, scp);
   //                  acp  = the agent view's own conversation, for an external ACP client
   tmuxTarget?: string;
-  /** acp only: what the bastion execs in the sandbox. Its stdio IS the ACP stream. */
-  acpCommand?: string;
-  /** acp only: what a PLAIN ssh runs — the same conversation, rendered, nothing to install. */
+  /**
+   * acp only: what the bastion execs in the sandbox, as the ssh channel's own process. A plain
+   * `ssh <routeId>@<host>` lands in the conversation, rendered — nothing for anybody to install.
+   */
   chatCommand?: string;
   dir?: string;
   label?: string;
@@ -445,21 +446,16 @@ export function modeForView(type: string): RouteMode | undefined {
 }
 
 /**
- * The line a person types for a route, when the bastion is configured and the type is reachable.
+ * The line a person types for a route: `ssh <routeId>@<host>`, whatever the route is for.
  *
- * THE MODE DECIDES THE LINE. `acp` builds the SUBSYSTEM form — the raw protocol, for a client that
- * speaks ACP; the plain form is the other door on the same route (`nativeConnectFor`), which lands
- * a person in the conversation rendered. Neither is a shell: an agent route never opens one.
- *
- * `-s` takes the subsystem name in the COMMAND position — after the destination — so
- * `ssh -s acp <route>@<host>` would dial a host literally called "acp" and never reach the bastion.
- * The order is the contract, and it is a string a person copies: nothing downstream would catch it.
+ * ONE LINE FOR EVERY DOOR, because the ROUTE already says what it opens — a terminal route attaches
+ * that terminal, an agent route lands in that conversation. Nothing about the protocol reaches what
+ * anybody types, and neither route ever opens a shell.
  */
-export function sshCommandFor(routeId: string, mode: RouteMode = "tmux"): string | undefined {
+export function sshCommandFor(routeId: string): string | undefined {
   const host = bastion.publicHost();
   if (!host) return undefined;
   const port = bastion.edgePort() ?? 22;
-  if (mode === "acp") return `ssh${port === 22 ? "" : ` -p ${port}`} -s ${routeId}@${host} acp`;
   return `ssh ${routeId}@${host}${port === 22 ? "" : ` -p ${port}`}`;
 }
 
@@ -470,17 +466,13 @@ export function sshCommandFor(routeId: string, mode: RouteMode = "tmux"): string
  */
 export function nativeConnectFor(routeId: string, sessionId: string, viewId: string, mode: RouteMode = "tmux"): Record<string, unknown> | undefined {
   const host = bastion.publicHost();
-  const command = sshCommandFor(routeId, mode);
+  const command = sshCommandFor(routeId);
   if (!host || !command) return undefined;
   const port = bastion.edgePort() ?? 22;
-  // AN AGENT ROUTE HAS TWO DOORS, and the payload leads with the one that needs nothing installed.
-  //
-  //   command  — a plain `ssh`, which lands in the conversation RENDERED. It is a real terminal
-  //              program, so `sshUrl` works exactly as it does for a terminal view: one click, the
-  //              OS opens a terminal, and you are talking to the agent. Quitting ends the
-  //              connection — the client IS the channel's process, with no shell behind it.
-  //   acpCommand — `ssh -s … acp`, the RAW protocol, for somebody pointing their own ACP client
-  //              (Zed, an editor) at this conversation.
+  // AN AGENT ROUTE IS A CONVERSATION, opened the way a terminal view is opened: a plain `ssh` that
+  // lands in it, rendered. It is a real terminal program, so `sshUrl` works exactly as it does for a
+  // terminal — one click, the OS opens a terminal, and you are talking to the agent. Quitting ends
+  // the connection: the client IS the channel's process, with no shell behind it.
   if (mode === "acp") {
     return {
       kind: "agent",
@@ -492,14 +484,8 @@ export function nativeConnectFor(routeId: string, sessionId: string, viewId: str
       viewId,
       passwordless: true,
       bastion: true,
-      command: sshCommandFor(routeId, "tmux"), // the plain line: `ssh <routeId>@<host>`
+      command,
       sshUrl: `ssh://${routeId}@${host}${port === 22 ? "" : `:${port}`}`,
-      acpCommand: command,
-      subsystem: "acp",
-      // What the SECOND line is, for a page that has to explain it: newline-delimited JSON-RPC on
-      // stdio, which is the framing ACP uses over stdio anyway — so it works wherever an "agent
-      // command" is configured, and the browser view stays live on the same conversation.
-      protocol: "acp",
     };
   }
   return {

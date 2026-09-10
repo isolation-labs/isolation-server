@@ -375,33 +375,28 @@ test("ensureSshCapability pulls AUDIT_WRITE back, keeps every other drop", () =>
 
 // --- the ssh bastion ----------------------------------------------------------
 
-test("an agent view has TWO doors: a plain ssh that needs nothing installed, and the raw ACP line", async () => {
-  // The plain line lands in the conversation RENDERED (the bastion execs the in-sandbox client as
-  // the channel's own process), so it is what the page leads with and what `ssh://` opens.
-  //
-  // The second is the protocol itself, and its ORDER is the whole contract: ssh(1) parses `-s` as a
-  // flag with NO argument, so `ssh -s acp r@host` takes the FIRST non-option as the destination and
-  // dials a host literally named "acp" as the local user, never reaching the bastion. It is a string
-  // a person copies into a client config — nothing downstream would catch it being wrong.
+test("an agent view opens with a plain ssh — the same line a terminal view uses", async () => {
+  // The line lands in the conversation RENDERED: the bastion execs the in-sandbox client as the ssh
+  // channel's own process, so quitting it ends the connection and there is no shell behind it. That
+  // makes it an ordinary terminal program, which is why `ssh://` works here exactly as it does for a
+  // terminal view — one click, and the OS opens a terminal already talking to the agent.
   const cfg0 = await import("../dist/config.js");
   const b = await import("../dist/bastion.js");
   cfg0.saveBastion({ controlHost: "127.0.0.1", controlPort: 1, publicHost: "ssh.example.cc", edgePort: 2222, daemonLabel: "d-1", registerSecret: "s" });
   b.bastion.startIfConfigured(); // the dial fails against a dead port; only `settings` matters here
   try {
     const acp = b.nativeConnectFor("r0ute1", "s-1", "v-1", "acp");
-    assert.equal(acp.command, "ssh r0ute1@ssh.example.cc -p 2222", "the no-install door leads");
+    assert.equal(acp.command, "ssh r0ute1@ssh.example.cc -p 2222", "nothing to install, and no flags to get wrong");
     assert.equal(acp.sshUrl, "ssh://r0ute1@ssh.example.cc:2222", "…and it is one the OS can open");
-    assert.equal(acp.acpCommand, "ssh -p 2222 -s r0ute1@ssh.example.cc acp", "the subsystem goes in the COMMAND slot");
-    assert.equal(acp.kind, "agent");
-    assert.equal(acp.subsystem, "acp");
+    assert.equal(acp.kind, "agent", "the page still knows what it is opening");
     // A terminal route is unchanged: no subsystem, and a deep link the OS can open.
     const term = b.nativeConnectFor("r0ute2", "s-1", "v-2");
     assert.equal(term.command, "ssh r0ute2@ssh.example.cc -p 2222");
     assert.equal(term.sshUrl, "ssh://r0ute2@ssh.example.cc:2222");
-    // The subsystem form is what `sshCommandFor` builds for this mode, and the two must agree: the
-    // page publishes one and a client config carries the other.
-    assert.equal(b.sshCommandFor("r0ute1", "acp"), acp.acpCommand);
-    assert.equal(b.sshCommandFor("r0ute2", "tmux"), term.command);
+    // ONE LINE FOR EVERY DOOR: the route says what it opens, so nothing about the view type reaches
+    // what a person types.
+    assert.equal(b.sshCommandFor("r0ute1"), acp.command);
+    assert.equal(b.sshCommandFor("r0ute2"), term.command);
     // Only the two types that have a real door get one.
     assert.equal(b.modeForView("terminal"), "tmux");
     assert.equal(b.modeForView("agent"), "acp");

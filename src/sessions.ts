@@ -20,7 +20,7 @@ import { dropViewsForSandbox, ensureRouteId, viewsForSandbox, type View, type Vi
 import { dropSessionAgents, parseAgentSecrets, parseRoster, registerRoster, setAgentCredentials, type AgentDef } from "./agents.js";
 import { installVault, parseVaultManifest, vaultPresent, type VaultSummary } from "./vault.js";
 import { forgetThreads } from "./threads.js";
-import { attachCommand, chatCommand } from "./acpview.js";
+import { chatCommand } from "./acpview.js";
 import { sealedOrInline } from "./envelope.js";
 
 const log = (...a: unknown[]) => console.log("[sessions]", ...a);
@@ -395,9 +395,8 @@ export function syncRoutes(sessionId: string, sandboxId: string): void {
     // TWO DOORS ON ONE ROUTE: a plain `ssh` gets the conversation rendered (nothing to install),
     // `ssh -s … acp` gets the raw protocol (for an ACP client). Both are commands the bastion execs
     // without knowing what either speaks.
-    const acpCommand = mode === "acp" ? attachCommand(v.port, v.id) : undefined;
     const chat = mode === "acp" ? chatCommand(v.port, v.id, v.label) : undefined;
-    if (mode === "acp" && !acpCommand) {
+    if (mode === "acp" && !chat) {
       log(`${v.id}: agent view has no usable bridge port (${String(v.port)}) — no ssh route`);
       continue;
     }
@@ -412,7 +411,8 @@ export function syncRoutes(sessionId: string, sandboxId: string): void {
       viewType: v.type,
       mode,
       ...(mode === "tmux" ? { tmuxTarget: tmuxTargetFor(v) } : {}),
-      ...(acpCommand ? { acpCommand } : {}),
+      // An agent route carries the one command whose stdio the ssh channel becomes. The bastion
+      // execs what it is told and knows nothing about what it speaks — the division tmux mode has.
       ...(chat ? { chatCommand: chat } : {}),
       ...(v.dir ? { dir: v.dir } : {}),
       ...(v.label ? { label: v.label } : {}),
@@ -540,12 +540,10 @@ export function viewJson(v: View, sessionId: string): Record<string, unknown> {
 function sshJson(v: View): Record<string, unknown> {
   const mode = modeForView(v.type);
   if (!v.sshRouteId || !mode) return {};
-  // The MODE has to reach the line. An agent route answers BOTH forms — a plain `ssh` lands in the
-  // conversation rendered, `ssh -s … acp` hands over the raw protocol — and this block is the one a
-  // client config is copied from, so it publishes the subsystem form. The plain line rides the
-  // `nativeConnect` payload, which is what the page offers for opening a terminal.
-  const command = sshCommandFor(v.sshRouteId, mode);
-  return command ? { ssh: { routeId: v.sshRouteId, command, ...(mode === "acp" ? { subsystem: "acp", protocol: "acp" } : {}) } } : {};
+  // ONE LINE, whatever the view is: the route says what it opens. A terminal route attaches that
+  // terminal; an agent route lands in that conversation, rendered.
+  const command = sshCommandFor(v.sshRouteId);
+  return command ? { ssh: { routeId: v.sshRouteId, command } } : {};
 }
 
 // A web view's public address: its slug as a hostname — on the wildcard sandbox domain
