@@ -301,7 +301,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
 
   // The gate's own log tail — the DAEMON's wire shape ({entries, cursor, dropped}),
   // so the web's server-card Logs modal renders it unchanged.
-  if (method === "GET" && url.startsWith("/logs")) {
+  if (method === "GET" && url === "/logs") {
     try {
       const { readFileSync } = await import("node:fs");
       const { join } = await import("node:path");
@@ -318,11 +318,13 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       const tailRaw = Number(q.get("tail"));
       const tail = Number.isFinite(tailRaw) && tailRaw >= 1 ? Math.min(Math.floor(tailRaw), 2000) : 500;
 
-      const from = after === undefined ? Math.max(0, all.length - tail) : after;
+      const from = after === undefined ? Math.max(0, all.length - tail) : Math.min(after, all.length);
       const entries = all.slice(from, from + tail).map((line, i) => ({ seq: from + i, ts: "", stream: "out" as const, line }));
       return json(res, 200, {
         entries,
-        cursor: all.length,
+        // The cursor is where THIS answer ends, not where the file does: a poller that fell more
+        // than `tail` behind gets the next window on its next call instead of skipping to the end.
+        cursor: from + entries.length,
         // The log was rotated or truncated under the caller: what they asked to continue from is
         // past the end, so they have missed lines and should re-read rather than trust the gap.
         dropped: after !== undefined && after > all.length,
@@ -808,20 +810,27 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         const asked = Number(q.get("tail"));
         const tail = Number.isFinite(asked) && asked >= 1 ? Math.min(Math.floor(asked), 500) : 500;
         // `after` IS A CURSOR INTO THE CONTAINER'S OWN STREAM, so a poll returns only new lines
-        // instead of the same tail every few seconds. The runtime gives us a tail, not a range, so
-        // the cursor is a count of lines already seen: ask for a wider window and drop what was.
+        // instead of the same tail every few seconds. The runtime hands out a TAIL, not a range,
+        // so the only cursor there is a count of lines from the start of the log — which holds
+        // exactly while the window we fetch still begins at line 0. EVERY read therefore asks for
+        // the widest window the runtime allows (10000) and trims to `tail` here — the first read
+        // included, or the cursor it hands out counts from its own small window and the poll that
+        // continues from it lands on the wrong lines. A 500-line window made the cursor stick at
+        // 500 and every poll after that answer nothing, for ever, while the container kept writing.
         const afterRaw = Number(q.get("after"));
         const after = Number.isFinite(afterRaw) && afterRaw >= 0 ? Math.floor(afterRaw) : undefined;
-        const want = after === undefined ? tail : 500;
+        const want = 10000;
         const text = await sandboxLogs(s.sandboxId, want).catch(() => undefined);
         if (text === undefined) return json(res, 200, { available: false, lines: [] });
         const all = text.split("\n").filter(Boolean);
-        // The container's log is a rolling window: its first line is not line 0 of all time. `seq`
-        // counts from the START of what the runtime still has, which is the only thing either side
-        // can agree on — and `dropped` says when that window has moved past where the caller was.
-        const from = after === undefined ? Math.max(0, all.length - tail) : Math.min(after, all.length);
-        const lines = all.slice(from).map((line, i) => ({ seq: from + i, ts: "", stream: "out" as const, line }));
-        return json(res, 200, { available: true, lines, cursor: all.length, dropped: after !== undefined && after > all.length });
+        // Once even the widest window is full the count has lost its anchor (the log's first line
+        // is no longer line 0 of all time), and a cursor past the end means the container was
+        // recreated under the caller. Either way the honest answer is the tail they asked for,
+        // flagged `dropped` so they re-read rather than trust the gap — never a silent empty page.
+        const dropped = after !== undefined && (all.length >= want || after > all.length);
+        const from = after !== undefined && !dropped ? after : Math.max(0, all.length - tail);
+        const lines = all.slice(from, from + tail).map((line, i) => ({ seq: from + i, ts: "", stream: "out" as const, line }));
+        return json(res, 200, { available: true, lines, cursor: from + lines.length, dropped });
       }
       if (method === "GET" && action === "claude-usage") return json(res, 200, { usage: [] });
       // The session's agents — the DEFINITIONS it was launched with, which the cloud folds into
