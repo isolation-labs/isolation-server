@@ -302,16 +302,31 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
 
   // The gate's own log tail — the DAEMON's wire shape ({entries, cursor, dropped}),
   // so the web's server-card Logs modal renders it unchanged.
-  if (method === "GET" && url === "/logs") {
+  if (method === "GET" && url.startsWith("/logs")) {
     try {
       const { readFileSync } = await import("node:fs");
       const { join } = await import("node:path");
       const { HOME } = await import("./config.js");
-      const lines = readFileSync(join(HOME, "isolation-server.log"), "utf8").split("\n").filter(Boolean).slice(-500);
+      const q = new URL(req.url ?? "/", "http://x").searchParams;
+      const all = readFileSync(join(HOME, "isolation-server.log"), "utf8").split("\n").filter(Boolean);
+
+      // A SEQ IS THE LINE'S PLACE IN THE WHOLE FILE, not in the window we happen to return. It was
+      // the index within the last 500, which made `cursor` mean nothing across two reads: a poller
+      // asking for "everything after 500" got the same 500 lines for ever. With an absolute seq,
+      // `after` is a real cursor and a poll returns only what is new.
+      const afterRaw = Number(q.get("after"));
+      const after = Number.isFinite(afterRaw) && afterRaw >= 0 ? Math.floor(afterRaw) : undefined;
+      const tailRaw = Number(q.get("tail"));
+      const tail = Number.isFinite(tailRaw) && tailRaw >= 1 ? Math.min(Math.floor(tailRaw), 2000) : 500;
+
+      const from = after === undefined ? Math.max(0, all.length - tail) : after;
+      const entries = all.slice(from, from + tail).map((line, i) => ({ seq: from + i, ts: "", stream: "out" as const, line }));
       return json(res, 200, {
-        entries: lines.map((line, i) => ({ seq: i, ts: "", stream: "out" as const, line })),
-        cursor: lines.length,
-        dropped: false,
+        entries,
+        cursor: all.length,
+        // The log was rotated or truncated under the caller: what they asked to continue from is
+        // past the end, so they have missed lines and should re-read rather than trust the gap.
+        dropped: after !== undefined && after > all.length,
       });
     } catch {
       return json(res, 200, { entries: [], cursor: 0, dropped: false });
@@ -790,14 +805,24 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         // screen, the `session_logs` action, an agent's own tool — and a route that always answered
         // with its own last 500 lines turned "show me the last 20" into 500 lines in somebody's
         // context. The clamp used to live in the tool pump, which no longer sees this call.
-        const asked = Number(new URL(req.url ?? "/", "http://x").searchParams.get("tail"));
+        const q = new URL(req.url ?? "/", "http://x").searchParams;
+        const asked = Number(q.get("tail"));
         const tail = Number.isFinite(asked) && asked >= 1 ? Math.min(Math.floor(asked), 500) : 500;
-        const text = await sandboxLogs(s.sandboxId, tail).catch(() => undefined);
+        // `after` IS A CURSOR INTO THE CONTAINER'S OWN STREAM, so a poll returns only new lines
+        // instead of the same tail every few seconds. The runtime gives us a tail, not a range, so
+        // the cursor is a count of lines already seen: ask for a wider window and drop what was.
+        const afterRaw = Number(q.get("after"));
+        const after = Number.isFinite(afterRaw) && afterRaw >= 0 ? Math.floor(afterRaw) : undefined;
+        const want = after === undefined ? tail : 500;
+        const text = await sandboxLogs(s.sandboxId, want).catch(() => undefined);
         if (text === undefined) return json(res, 200, { available: false, lines: [] });
-        return json(res, 200, {
-          available: true,
-          lines: text.split("\n").filter(Boolean).slice(-tail).map((line) => ({ ts: "", stream: "out" as const, line })),
-        });
+        const all = text.split("\n").filter(Boolean);
+        // The container's log is a rolling window: its first line is not line 0 of all time. `seq`
+        // counts from the START of what the runtime still has, which is the only thing either side
+        // can agree on — and `dropped` says when that window has moved past where the caller was.
+        const from = after === undefined ? Math.max(0, all.length - tail) : Math.min(after, all.length);
+        const lines = all.slice(from).map((line, i) => ({ seq: from + i, ts: "", stream: "out" as const, line }));
+        return json(res, 200, { available: true, lines, cursor: all.length, dropped: after !== undefined && after > all.length });
       }
       if (method === "GET" && action === "claude-usage") return json(res, 200, { usage: [] });
       if (method === "GET" && action === "agents") return json(res, 200, { agents: listAgents(id).map(agentJson) });
