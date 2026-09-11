@@ -16,7 +16,6 @@ import { dropLocksForSandbox } from "./webdav.js";
 import { agentJson, getAgent, listAgents, parseRoster, spawnAgent, startAgent, stopAgent } from "./agents.js";
 import { bridgePattern, connectorTurn, syncViewsFile } from "./acpview.js";
 import { attachChannel, channelBinding, channelThreadKey, channelsForSession, detachChannel, rememberEnvelope, type ChatEnvelope } from "./channels.js";
-import { listHarnesses } from "./harness.js";
 import { sealedOrInline } from "./envelope.js";
 import { pauseSession, resumeSession,
   actorFrom,
@@ -825,13 +824,11 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         return json(res, 200, { available: true, lines, cursor: all.length, dropped: after !== undefined && after > all.length });
       }
       if (method === "GET" && action === "claude-usage") return json(res, 200, { usage: [] });
+      // The session's agents — the DEFINITIONS it was launched with, which the cloud folds into
+      // `session_get`. `POST …/agents` (spawn an ad-hoc agent) stood beside it with no caller
+      // anywhere and is gone: an agent is a definition on the workspace, and a running one is a
+      // view of type `agent` — adding one is `view_create`, not a second kind of thing.
       if (method === "GET" && action === "agents") return json(res, 200, { agents: listAgents(id).map(agentJson) });
-      if (method === "POST" && action === "agents") {
-        const b = await readBody(req);
-        const def = parseRoster([b])[0];
-        if (!def) return json(res, 400, { error: "agent needs id + name" });
-        return json(res, 201, agentJson(spawnAgent(id, s.workspaceId ?? id, s.sandboxId, def)));
-      }
       if (method === "POST" && action === "stop") {
         const out = await pauseSession(id);
         return out ? json(res, 200, sessionJson(out)) : json(res, 409, { error: "session not ready" });
@@ -947,8 +944,8 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       await abortMerge(s2.sandboxId).catch(() => undefined);
       return json(res, 200, { ok: true });
     }
-    if (method === "GET" && sub === "agents/approvals") return json(res, 200, { approvals: [] });
-    if (method === "GET" && sub === "agents/harnesses") return json(res, 200, { harnesses: listHarnesses() });
+    // `agents/approvals` answered a hard-coded empty list and `agents/harnesses` had no caller;
+    // both predate "a view is the thread" and went with the client methods that never called them.
     return json(res, 501, { error: "not supported by this server runtime yet" });
   }
 
